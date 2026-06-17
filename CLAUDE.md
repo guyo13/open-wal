@@ -109,6 +109,6 @@ The entire value of this component is **correct behavior under crashes and fault
 
 ## Project status (keep this updated)
 
-- **Current milestone:** M0 — not started
+- **Current milestone:** M0 — complete (foundations: `Lsn`, `WalConfig`, `WalError`, CRC-32C wired to `crc32c`; §14.1 CRC vectors pass, incl. the Castagnoli-not-ISO-HDLC assertion). **M1 (record codec) is next.**
 - **M3 gate:** NOT yet passed (LazyFS §14.4b + §14.4g pending)
-- **Known environment limitations:** _(record here whether FUSE/privileges are available)_
+- **Known environment limitations:** crates.io reachable; `cargo`/`rustc` 1.94 available. FUSE/LazyFS (§14.4b) and privileged fault-injection (`dm-flakey`, power-pull — §14.8) are **not yet verified** in this sandbox; the M3 LazyFS gate remains open and must run where FUSE/privileges exist.
