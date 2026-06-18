@@ -2,6 +2,9 @@
 name = "open-wal"
 version = "0.1.0"
 edition = "2024"
+# Minimum supported Rust version: the floor implied by edition 2024. No feature
+# beyond this is used; bump deliberately if a later milestone needs a newer API.
+rust-version = "1.85"
 description = "An embedded Write-Ahead Log (WAL) library for Rust."
 license = "BSD-3-Clause"
 repository = "https://github.com/guyo13/open-wal"

@@ -14,6 +14,10 @@
 //! checksum ([`crc32c`]). The write path, recovery, and checkpoint arrive in
 //! later milestones.
 
+// This is an embeddable library; every public item must be documented. With
+// CI's `clippy -D warnings`, an undocumented public item fails the build.
+#![warn(missing_docs)]
+
 mod config;
 mod crc;
 mod error;
