@@ -45,3 +45,16 @@ jobs:
         run: cargo build --all-targets --verbose
       - name: test
         run: cargo test --verbose
+
+  msrv:
+    name: MSRV (1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Pin to the declared rust-version so the MSRV claim is verified, not just
+      # asserted. Uses the committed Cargo.lock (--locked) for a faithful check.
+      - name: Install Rust 1.85
+        uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+      - name: check
+        run: cargo check --all-targets --locked

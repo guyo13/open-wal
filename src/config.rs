@@ -12,9 +12,11 @@ pub struct WalConfig {
     /// Hard upper bound on a single record's payload length.
     ///
     /// A record must not span segments (§5.3), so this is constrained by
-    /// `max_record_size <= segment_size - 91` (64-byte segment header +
-    /// 20-byte record header + up to 7 padding bytes). That precondition is
-    /// **not** enforced here; `open()` validates it and returns
+    /// `max_record_size + 91 <= segment_size` (64-byte segment header +
+    /// 20-byte record header + up to 7 padding bytes). The bound is written in
+    /// additive form on purpose: the equivalent `segment_size - 91` underflows
+    /// for `segment_size < 91`, which would *bypass* the check. That precondition
+    /// is **not** enforced here; `open()` validates it and returns
     /// [`InvalidConfig`](crate::WalError::InvalidConfig) (a later milestone).
     pub max_record_size: u32,
 }
@@ -40,9 +42,10 @@ mod tests {
 
     #[test]
     fn default_satisfies_section_5_3_bound() {
-        // max_record_size ≤ segment_size − 91 (§5.3) must hold for the default,
+        // max_record_size + 91 ≤ segment_size (§5.3) must hold for the default,
         // so a default-configured WAL never trips InvalidConfig at open().
+        // Additive form avoids the segment_size − 91 underflow trap.
         let c = WalConfig::default();
-        assert!(u64::from(c.max_record_size) <= c.segment_size - 91);
+        assert!(u64::from(c.max_record_size) + 91 <= c.segment_size);
     }
 }
