@@ -109,6 +109,7 @@ The entire value of this component is **correct behavior under crashes and fault
 
 ## Project status (keep this updated)
 
-- **Current milestone:** M0 — complete (foundations: `Lsn`, `WalConfig`, `WalError`, CRC-32C wired to `crc32c`; §14.1 CRC vectors pass, incl. the Castagnoli-not-ISO-HDLC assertion). **M1 (record codec) is next.**
+- **Current milestone:** M1 — complete (record codec in `src/record.rs`: encode/decode of the §5.3 framing, padding inside CRC coverage, bounded never-panicking decode). §14.1 codec unit tests + proptest round-trip/bit-flip/bounded-decode pass; `cargo test`, `cargo clippy -D warnings`, `cargo fmt --check` all green. **M2 (single-segment write/read) is next.** (M0 foundations — `Lsn`, `WalConfig`, `WalError`, CRC-32C wired to `crc32c`, §14.1 CRC vectors incl. Castagnoli-not-ISO-HDLC — remain complete.)
+- **§14.5 F2 (decoder libFuzzer/cargo-fuzz target) — DEFERRED to M9.** In the interim, in-tree **proptest** provides the generative codec coverage (round-trip, single-bit-flip/CRC detection incl. padding, bounded decode of arbitrary bytes with length-bound enforcement). Consequence: **D11's coverage is NOT complete at M1** — the parser is bounds-checked and property-tested, **not yet fuzz-hardened**. Do not read "M1 passed" as "the parser is fuzz-hardened"; the §14.12 D11 row stays open until the M9 fuzz targets (F1–F3) exist.
 - **M3 gate:** NOT yet passed (LazyFS §14.4b + §14.4g pending)
 - **Known environment limitations:** crates.io reachable; `cargo`/`rustc` 1.94 available. FUSE/LazyFS (§14.4b) and privileged fault-injection (`dm-flakey`, power-pull — §14.8) are **not yet verified** in this sandbox; the M3 LazyFS gate remains open and must run where FUSE/privileges exist.

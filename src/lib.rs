@@ -11,8 +11,10 @@
 //!
 //! This crate is built in milestones (§13). **M0 (foundations)** provides the
 //! core value types — [`Lsn`], [`WalConfig`], [`WalError`] — and the CRC-32C
-//! checksum ([`crc32c`]). The write path, recovery, and checkpoint arrive in
-//! later milestones.
+//! checksum ([`crc32c`]). **M1** adds the internal record codec (`record` —
+//! encode/decode of the §5.3 framing, with padding inside CRC coverage and a
+//! bounded, never-panicking decoder). The write path, recovery, and checkpoint
+//! arrive in later milestones.
 
 // This is an embeddable library; every public item must be documented. With
 // CI's `clippy -D warnings`, an undocumented public item fails the build.
@@ -22,6 +24,11 @@ mod config;
 mod crc;
 mod error;
 mod lsn;
+// The record codec is consumed by the write path (`append`) and `Reader` in M2;
+// until then its items are exercised only by tests, so suppress dead-code in
+// non-test library builds (`clippy -D warnings` would otherwise reject them).
+#[allow(dead_code)]
+mod record;
 
 pub use config::WalConfig;
 pub use crc::crc32c;
