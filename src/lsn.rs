@@ -1,5 +1,7 @@
 //! Log Sequence Numbers.
 
+use std::fmt;
+
 /// Log Sequence Number. Newtype to prevent mixing with byte offsets/counts.
 ///
 /// `Lsn(0)` is reserved as "none"; real records are dense starting at 1
@@ -31,6 +33,14 @@ impl Lsn {
     }
 }
 
+impl fmt::Display for Lsn {
+    /// Formats the LSN as its underlying integer, so error and log messages can
+    /// use `{lsn}` instead of poking at the `.0` field.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -58,5 +68,11 @@ mod tests {
     fn ordering() {
         assert!(Lsn(1) < Lsn(2));
         assert!(Lsn::NONE < Lsn::FIRST);
+    }
+
+    #[test]
+    fn display_is_the_underlying_integer() {
+        assert_eq!(Lsn(0).to_string(), "0");
+        assert_eq!(Lsn(100001).to_string(), "100001");
     }
 }

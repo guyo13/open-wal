@@ -77,14 +77,14 @@ impl fmt::Display for WalError {
                 detail,
             } => write!(
                 f,
-                "corruption in segment {} at offset {offset}: {detail}",
-                segment.0
+                "corruption in segment {segment} at offset {offset}: {detail}"
             ),
-            WalError::TornMidLog { segment, offset } => write!(
-                f,
-                "torn record mid-log in segment {} at offset {offset}",
-                segment.0
-            ),
+            WalError::TornMidLog { segment, offset } => {
+                write!(
+                    f,
+                    "torn record mid-log in segment {segment} at offset {offset}"
+                )
+            }
             WalError::RecordTooLarge => write!(f, "record exceeds max_record_size"),
             WalError::InvalidConfig => write!(f, "invalid WAL configuration"),
             WalError::BadSegmentHeader => write!(f, "bad segment header"),
