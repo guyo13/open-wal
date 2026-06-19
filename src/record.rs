@@ -56,6 +56,16 @@ pub(crate) const fn padding_for(payload_len: usize) -> usize {
     (8 - ((RECORD_HEADER_SIZE + payload_len) % 8)) % 8
 }
 
+/// `padding_for` over a `u64` length, so the decoder can size a record without
+/// risking a `usize` overflow on a 32-bit target (D11: never panic for *any*
+/// input). `+ 4` is `RECORD_HEADER_SIZE mod 8`; reducing mod 8 keeps the
+/// intermediate small, so this cannot overflow even for `length == u64::MAX`.
+#[inline]
+#[must_use]
+const fn padding_for_u64(payload_len: u64) -> u64 {
+    (8 - ((RECORD_HEADER_SIZE as u64 % 8 + payload_len % 8) % 8)) % 8
+}
+
 /// Total on-disk framed size of a record with a `payload_len`-byte payload
 /// (header + payload + padding). Always a multiple of 8.
 #[inline]
@@ -124,6 +134,11 @@ pub(crate) fn encode_into(buf: &mut Vec<u8>, lsn: Lsn, payload: &[u8]) -> usize 
     let pad = padding_for(payload.len());
     let start = buf.len();
 
+    // One up-front reservation so a cold/under-capacity staging buffer grows
+    // exactly once for this record instead of reallocating across the writes
+    // below — keeps the M2 `append` hot path's growth deterministic.
+    buf.reserve(framed_size(payload.len()));
+
     // 4-byte CRC placeholder; backfilled once the body is laid down.
     buf.extend_from_slice(&[0u8; 4]);
     buf.extend_from_slice(&length.to_le_bytes());
@@ -170,13 +185,19 @@ pub(crate) fn decode(buf: &[u8], max_record_size: u32) -> Decoded<'_> {
     if length > max_record_size {
         return Decoded::Invalid(DecodeError::LengthTooLarge);
     }
-    let length = length as usize;
 
-    let framed = framed_size(length);
-    if framed > buf.len() {
+    // Size the framed record in u64 to avoid a `usize` overflow on 32-bit targets
+    // (a near-`u32::MAX` `length` would overflow `20 + length + pad` there) — D11
+    // requires no panic for *any* input. If it overruns the slice it is a short
+    // read; otherwise `framed <= buf.len() <= usize::MAX`, so the cast is safe.
+    let framed_u64 =
+        RECORD_HEADER_SIZE as u64 + u64::from(length) + padding_for_u64(u64::from(length));
+    if framed_u64 > buf.len() as u64 {
         // Short read: a torn tail or a record split by the slice boundary.
         return Decoded::Incomplete;
     }
+    let length = length as usize;
+    let framed = framed_u64 as usize;
 
     let stored_crc = u32::from_le_bytes(buf[0..4].try_into().unwrap());
     let computed_crc = crc32c(&buf[LEN_OFF..framed]);
@@ -377,6 +398,21 @@ mod tests {
     fn lsn_roundtrips_small_and_large() {
         assert_roundtrip(Lsn(1), b"first");
         assert_roundtrip(Lsn(u64::MAX), b"last");
+    }
+
+    #[test]
+    fn padding_for_u64_matches_usize_helper() {
+        // The 32-bit-safe decoder path must agree with the const helper used by
+        // the encoder, including past the u32 range it guards against.
+        for len in 0u64..=64 {
+            assert_eq!(padding_for_u64(len), padding_for(len as usize) as u64);
+        }
+        // Equivalent reduction at and beyond u32::MAX (where the usize form would
+        // overflow on a 32-bit target).
+        for len in [u32::MAX as u64, u32::MAX as u64 + 1, u64::MAX] {
+            let expected = (8 - ((20u64 + len % 8) % 8)) % 8;
+            assert_eq!(padding_for_u64(len), expected);
+        }
     }
 
     proptest! {
