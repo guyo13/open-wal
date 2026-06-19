@@ -74,7 +74,7 @@ The entire value of this component is **correct behavior under crashes and fault
 | M | Scope | Done when |
 |---|---|---|
 | **M0** | Crate skeleton, `Lsn`/`WalConfig`/`WalError`, CRC-32C | §14.1 CRC vectors pass |
-| **M1** | Record codec (encode/decode, bounds, padding-in-CRC) | §14.1 codec + §14.2 round-trip + §14.5 decoder fuzz |
+| **M1** | Record codec (encode/decode, bounds, padding-in-CRC) | §14.1 codec + §14.2 round-trip + proptest (interim; §14.5 F2 decoder fuzz deferred to M9) |
 | **M2** | Single-segment `append`/`commit`/`Reader`; pre-alloc; zero-alloc hot path | §14.1, §14.2, §14.7 alloc assertion |
 | **M3** | **Intra-segment recovery** — tail detect, durable zero-to-EOF, bounded scan, sealed-vs-active, sparse index | **GATE — see below** |
 | **M4** | Multi-segment + commit-time whole-record split, empty active segment, dir fsync, **sealed-segment immutability (D12)** | §14.2 P4/P7, §14.4c (split-batch), §14.4d, §14.4h immutability |
