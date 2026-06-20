@@ -4,8 +4,17 @@
 //! A counting global allocator gates on an `ENABLED` flag so only the measured
 //! region is counted (setup, `tempfile`, and warm-up allocations are excluded).
 //! `alloc` and `realloc` (buffer growth) both bump the counter.
+//!
+//! The counter is **process-global**, so the two tests below must not measure
+//! concurrently — `cargo test` runs them on parallel threads, and a sibling's
+//! setup allocations would otherwise be counted inside an open measured window
+//! (notably the `append+commit` window, which spans an `fdatasync`). `SERIAL`
+//! serializes the whole body of each test so only the measuring thread is live
+//! while counting is on. (Thread-id gating inside the allocator is avoided: it
+//! risks reentrancy via `thread::current()`.)
 
 use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use open_wal::{Lsn, Wal, WalConfig};
@@ -14,6 +23,8 @@ struct CountingAlloc;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 static ALLOCS: AtomicUsize = AtomicUsize::new(0);
+/// Serializes the measured tests so the global counter reflects one thread.
+static SERIAL: Mutex<()> = Mutex::new(());
 
 unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
@@ -64,6 +75,11 @@ fn batch() -> Vec<[u8; 64]> {
 
 #[test]
 fn append_commit_steady_state_is_zero_alloc() {
+    // Held for the whole body so the sibling test is not running (and thus not
+    // allocating) while this one measures against the process-global counter.
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let (mut wal, _) = Wal::open(dir.path(), config()).unwrap();
     let batch = batch();
@@ -87,6 +103,9 @@ fn append_commit_steady_state_is_zero_alloc() {
 
 #[test]
 fn reader_next_steady_state_is_zero_alloc() {
+    let _serial = SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
     let (mut wal, _) = Wal::open(dir.path(), config()).unwrap();
     let batch = batch();
