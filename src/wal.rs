@@ -376,6 +376,25 @@ mod tests {
             Wal::open(dir.path(), bad),
             Err(WalError::InvalidConfig)
         ));
+
+        // Degenerate sub-91 segments: the subtractive `segment_size - 91` form
+        // would underflow/wrap and bypass the check entirely; the additive form
+        // (`max_record_size + 91 > segment_size`) must still reject them.
+        for tiny in [
+            WalConfig {
+                segment_size: 90,
+                max_record_size: 0,
+            },
+            WalConfig {
+                segment_size: 0,
+                max_record_size: 0,
+            },
+        ] {
+            assert!(matches!(
+                Wal::open(dir.path(), tiny),
+                Err(WalError::InvalidConfig)
+            ));
+        }
     }
 
     #[test]
