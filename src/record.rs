@@ -96,8 +96,11 @@ pub(crate) enum Decoded<'a> {
     /// slice. At a physical tail this is a short/torn write; the codec does not
     /// classify tail-vs-corruption (that is recovery's job, §8.2).
     Incomplete,
-    /// A header is present but the record is not valid.
-    Invalid(DecodeError),
+    /// A header is present but the record is not valid. The inner reason is
+    /// consumed by recovery's tail-vs-corruption classification (M3); M2's clean
+    /// scan collapses it to end-of-records, so it is not read in the library
+    /// build yet.
+    Invalid(#[allow(dead_code)] DecodeError),
 }
 
 /// Why a present record header failed validation.

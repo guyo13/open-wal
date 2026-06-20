@@ -12,9 +12,11 @@
 //! This crate is built in milestones (§13). **M0 (foundations)** provides the
 //! core value types — [`Lsn`], [`WalConfig`], [`WalError`] — and the CRC-32C
 //! checksum ([`crc32c`]). **M1** adds the internal record codec (`record` —
-//! encode/decode of the §5.3 framing, with padding inside CRC coverage and a
-//! bounded, never-panicking decoder). The write path, recovery, and checkpoint
-//! arrive in later milestones.
+//! encode/decode of the §5.3 framing). **M2** adds the single-segment write
+//! path and replay: [`Wal::open`]/[`append`](Wal::append)/[`commit`](Wal::commit),
+//! a streaming [`Reader`], the [`DurabilityObserver`] hook, segment
+//! pre-allocation and `fdatasync`, and a zero-allocation hot path. Multi-segment
+//! roll/split (M4), torn-tail recovery (M3), and checkpoint (M5) arrive later.
 
 // This is an embeddable library; every public item must be documented. With
 // CI's `clippy -D warnings`, an undocumented public item fails the build.
@@ -24,13 +26,16 @@ mod config;
 mod crc;
 mod error;
 mod lsn;
-// The record codec is consumed by the write path (`append`) and `Reader` in M2;
-// until then its items are exercised only by tests, so suppress dead-code in
-// non-test library builds (`clippy -D warnings` would otherwise reject them).
-#[allow(dead_code)]
+mod observer;
+mod reader;
 mod record;
+mod segment;
+mod wal;
 
 pub use config::WalConfig;
 pub use crc::crc32c;
 pub use error::{Result, WalError};
 pub use lsn::Lsn;
+pub use observer::{DurabilityObserver, NullObserver};
+pub use reader::Reader;
+pub use wal::{RecoveryReport, TailState, Wal};
