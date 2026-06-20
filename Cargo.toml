@@ -14,6 +14,11 @@ readme = "README.md"
 # Castagnoli CRC-32C (hardware-accelerated, software fallback). NOT crc32fast,
 # which uses the ISO-HDLC/zlib polynomial (§5, §16 of docs/wal_design_v6.md).
 crc32c = "0.6"
+# Filesystem syscalls the durability contract needs (§16): fallocate
+# (pre-allocation), fsync (file + directory), flock (exclusive writer lock),
+# and fcntl(F_FULLFSYNC) for macOS durability (§8.3). Positioned reads/writes
+# and sync_data come from std; rustix covers what std does not expose.
+rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]
 # Generative property testing (§16 suggests proptest or bolero). In M1 this
@@ -21,3 +26,5 @@ crc32c = "0.6"
 # libFuzzer/cargo-fuzz decoder target (§14.5 F2) is deferred to M9; until then
 # proptest is the generative coverage and D11 is not yet fuzz-hardened.
 proptest = "1"
+# Temp directories for the M2 write/read integration tests.
+tempfile = "3"

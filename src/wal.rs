@@ -1,0 +1,491 @@
+//! The single-writer `Wal` handle — open, append, commit, replay (M2).
+//!
+//! **M2 scope:** a single, pre-allocated segment. `append` is pure memory
+//! (§7.1); `commit` writes the staged batch and `fdatasync`s it (§7.2,
+//! single-segment only); `open` cold-starts an empty directory or cleanly
+//! reopens a single segment. Segment roll, commit-time split, torn-tail
+//! recovery, and checkpoint are later milestones (M3–M5) and are deliberately
+//! absent here.
+
+use std::cell::Cell;
+use std::fs::{File, OpenOptions};
+use std::io;
+use std::marker::PhantomData;
+use std::os::unix::fs::FileExt;
+use std::path::Path;
+
+use crate::error::{Result, WalError};
+use crate::observer::{DurabilityObserver, NullObserver};
+use crate::reader::Reader;
+use crate::segment::{self, HEADER_SIZE};
+use crate::{Lsn, WalConfig};
+
+/// Outcome of recovery, returned by [`Wal::open`] (§6).
+#[derive(Debug, Clone, Copy)]
+pub struct RecoveryReport {
+    /// `P`: base LSN of the oldest surviving segment (1 until the first
+    /// checkpoint).
+    pub oldest_lsn: Lsn,
+    /// `k`: highest recovered durable LSN (`oldest_lsn - 1` if the suffix is
+    /// empty).
+    pub durable_lsn: Lsn,
+    /// Whether the tail was clean or a torn tail was truncated.
+    pub tail_state: TailState,
+    /// Number of segment files inspected during recovery.
+    pub segments_scanned: usize,
+}
+
+/// State of the active segment's tail after recovery (§6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TailState {
+    /// The tail ended cleanly (sentinel / end of records). M2 always reports
+    /// this; torn-tail truncation is M3.
+    Clean,
+    /// A torn tail was detected, truncated, and zeroed at this offset of the
+    /// active segment (produced from M3 onward).
+    TruncatedAt {
+        /// `base_lsn` of the active segment that was truncated.
+        segment_base: Lsn,
+        /// Byte offset within that segment at which the tail was truncated.
+        offset: u64,
+    },
+}
+
+/// Single-writer, append-only write-ahead log handle.
+///
+/// `Send` but **not `Sync`** (§6.2): the write methods take `&mut self`, and the
+/// `PhantomData<Cell<()>>` marker makes sharing the handle across threads a
+/// compile error, so concurrent writers cannot exist. Generic over a
+/// [`DurabilityObserver`]; the default [`NullObserver`] compiles away.
+pub struct Wal<O: DurabilityObserver = NullObserver> {
+    /// Held open for the handle's lifetime so the exclusive `flock` is retained;
+    /// dropping the `Wal` releases the lock.
+    _lock: File,
+    /// The active (highest-`base_lsn`) segment.
+    active: File,
+    active_base: Lsn,
+    /// Offset of the next byte to write in the active segment.
+    write_offset: u64,
+    oldest_lsn: Lsn,
+    last_lsn: Lsn,
+    durable_lsn: Lsn,
+    segment_size: u64,
+    max_record_size: u32,
+    /// Reusable encode buffer for the current uncommitted batch (§7.1).
+    staging: Vec<u8>,
+    observer: O,
+    /// Set after a durability failure; all subsequent ops return `Poisoned`
+    /// (§12).
+    poisoned: bool,
+    /// Makes `Wal` `!Sync` (single-writer enforcement, §6.2).
+    _not_sync: PhantomData<Cell<()>>,
+}
+
+impl Wal<NullObserver> {
+    /// Open or create a WAL in `dir` with the default no-op observer.
+    pub fn open(dir: &Path, config: WalConfig) -> Result<(Wal<NullObserver>, RecoveryReport)> {
+        Wal::open_with(dir, config, NullObserver)
+    }
+}
+
+impl<O: DurabilityObserver> Wal<O> {
+    /// Open or create a WAL in `dir`, running recovery, with an explicit
+    /// `observer` (§6). Acquires an exclusive advisory lock on the directory;
+    /// fails with [`Locked`](WalError::Locked) if already held.
+    ///
+    /// M2 recovers a single segment cleanly: it cold-starts an empty directory
+    /// (creating `…0001.wal`) or reopens an existing segment, scanning its
+    /// records up to the first sentinel. Torn-tail handling is M3.
+    pub fn open_with(
+        dir: &Path,
+        config: WalConfig,
+        observer: O,
+    ) -> Result<(Wal<O>, RecoveryReport)> {
+        // §5.3 precondition, additive form (no `segment_size - 91` underflow).
+        if u64::from(config.max_record_size) + 91 > config.segment_size {
+            return Err(WalError::InvalidConfig);
+        }
+
+        std::fs::create_dir_all(dir)?;
+
+        // Exclusive writer lock for the handle's lifetime (§6.2).
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(dir.join("LOCK"))?;
+        match rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => {}
+            // EWOULDBLOCK == EAGAIN on Linux/macOS; the lock is already held.
+            Err(rustix::io::Errno::WOULDBLOCK) => {
+                return Err(WalError::Locked);
+            }
+            Err(e) => return Err(WalError::Io(io::Error::from(e))),
+        }
+
+        // Discover segments: sorted by base_lsn, never trusting dir order (§8.6).
+        let mut bases: Vec<u64> = Vec::new();
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            if let Some(name) = entry.file_name().to_str() {
+                if let Some(base) = segment::parse_base_lsn(name) {
+                    bases.push(base);
+                }
+            }
+        }
+        bases.sort_unstable();
+
+        let (active, active_base, write_offset, last_lsn, oldest_lsn, segments_scanned) =
+            if bases.is_empty() {
+                Self::cold_start(dir, config.segment_size)?
+            } else {
+                Self::reopen_single(dir, &bases, config)?
+            };
+
+        let durable_lsn = last_lsn;
+        let report = RecoveryReport {
+            oldest_lsn,
+            durable_lsn,
+            tail_state: TailState::Clean,
+            segments_scanned,
+        };
+
+        let wal = Wal {
+            _lock: lock,
+            active,
+            active_base,
+            write_offset,
+            oldest_lsn,
+            last_lsn,
+            durable_lsn,
+            segment_size: config.segment_size,
+            max_record_size: config.max_record_size,
+            staging: Vec::new(),
+            observer,
+            poisoned: false,
+            _not_sync: PhantomData,
+        };
+        Ok((wal, report))
+    }
+
+    /// Cold start (§8.4): create `…0001.wal`, then fsync the directory so the
+    /// new filename is durable (§7.4 step 5).
+    fn cold_start(dir: &Path, segment_size: u64) -> Result<(File, Lsn, u64, Lsn, Lsn, usize)> {
+        let active = segment::create(dir, Lsn::FIRST, segment_size)?;
+        fsync_dir(dir)?;
+        // base 1, empty: write offset just past the header, durable_lsn = 0.
+        Ok((active, Lsn::FIRST, HEADER_SIZE, Lsn::NONE, Lsn::FIRST, 1))
+    }
+
+    /// Clean reopen of the highest-base segment (M2 single-segment scope): the
+    /// lower bases (if any) only set `oldest_lsn`; the active segment is scanned
+    /// for its dense run of records.
+    fn reopen_single(
+        dir: &Path,
+        bases: &[u64],
+        config: WalConfig,
+    ) -> Result<(File, Lsn, u64, Lsn, Lsn, usize)> {
+        let oldest_lsn = Lsn(bases[0]);
+        let active_base = Lsn(*bases.last().unwrap());
+
+        let active = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(dir.join(segment::filename_for(active_base)))?;
+
+        // Validate the active header and confirm it matches its filename.
+        let mut header = [0u8; HEADER_SIZE as usize];
+        active.read_exact_at(&mut header, 0)?;
+        let parsed = segment::decode_header(&header)?;
+        if parsed.base_lsn != active_base {
+            return Err(WalError::BadSegmentHeader);
+        }
+
+        // Forward scan the active segment's clean record run.
+        let mut buf = Vec::new();
+        let mut offset = HEADER_SIZE;
+        let mut expected = active_base;
+        let mut last = Lsn::NONE;
+        let mut any = false;
+        loop {
+            let outcome = segment::read_record_at(
+                &active,
+                offset,
+                config.segment_size,
+                config.max_record_size,
+                &mut buf,
+            )?;
+            let (lsn, framed_len) = match outcome {
+                segment::ScanOutcome::Record {
+                    lsn, framed_len, ..
+                } => (lsn, framed_len),
+                segment::ScanOutcome::End => break,
+            };
+            // A clean log is dense and in order; a break is the end of records.
+            if lsn != expected {
+                break;
+            }
+            offset += framed_len as u64;
+            last = lsn;
+            expected = lsn.next();
+            any = true;
+        }
+
+        // An empty active segment's durable_lsn is `base_lsn - 1` (§8.1).
+        let last_lsn = if any { last } else { Lsn(active_base.0 - 1) };
+        Ok((
+            active,
+            active_base,
+            offset,
+            last_lsn,
+            oldest_lsn,
+            bases.len(),
+        ))
+    }
+
+    /// Sequence + buffer a record (§7.1). Pure memory: no syscall, no allocation
+    /// once the staging buffer is warm. The record is **not** durable until a
+    /// later `commit` returns covering it.
+    pub fn append(&mut self, payload: &[u8]) -> Result<Lsn> {
+        if self.poisoned {
+            return Err(WalError::Poisoned);
+        }
+        if payload.len() > self.max_record_size as usize {
+            return Err(WalError::RecordTooLarge);
+        }
+        let lsn = self.last_lsn.next();
+        crate::record::encode_into(&mut self.staging, lsn, payload);
+        self.last_lsn = lsn;
+        Ok(lsn)
+    }
+
+    /// Make all buffered records durable (§7.2): one `write` + `fdatasync`
+    /// (`F_FULLFSYNC` on macOS), advancing `durable_lsn`. On any I/O failure the
+    /// handle is **poisoned** (§12) and `durable_lsn` does not advance.
+    ///
+    /// M2 handles the single-segment case only; the commit-time split across
+    /// segments is M4 (a batch that overruns the active segment trips a
+    /// debug assertion).
+    pub fn commit(&mut self) -> Result<Lsn> {
+        if self.poisoned {
+            return Err(WalError::Poisoned);
+        }
+        if self.staging.is_empty() {
+            return Ok(self.durable_lsn);
+        }
+
+        let end = self.write_offset + self.staging.len() as u64;
+        debug_assert!(
+            end <= self.segment_size,
+            "M2 commit assumes a single-segment batch; commit-time split is M4"
+        );
+
+        if let Err(e) = self.active.write_all_at(&self.staging, self.write_offset) {
+            self.poisoned = true;
+            return Err(WalError::Io(e));
+        }
+        if segment::sync_data_fully(&self.active).is_err() {
+            self.poisoned = true;
+            return Err(WalError::FsyncFailed);
+        }
+
+        self.write_offset = end;
+        self.durable_lsn = self.last_lsn;
+        self.staging.clear();
+        self.observer.on_durable(self.durable_lsn);
+        Ok(self.durable_lsn)
+    }
+
+    /// Highest durable LSN (§6).
+    #[must_use]
+    pub fn durable_lsn(&self) -> Lsn {
+        self.durable_lsn
+    }
+
+    /// Highest assigned LSN, durable or still buffered (§6).
+    #[must_use]
+    pub fn last_lsn(&self) -> Lsn {
+        self.last_lsn
+    }
+
+    /// A streaming replay [`Reader`] starting at `from` (§6).
+    ///
+    /// `from == Lsn(0)` means "from the beginning". A `from` below the oldest
+    /// available LSN is a fatal gap (§15.4) — the needed records were
+    /// checkpointed away; never a silent skip. (Dormant in M2, where
+    /// `oldest_lsn == 1`.)
+    pub fn reader_from(&self, from: Lsn) -> Result<Reader<'_>> {
+        if from.0 != 0 && from < self.oldest_lsn {
+            return Err(WalError::ContiguityViolation);
+        }
+        let effective_from = if from.0 == 0 { Lsn::FIRST } else { from };
+        Ok(Reader::new(
+            &self.active,
+            self.active_base,
+            effective_from,
+            self.segment_size,
+            self.max_record_size,
+        ))
+    }
+}
+
+/// `fsync` a directory so a newly-created filename within it is durable (§7.4).
+fn fsync_dir(dir: &Path) -> Result<()> {
+    let dir_file = File::open(dir)?;
+    rustix::fs::fsync(&dir_file).map_err(io::Error::from)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg() -> WalConfig {
+        // Small but single-segment: holds the modest batches these tests use.
+        WalConfig {
+            segment_size: 64 * 1024,
+            max_record_size: 4096,
+        }
+    }
+
+    fn tmp() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
+    #[test]
+    fn open_rejects_config_violating_section_5_3() {
+        let dir = tmp();
+        let bad = WalConfig {
+            segment_size: 100,
+            max_record_size: 100, // 100 + 91 > 100
+        };
+        assert!(matches!(
+            Wal::open(dir.path(), bad),
+            Err(WalError::InvalidConfig)
+        ));
+    }
+
+    #[test]
+    fn cold_start_creates_first_segment() {
+        let dir = tmp();
+        let (wal, report) = Wal::open(dir.path(), cfg()).unwrap();
+        assert_eq!(report.oldest_lsn, Lsn(1));
+        assert_eq!(report.durable_lsn, Lsn(0));
+        assert_eq!(report.tail_state, TailState::Clean);
+        assert_eq!(wal.last_lsn(), Lsn(0));
+        assert!(dir.path().join("00000000000000000001.wal").exists());
+    }
+
+    #[test]
+    fn lsn_assignment_is_monotone_dense_from_one() {
+        let dir = tmp();
+        let (mut wal, _) = Wal::open(dir.path(), cfg()).unwrap();
+        assert_eq!(wal.append(b"a").unwrap(), Lsn(1));
+        assert_eq!(wal.append(b"b").unwrap(), Lsn(2));
+        assert_eq!(wal.append(b"c").unwrap(), Lsn(3));
+        assert_eq!(wal.last_lsn(), Lsn(3));
+        assert_eq!(wal.durable_lsn(), Lsn(0)); // not yet committed
+    }
+
+    #[test]
+    fn append_rejects_oversized_payload() {
+        let dir = tmp();
+        let (mut wal, _) = Wal::open(dir.path(), cfg()).unwrap();
+        let too_big = vec![0u8; cfg().max_record_size as usize + 1];
+        assert!(matches!(
+            wal.append(&too_big),
+            Err(WalError::RecordTooLarge)
+        ));
+        // A max-sized payload is accepted.
+        let max = vec![0u8; cfg().max_record_size as usize];
+        assert!(wal.append(&max).is_ok());
+    }
+
+    #[test]
+    fn max_sized_record_fits_segment_and_round_trips() {
+        // §14.1: a max-sized record (max = segment - 91) fits and round-trips.
+        let dir = tmp();
+        let c = WalConfig {
+            segment_size: 8 * 1024,
+            max_record_size: 8 * 1024 - 91,
+        };
+        let (mut wal, _) = Wal::open(dir.path(), c).unwrap();
+        let payload = vec![0xABu8; c.max_record_size as usize];
+        wal.append(&payload).unwrap();
+        assert_eq!(wal.commit().unwrap(), Lsn(1));
+
+        let mut reader = wal.reader_from(Lsn(1)).unwrap();
+        let (lsn, got) = reader.next().unwrap().unwrap();
+        assert_eq!(lsn, Lsn(1));
+        assert_eq!(got, &payload[..]);
+        assert!(reader.next().is_none());
+    }
+
+    #[test]
+    fn commit_then_read_back() {
+        let dir = tmp();
+        let (mut wal, _) = Wal::open(dir.path(), cfg()).unwrap();
+        wal.append(b"hello").unwrap();
+        wal.append(b"world").unwrap();
+        assert_eq!(wal.commit().unwrap(), Lsn(2));
+        assert_eq!(wal.durable_lsn(), Lsn(2));
+
+        let mut reader = wal.reader_from(Lsn(1)).unwrap();
+        assert_eq!(reader.next().unwrap().unwrap(), (Lsn(1), &b"hello"[..]));
+        assert_eq!(reader.next().unwrap().unwrap(), (Lsn(2), &b"world"[..]));
+        assert!(reader.next().is_none());
+    }
+
+    #[test]
+    fn empty_commit_is_a_noop() {
+        let dir = tmp();
+        let (mut wal, _) = Wal::open(dir.path(), cfg()).unwrap();
+        assert_eq!(wal.commit().unwrap(), Lsn(0));
+    }
+
+    #[test]
+    fn reopen_recovers_committed_records() {
+        let dir = tmp();
+        {
+            let (mut wal, _) = Wal::open(dir.path(), cfg()).unwrap();
+            wal.append(b"one").unwrap();
+            wal.append(b"two").unwrap();
+            wal.commit().unwrap();
+        }
+        let (wal, report) = Wal::open(dir.path(), cfg()).unwrap();
+        assert_eq!(report.durable_lsn, Lsn(2));
+        assert_eq!(report.oldest_lsn, Lsn(1));
+        assert_eq!(wal.last_lsn(), Lsn(2));
+
+        let mut reader = wal.reader_from(Lsn(1)).unwrap();
+        assert_eq!(reader.next().unwrap().unwrap(), (Lsn(1), &b"one"[..]));
+        assert_eq!(reader.next().unwrap().unwrap(), (Lsn(2), &b"two"[..]));
+        assert!(reader.next().is_none());
+    }
+
+    #[test]
+    fn second_open_is_locked() {
+        let dir = tmp();
+        let (_held, _) = Wal::open(dir.path(), cfg()).unwrap();
+        assert!(matches!(
+            Wal::open(dir.path(), cfg()),
+            Err(WalError::Locked)
+        ));
+    }
+
+    #[test]
+    fn reader_from_skips_earlier_records() {
+        let dir = tmp();
+        let (mut wal, _) = Wal::open(dir.path(), cfg()).unwrap();
+        for i in 1..=5u8 {
+            wal.append(&[i]).unwrap();
+        }
+        wal.commit().unwrap();
+        let mut reader = wal.reader_from(Lsn(3)).unwrap();
+        assert_eq!(reader.next().unwrap().unwrap(), (Lsn(3), &[3u8][..]));
+        assert_eq!(reader.next().unwrap().unwrap(), (Lsn(4), &[4u8][..]));
+        assert_eq!(reader.next().unwrap().unwrap(), (Lsn(5), &[5u8][..]));
+        assert!(reader.next().is_none());
+    }
+}

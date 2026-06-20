@@ -122,6 +122,8 @@ version = "0.1.0"
 dependencies = [
  "crc32c",
  "proptest",
+ "rustix",
+ "tempfile",
 ]
 
 [[package]]
