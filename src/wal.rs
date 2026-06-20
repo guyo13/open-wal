@@ -181,6 +181,12 @@ impl<O: DurabilityObserver> Wal<O> {
     /// Clean reopen of the highest-base segment (M2 single-segment scope): the
     /// lower bases (if any) only set `oldest_lsn`; the active segment is scanned
     /// for its dense run of records.
+    ///
+    /// M4/M3: this is **not** full recovery. It scans only the highest-base
+    /// segment and validates neither the sealed segments' headers nor
+    /// cross-segment LSN continuity (§8.1 steps 2–3); `segments_scanned` counts
+    /// the files discovered, not the ones scanned. Those checks (and torn-tail
+    /// handling) arrive when M3/M4 generalize this path.
     fn reopen_single(
         dir: &Path,
         bases: &[u64],
@@ -265,8 +271,9 @@ impl<O: DurabilityObserver> Wal<O> {
     /// handle is **poisoned** (§12) and `durable_lsn` does not advance.
     ///
     /// M2 handles the single-segment case only; the commit-time split across
-    /// segments is M4 (a batch that overruns the active segment trips a
-    /// debug assertion).
+    /// segments is M4. Until then a batch that would overrun the active segment
+    /// is rejected with [`RecordTooLarge`](WalError::RecordTooLarge) (no silent
+    /// overrun, no poison) rather than written past the pre-allocated region.
     pub fn commit(&mut self) -> Result<Lsn> {
         if self.poisoned {
             return Err(WalError::Poisoned);
@@ -276,10 +283,15 @@ impl<O: DurabilityObserver> Wal<O> {
         }
 
         let end = self.write_offset + self.staging.len() as u64;
-        debug_assert!(
-            end <= self.segment_size,
-            "M2 commit assumes a single-segment batch; commit-time split is M4"
-        );
+        if end > self.segment_size {
+            // M4 replaces this with the commit-time whole-record split (§7.3);
+            // until then a batch must fit the active segment. Reject rather than
+            // let `write_all_at` overrun the pre-allocated region (which would
+            // silently produce a record straddling the segment boundary,
+            // violating §5.3). A precondition reject, not a durability failure,
+            // so the handle is not poisoned and `staging`/`last_lsn` are intact.
+            return Err(WalError::RecordTooLarge);
+        }
 
         if let Err(e) = self.active.write_all_at(&self.staging, self.write_offset) {
             self.poisoned = true;
@@ -462,6 +474,61 @@ mod tests {
         assert_eq!(reader.next().unwrap().unwrap(), (Lsn(1), &b"one"[..]));
         assert_eq!(reader.next().unwrap().unwrap(), (Lsn(2), &b"two"[..]));
         assert!(reader.next().is_none());
+    }
+
+    #[test]
+    fn append_after_reopen_resumes_write_offset() {
+        // Exercises the resume `write_offset` that reopen_single accumulates:
+        // writing after a reopen must neither overwrite the last record nor
+        // leave a hole. Replay across the boundary must be dense.
+        let dir = tmp();
+        {
+            let (mut wal, _) = Wal::open(dir.path(), cfg()).unwrap();
+            wal.append(b"a").unwrap();
+            wal.append(b"b").unwrap();
+            wal.append(b"c").unwrap();
+            wal.commit().unwrap();
+        }
+        {
+            let (mut wal, report) = Wal::open(dir.path(), cfg()).unwrap();
+            assert_eq!(report.durable_lsn, Lsn(3));
+            assert_eq!(wal.append(b"d").unwrap(), Lsn(4));
+            assert_eq!(wal.append(b"e").unwrap(), Lsn(5));
+            assert_eq!(wal.commit().unwrap(), Lsn(5));
+        }
+        let (wal, report) = Wal::open(dir.path(), cfg()).unwrap();
+        assert_eq!(report.durable_lsn, Lsn(5));
+        let mut reader = wal.reader_from(Lsn(0)).unwrap();
+        let expected: [&[u8]; 5] = [b"a", b"b", b"c", b"d", b"e"];
+        for (i, want) in expected.iter().enumerate() {
+            let (lsn, got) = reader.next().unwrap().unwrap();
+            assert_eq!(lsn, Lsn(i as u64 + 1));
+            assert_eq!(got, *want);
+        }
+        assert!(reader.next().is_none());
+    }
+
+    #[test]
+    fn commit_batch_overrunning_segment_is_rejected() {
+        // A multi-record batch larger than the segment must hard-fail (not
+        // silently overrun the pre-allocated region) until the M4 split lands.
+        let dir = tmp();
+        let c = WalConfig {
+            segment_size: 512,
+            max_record_size: 256,
+        };
+        let (mut wal, _) = Wal::open(dir.path(), c).unwrap();
+        // Each framed record is 20 + 200 + pad(4) = 224 bytes; the header takes
+        // 64, so two fit (64 + 448 ≤ 512) but three (64 + 672) do not.
+        let payload = vec![0u8; 200];
+        for _ in 0..3 {
+            wal.append(&payload).unwrap();
+        }
+        assert!(matches!(wal.commit(), Err(WalError::RecordTooLarge)));
+        // The reject is a precondition failure, not a durability one: it must
+        // NOT poison. A poisoned handle would return `Poisoned` here.
+        assert!(matches!(wal.commit(), Err(WalError::RecordTooLarge)));
+        assert!(wal.append(&payload).is_ok());
     }
 
     #[test]

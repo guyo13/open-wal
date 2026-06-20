@@ -84,6 +84,13 @@ pub(crate) fn decode_header(bytes: &[u8]) -> Result<SegmentHeader> {
     let base_lsn = Lsn(u64::from_le_bytes(
         bytes[BASE_LSN_OFF..BASE_LSN_OFF + 8].try_into().unwrap(),
     ));
+    // `Lsn(0)` is the reserved "none" sentinel and is never a legal segment
+    // base (records are dense from 1). Rejecting it keeps recovery total over an
+    // adversarial directory (D11) and removes the `base_lsn - 1` underflow on an
+    // empty active segment.
+    if base_lsn.is_none() {
+        return Err(WalError::BadSegmentHeader);
+    }
     Ok(SegmentHeader { base_lsn })
 }
 
@@ -184,6 +191,14 @@ pub(crate) fn read_record_at(
     max_record_size: u32,
     buf: &mut Vec<u8>,
 ) -> Result<ScanOutcome> {
+    // `framed` below is computed with the `usize` `framed_size`; that is
+    // overflow-safe only because `open()` validated this relation (§5.3), so the
+    // framed size of any in-bounds record is ≤ `segment_size - 64`. Document the
+    // coupling rather than let an unvalidated caller reintroduce the overflow.
+    debug_assert!(
+        u64::from(max_record_size) + 91 <= segment_size,
+        "scanner assumes an open()-validated config (§5.3)"
+    );
     let remaining = segment_size.saturating_sub(offset);
     if remaining < RECORD_HEADER_SIZE as u64 {
         return Ok(ScanOutcome::End);
@@ -258,6 +273,13 @@ mod tests {
         // Flip a covered byte without fixing the CRC ⇒ BadSegmentHeader.
         let mut h = encode_header(Lsn(7), 0);
         h[BASE_LSN_OFF] ^= 0x01;
+        assert!(matches!(decode_header(&h), Err(WalError::BadSegmentHeader)));
+    }
+
+    #[test]
+    fn base_lsn_zero_rejected() {
+        // base 0 is the reserved Lsn sentinel, never a legal segment base.
+        let h = encode_header(Lsn(0), 0);
         assert!(matches!(decode_header(&h), Err(WalError::BadSegmentHeader)));
     }
 
