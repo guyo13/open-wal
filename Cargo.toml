@@ -28,3 +28,8 @@ rustix = { version = "1", features = ["fs"] }
 proptest = "1"
 # Temp directories for the M2 write/read integration tests.
 tempfile = "3"
+# `O_NONBLOCK`/`ENXIO` constants for the LazyFS gate's faults-FIFO open
+# (`tests/lazyfs_gate.rs`) — a non-blocking open fails fast if the daemon is down
+# rather than hanging CI. Test-only; the library proper depends on `rustix`, not
+# `libc`. Already present transitively, so this adds no new crate.
+libc = "0.2"
