@@ -1,11 +1,17 @@
 # Write-Ahead Log (WAL) Component — Design, Implementation & Test Specification
 
-**Status:** Draft **v6** — all open decisions resolved; ready for implementation
+**Status:** Draft **v6.1** — all open decisions resolved; ready for implementation
 **Target language:** Rust (stable)
 **Intended audience:** A coding agent implementing the component, plus a human reviewer.
 **Context:** Journal/WAL for an LMAX-style single-writer, event-sourced system with complex incremental business logic. Durability-first (acknowledge only after durable).
 
 ---
+
+## Changelog (v6 → v6.1)
+
+A single normative correction surfaced while implementing M3 (intra-segment recovery); no other sections change.
+
+- **§8.2 step 5 (active-segment forward scan) — condition corrected `lsn == expected_next_lsn` → `lsn >= expected_next_lsn`.** The equality form is wrong and would silently truncate acknowledged data (a **D5** violation): when the invalid record at offset X is itself a *corrupted acked record*, the next genuine record carries `expected_next_lsn + 1`, never `expected_next_lsn`, so the equality test never matches and recovery misclassifies mid-log corruption as a torn tail — discarding the valid records after X. It was also internally inconsistent with §14.4e ("finds the **next** valid record"). The corrected `>=` form matches every genuine continuation; soundness against a coincidental stale match still rests on the §8.2.1 durable zeroing of `[X, EOF)` keeping the post-tail region clear within the scan bound. (Found and fixed during M3 implementation.)
 
 ## Changelog (v5 → v6)
 
@@ -363,7 +369,7 @@ For each record:
 4. Compute CRC-32C over `[4, 4+16+length+pad)`; compare to `crc`. Check `lsn == expected_next_lsn`. Either mismatch ⇒ invalid (step 5).
 5. **Classification of an invalid record at offset X:**
    - **Sealed segment:** sealed segments are fully synced before the next segment exists (§7.3), so they contain **no torn tail.** Any invalid record before the zero sentinel is **fatal corruption** (`Corruption`). No forward scan.
-   - **Active segment:** perform a **bounded forward scan** — from `X+8`, step forward (8-byte aligned) at most `max_record_size + 28` bytes (record header + max padding), attempting to parse a structurally valid record whose `lsn == expected_next_lsn`.
+   - **Active segment:** perform a **bounded forward scan** — from `X+8`, step forward (8-byte aligned) at most `max_record_size + 28` bytes (record header + max padding), attempting to parse a structurally valid record whose `lsn >= expected_next_lsn`. (Every genuine continuation has `lsn >= expected_next_lsn`; soundness against a coincidental stale match rests on the §8.2.1 zeroing keeping the post-tail region clear within the bound. See the v6 → v6.1 changelog for why this is `>=` and not `==`.)
      - **Found ⇒ mid-log corruption ⇒ FATAL** (`TornMidLog`). The found record proves data after X was genuine and acknowledged; truncating would silently drop it (D5). *(This inference is sound because every prior truncation zeroed the post-tail region — §8.2.1 — so no stale-but-valid record can appear here; a valid record after a gap is therefore real corruption, not resurrection.)*
      - **Not found within the bound ⇒ torn tail.** Truncate logically at X, then **physically invalidate** the region from X to segment EOF, and record `TailState::TruncatedAt`; `durable_lsn` = last valid LSN before X. The invalidation MUST be durable before recovery completes (see §8.2.1).
 6. On a valid record: record `(lsn → offset)` into the **sparse index** (see §8.5), set `expected_next_lsn = lsn + 1`, advance by the padded record size.
