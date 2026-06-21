@@ -160,9 +160,13 @@ fn created_unix_nanos() -> u64 {
 /// Outcome of reading the record at one scan offset (§8.2 record-level checks).
 ///
 /// `Record` carries the payload's location **within `buf`** (the caller slices
-/// `buf[RECORD_HEADER_SIZE..][..payload_len]`); `End` collapses sentinel, short
-/// read, and invalid into "no more clean records here" — sufficient for M2's
-/// clean scan. M3 will split `End` into the tail-vs-corruption classification.
+/// `buf[RECORD_HEADER_SIZE..][..payload_len]`). `CleanEnd` and `Invalid` split
+/// the M2 `End` into the two cases M3 recovery must tell apart (§8.2):
+/// `CleanEnd` is "no more records here" (`< 20` bytes remain or a `rec_type == 0`
+/// sentinel — step 1); `Invalid` is "a header is present but this is not a valid
+/// record" — a candidate truncation/corruption boundary (steps 2–4). The live
+/// [`Reader`](crate::Reader) treats both as a clean end of stream; recovery
+/// classifies `Invalid` as torn-tail vs mid-log corruption.
 #[derive(Debug)]
 pub(crate) enum ScanOutcome {
     /// A structurally valid record (CRC verified, bounds checked).
@@ -174,8 +178,32 @@ pub(crate) enum ScanOutcome {
         /// Total framed bytes consumed; advance the scan offset by this.
         framed_len: usize,
     },
-    /// No further clean record at this offset (sentinel / short read / invalid).
-    End,
+    /// End of this segment's records: `< 20` bytes remain (within `segment_size`)
+    /// or a sentinel header (§8.2 step 1). Never a torn tail.
+    CleanEnd,
+    /// A header is present but the record is invalid at this offset — a candidate
+    /// boundary for recovery's tail-vs-corruption classification (§8.2 steps 2–4):
+    /// length over `max_record_size`, framed overrun, a short physical read
+    /// (file truncated below `segment_size`), CRC mismatch, or unknown `rec_type`.
+    Invalid,
+}
+
+/// Fill `buf` from `offset`, returning `false` on a short read (physical EOF
+/// before `buf` is full — e.g. a segment file truncated below `segment_size` by
+/// fault injection, §14.4f). Tolerating the short read here, rather than letting
+/// `read_exact_at` surface `UnexpectedEof`, is what keeps recovery total over a
+/// truncated file (D11).
+fn read_full_at(file: &File, buf: &mut [u8], offset: u64) -> io::Result<bool> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match file.read_at(&mut buf[filled..], offset + filled as u64) {
+            Ok(0) => return Ok(false),
+            Ok(n) => filled += n,
+            Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(true)
 }
 
 /// Read and classify the record at `offset` in `file`, into the reusable `buf`.
@@ -201,36 +229,45 @@ pub(crate) fn read_record_at(
     );
     let remaining = segment_size.saturating_sub(offset);
     if remaining < RECORD_HEADER_SIZE as u64 {
-        return Ok(ScanOutcome::End);
+        return Ok(ScanOutcome::CleanEnd);
     }
 
-    // Read the fixed header first to learn `length`, then size the full read.
+    // Read the fixed header first to learn `length`, then size the full read. A
+    // short physical read means the file was truncated below `segment_size`
+    // (§14.4f): a candidate boundary, not a clean sentinel.
     buf.resize(RECORD_HEADER_SIZE, 0);
-    file.read_exact_at(&mut buf[..RECORD_HEADER_SIZE], offset)?;
+    if !read_full_at(file, &mut buf[..RECORD_HEADER_SIZE], offset)? {
+        return Ok(ScanOutcome::Invalid);
+    }
 
     // A short-circuit on the sentinel keeps a cleanly-rolled / partially-filled
     // tail cheap (no length parse, no second read).
     if let Decoded::Sentinel = record::decode(&buf[..RECORD_HEADER_SIZE], max_record_size) {
-        return Ok(ScanOutcome::End);
+        return Ok(ScanOutcome::CleanEnd);
     }
 
     let length = u32::from_le_bytes(buf[4..8].try_into().unwrap());
     if length > max_record_size {
-        return Ok(ScanOutcome::End);
+        return Ok(ScanOutcome::Invalid);
     }
     // u64 math: a near-u32::MAX length cannot overflow the framed size here.
     let framed = record::framed_size(length as usize);
     if framed as u64 > remaining {
         // The framed record overruns the segment — a short/torn tail.
-        return Ok(ScanOutcome::End);
+        return Ok(ScanOutcome::Invalid);
     }
 
-    // Read the payload + padding tail, then validate the whole framed record.
+    // Read the payload + padding tail, then validate the whole framed record. A
+    // short physical read here is again a truncated file (§14.4f) ⇒ candidate
+    // boundary.
     buf.resize(framed, 0);
-    file.read_exact_at(
+    if !read_full_at(
+        file,
         &mut buf[RECORD_HEADER_SIZE..framed],
         offset + RECORD_HEADER_SIZE as u64,
-    )?;
+    )? {
+        return Ok(ScanOutcome::Invalid);
+    }
 
     match record::decode(&buf[..framed], max_record_size) {
         Decoded::Record {
@@ -246,8 +283,35 @@ pub(crate) fn read_record_at(
                 framed_len,
             })
         }
-        _ => Ok(ScanOutcome::End),
+        _ => Ok(ScanOutcome::Invalid),
     }
+}
+
+/// Durably zero `[from, segment_size)` of `file` (§8.2.1): `pwrite` zeros over
+/// the (pre-allocated) tail, then a fully-durable sync. This is the physical
+/// invalidation of a truncated tail — it makes any stale bytes read as zero
+/// (the §5.4 end-of-records sentinel) and durably, so no stale-but-CRC-valid
+/// record can be resurrected on a later recovery (D10). The region MUST extend
+/// to **EOF**, never a bounded window, because a previous generation may have
+/// written a longer record past `from`.
+///
+/// A pure data write over allocated blocks needs only `fdatasync`-class
+/// durability — but on macOS that is `F_FULLFSYNC` (§8.3), hence
+/// [`sync_data_fully`]. Writing also re-extends a physically truncated file
+/// back to `segment_size`, restoring the pre-allocation the write path assumes.
+pub(crate) fn zero_to_eof(file: &File, from: u64, segment_size: u64) -> Result<()> {
+    const CHUNK: usize = 64 * 1024;
+    let zeros = [0u8; CHUNK];
+    let mut off = from;
+    while off < segment_size {
+        let n = std::cmp::min(CHUNK as u64, segment_size - off) as usize;
+        file.write_all_at(&zeros[..n], off)?;
+        off += n as u64;
+    }
+    if sync_data_fully(file).is_err() {
+        return Err(WalError::FsyncFailed);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
