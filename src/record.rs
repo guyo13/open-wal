@@ -74,6 +74,16 @@ pub(crate) const fn framed_size(payload_len: usize) -> usize {
     RECORD_HEADER_SIZE + payload_len + padding_for(payload_len)
 }
 
+/// `framed_size` computed entirely in `u64`, so a near-`u32::MAX` `payload_len`
+/// cannot wrap on a 32-bit target (where `usize` is 32-bit and `20 + len` would
+/// overflow). Used by the recovery scanner to size a read **before** narrowing
+/// to `usize`, keeping recovery panic-free for any on-disk `length` (D11).
+#[inline]
+#[must_use]
+pub(crate) const fn framed_size_u64(payload_len: u64) -> u64 {
+    RECORD_HEADER_SIZE as u64 + payload_len + padding_for_u64(payload_len)
+}
+
 /// Outcome of decoding one record from the front of a byte slice.
 ///
 /// The borrow of [`Decoded::Record::payload`] is tied to the input slice.
@@ -416,6 +426,26 @@ mod tests {
             let expected = (8 - ((20u64 + len % 8) % 8)) % 8;
             assert_eq!(padding_for_u64(len), expected);
         }
+    }
+
+    #[test]
+    fn framed_size_u64_matches_and_does_not_wrap() {
+        // Agrees with the usize helper across normal sizes.
+        for len in [0usize, 1, 7, 8, 9, 20, 4096] {
+            assert_eq!(framed_size_u64(len as u64), framed_size(len) as u64);
+        }
+        // The scanner sizes reads with this: a near-`u32::MAX` `length` (the
+        // largest a record header can encode) must yield its true, un-wrapped
+        // framed size — on a 32-bit target the usize `framed_size` would overflow
+        // `20 + len` and could collapse below the 20-byte header, panicking the
+        // payload slice in `read_record_at` (D11).
+        let big = u32::MAX as u64;
+        let f = framed_size_u64(big);
+        assert!(
+            f >= 20 + big,
+            "framed_size_u64 must not wrap for a huge length"
+        );
+        assert_eq!(f % 8, 0, "framed size is always 8-aligned");
     }
 
     proptest! {
