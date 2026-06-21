@@ -128,8 +128,15 @@ pub(crate) fn sync_data_fully(file: &File) -> io::Result<()> {
 /// `O_CREAT|O_EXCL` (never clobber an existing segment), `fallocate` to
 /// `segment_size` (the unwritten remainder is zero-filled — the §5.4 sentinel
 /// region), `pwrite` the 64-byte header at offset 0, then `sync_data_fully` so
-/// the header is durable. The caller is responsible for the **directory** fsync
-/// that makes the new filename durable (§7.4 step 5).
+/// the header **and** the pre-allocated zeros are durable. The caller is
+/// responsible for the **directory** fsync that makes the new filename durable
+/// (§7.4 step 5).
+///
+/// On filesystems that do not implement `fallocate` (e.g. FUSE/LazyFS — the
+/// §14.4b fault-injection backend — and some network filesystems), this falls
+/// back to an explicit zero-fill to the same effect: a fully allocated,
+/// zero-initialized segment. The single `sync_data_fully` below covers both the
+/// zero-fill and the header.
 pub(crate) fn create(dir: &Path, base_lsn: Lsn, segment_size: u64) -> Result<File> {
     let path = dir.join(filename_for(base_lsn));
     let file = OpenOptions::new()
@@ -138,8 +145,15 @@ pub(crate) fn create(dir: &Path, base_lsn: Lsn, segment_size: u64) -> Result<Fil
         .create_new(true)
         .open(&path)?;
 
-    rustix::fs::fallocate(&file, rustix::fs::FallocateFlags::empty(), 0, segment_size)
-        .map_err(io::Error::from)?;
+    match rustix::fs::fallocate(&file, rustix::fs::FallocateFlags::empty(), 0, segment_size) {
+        Ok(()) => {}
+        // EOPNOTSUPP / ENOSYS: the filesystem has no `fallocate`. Pre-allocate by
+        // writing zeros instead — slower, but startup-only and identical on disk.
+        Err(rustix::io::Errno::OPNOTSUPP | rustix::io::Errno::NOSYS) => {
+            write_zeros(&file, 0, segment_size)?;
+        }
+        Err(e) => return Err(io::Error::from(e).into()),
+    }
 
     let header = encode_header(base_lsn, created_unix_nanos());
     file.write_all_at(&header, 0)?;
@@ -300,16 +314,23 @@ pub(crate) fn read_record_at(
 /// [`sync_data_fully`]. Writing also re-extends a physically truncated file
 /// back to `segment_size`, restoring the pre-allocation the write path assumes.
 pub(crate) fn zero_to_eof(file: &File, from: u64, segment_size: u64) -> Result<()> {
+    write_zeros(file, from, segment_size)?;
+    if sync_data_fully(file).is_err() {
+        return Err(WalError::FsyncFailed);
+    }
+    Ok(())
+}
+
+/// `pwrite` zero bytes over `[from, to)` in bounded chunks (no sync). Shared by
+/// the `fallocate`-less pre-allocation fallback and [`zero_to_eof`].
+fn write_zeros(file: &File, from: u64, to: u64) -> io::Result<()> {
     const CHUNK: usize = 64 * 1024;
     let zeros = [0u8; CHUNK];
     let mut off = from;
-    while off < segment_size {
-        let n = std::cmp::min(CHUNK as u64, segment_size - off) as usize;
+    while off < to {
+        let n = std::cmp::min(CHUNK as u64, to - off) as usize;
         file.write_all_at(&zeros[..n], off)?;
         off += n as u64;
-    }
-    if sync_data_fully(file).is_err() {
-        return Err(WalError::FsyncFailed);
     }
     Ok(())
 }
