@@ -264,12 +264,18 @@ pub(crate) fn read_record_at(
     if length > max_record_size {
         return Ok(ScanOutcome::Invalid);
     }
-    // u64 math: a near-u32::MAX length cannot overflow the framed size here.
-    let framed = record::framed_size(length as usize);
-    if framed as u64 > remaining {
+    // Size the framed record in u64 so a near-`u32::MAX` `length` cannot wrap on
+    // a 32-bit target (where the `usize` `framed_size` would overflow `20 + len`
+    // and could collapse below the header, panicking the slice below) — D11
+    // requires recovery to stay panic-free for any on-disk bytes. The overrun
+    // check is done in u64 too; only after it bounds `framed ≤ remaining ≤
+    // segment_size` do we narrow to `usize`.
+    let framed_u64 = record::framed_size_u64(u64::from(length));
+    if framed_u64 > remaining {
         // The framed record overruns the segment — a short/torn tail.
         return Ok(ScanOutcome::Invalid);
     }
+    let framed = framed_u64 as usize;
 
     // Read the payload + padding tail, then validate the whole framed record. A
     // short physical read here is again a truncated file (§14.4f) ⇒ candidate

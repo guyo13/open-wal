@@ -170,16 +170,14 @@ fn classify(
 /// padding), looking for a structurally valid record that **continues the log**.
 ///
 /// A genuine acked record after the gap proves data past `x` was real (D5). The
-/// spec's §8.2 wording is `lsn == expected_next_lsn`, but that is inconsistent
-/// with §14.4e ("finds the **next** valid record"): when record `E` is itself
-/// corrupted, `expected_next_lsn == E` yet the next genuine record is `E + 1`,
-/// so an exact-equality test would never match and would silently misclassify
-/// the mid-log corruption as a torn tail (a D5 violation). The correct, and
-/// §14.4e-consistent, condition is `lsn >= expected_next_lsn`: every genuine
-/// continuation record has an LSN at least the expected one, while a torn tail
-/// has no valid record ahead at all (the post-tail region is zeroed — §8.2.1 —
-/// so no stale record can appear within the bound). *(Design-doc discrepancy;
-/// see the M3 notes — §8.2 step 5 should read `>=`, not `==`.)*
+/// condition is `lsn >= expected_next_lsn` (the corrected §8.2 step 5, v6.1):
+/// when the record at `x` is itself a corrupted acked record, the next genuine
+/// record is `expected_next_lsn + 1`, never `expected_next_lsn`, so the earlier
+/// `==` form would never match and would silently misclassify mid-log corruption
+/// as a torn tail (a D5 violation, inconsistent with §14.4e's "finds the **next**
+/// valid record"). Every genuine continuation has `lsn >= expected_next_lsn`,
+/// while a torn tail has no valid record ahead at all — the post-tail region is
+/// durably zeroed (§8.2.1 / D10), so no stale record can appear within the bound.
 ///
 /// The bound keeps recovery `O(segment)` with a small constant and immune to a
 /// garbage-CRC scan DoS (D11). Every individual read is also bounded by
