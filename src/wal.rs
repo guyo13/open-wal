@@ -1,11 +1,12 @@
-//! The single-writer `Wal` handle — open, append, commit, replay (M2).
+//! The single-writer `Wal` handle — open, append, commit, replay.
 //!
-//! **M2 scope:** a single, pre-allocated segment. `append` is pure memory
-//! (§7.1); `commit` writes the staged batch and `fdatasync`s it (§7.2,
-//! single-segment only); `open` cold-starts an empty directory or cleanly
-//! reopens a single segment. Segment roll, commit-time split, torn-tail
-//! recovery, and checkpoint are later milestones (M3–M5) and are deliberately
-//! absent here.
+//! **Scope through M3:** a single, pre-allocated segment. `append` is pure
+//! memory (§7.1); `commit` writes the staged batch and `fdatasync`s it (§7.2,
+//! single-segment only); `open` cold-starts an empty directory or reopens a
+//! single segment, running full intra-segment recovery on it (§8.2,
+//! [`recovery`](crate::recovery) — torn-tail truncation + durable zeroing, and
+//! fatal-on-mid-log-corruption). Segment roll, commit-time split, and
+//! checkpoint are later milestones (M4–M5) and are deliberately absent here.
 
 use std::cell::Cell;
 use std::fs::{File, OpenOptions};
@@ -17,6 +18,7 @@ use std::path::Path;
 use crate::error::{Result, WalError};
 use crate::observer::{DurabilityObserver, NullObserver};
 use crate::reader::Reader;
+use crate::recovery;
 use crate::segment::{self, HEADER_SIZE};
 use crate::{Lsn, WalConfig};
 
@@ -38,11 +40,10 @@ pub struct RecoveryReport {
 /// State of the active segment's tail after recovery (§6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TailState {
-    /// The tail ended cleanly (sentinel / end of records). M2 always reports
-    /// this; torn-tail truncation is M3.
+    /// The tail ended cleanly (sentinel / end of records); no truncation.
     Clean,
-    /// A torn tail was detected, truncated, and zeroed at this offset of the
-    /// active segment (produced from M3 onward).
+    /// A torn tail was detected, truncated, and durably zeroed at this offset of
+    /// the active segment (§8.2.1).
     TruncatedAt {
         /// `base_lsn` of the active segment that was truncated.
         segment_base: Lsn,
@@ -93,9 +94,10 @@ impl<O: DurabilityObserver> Wal<O> {
     /// `observer` (§6). Acquires an exclusive advisory lock on the directory;
     /// fails with [`Locked`](WalError::Locked) if already held.
     ///
-    /// M2 recovers a single segment cleanly: it cold-starts an empty directory
-    /// (creating `…0001.wal`) or reopens an existing segment, scanning its
-    /// records up to the first sentinel. Torn-tail handling is M3.
+    /// Recovers a single segment (§8.2): it cold-starts an empty directory
+    /// (creating `…0001.wal`) or reopens an existing segment, scanning its dense
+    /// record run and handling a torn tail (truncate + durably zero `[X, EOF)`)
+    /// or mid-log corruption (fatal). Multi-segment recovery is M4.
     pub fn open_with(
         dir: &Path,
         config: WalConfig,
@@ -136,18 +138,19 @@ impl<O: DurabilityObserver> Wal<O> {
         }
         bases.sort_unstable();
 
-        let (active, active_base, write_offset, last_lsn, oldest_lsn, segments_scanned) =
+        let (active, active_base, write_offset, last_lsn, oldest_lsn, segments_scanned, tail_state) =
             if bases.is_empty() {
-                Self::cold_start(dir, config.segment_size)?
+                let (f, base, off, last, oldest, n) = Self::cold_start(dir, config.segment_size)?;
+                (f, base, off, last, oldest, n, TailState::Clean)
             } else {
-                Self::reopen_single(dir, &bases, config)?
+                Self::reopen(dir, &bases, config)?
             };
 
         let durable_lsn = last_lsn;
         let report = RecoveryReport {
             oldest_lsn,
             durable_lsn,
-            tail_state: TailState::Clean,
+            tail_state,
             segments_scanned,
         };
 
@@ -178,20 +181,22 @@ impl<O: DurabilityObserver> Wal<O> {
         Ok((active, Lsn::FIRST, HEADER_SIZE, Lsn::NONE, Lsn::FIRST, 1))
     }
 
-    /// Clean reopen of the highest-base segment (M2 single-segment scope): the
-    /// lower bases (if any) only set `oldest_lsn`; the active segment is scanned
-    /// for its dense run of records.
+    /// Reopen the highest-base segment and run intra-segment recovery on it
+    /// (§8.2, M3). The lower bases (if any) only set `oldest_lsn`.
     ///
-    /// M4/M3: this is **not** full recovery. It scans only the highest-base
-    /// segment and validates neither the sealed segments' headers nor
-    /// cross-segment LSN continuity (§8.1 steps 2–3); `segments_scanned` counts
-    /// the files discovered, not the ones scanned. Those checks (and torn-tail
-    /// handling) arrive when M3/M4 generalize this path.
-    fn reopen_single(
+    /// **M3 single-segment scope:** this recovers only the highest-base (active)
+    /// segment — with full torn-tail/corruption classification — but does **not**
+    /// yet validate the sealed segments' headers or cross-segment LSN continuity
+    /// (§8.1 steps 2–3); `segments_scanned` counts the files discovered, not the
+    /// ones scanned. The writer cannot produce multiple segments before M4, so
+    /// those checks (and the §8.4 discard of an incomplete-header highest-base
+    /// file) arrive with the roll machinery in M4. The active segment's
+    /// classifier path is already exercised here.
+    fn reopen(
         dir: &Path,
         bases: &[u64],
         config: WalConfig,
-    ) -> Result<(File, Lsn, u64, Lsn, Lsn, usize)> {
+    ) -> Result<(File, Lsn, u64, Lsn, Lsn, usize, TailState)> {
         let oldest_lsn = Lsn(bases[0]);
         let active_base = Lsn(*bases.last().unwrap());
 
@@ -200,53 +205,42 @@ impl<O: DurabilityObserver> Wal<O> {
             .write(true)
             .open(dir.join(segment::filename_for(active_base)))?;
 
-        // Validate the active header and confirm it matches its filename.
+        // Validate the active header and confirm it matches its filename. A bad
+        // header is fatal (§8.1 step 2); it is written and synced at creation,
+        // so it is never a torn tail. A physically truncated header (file cut
+        // below 64 bytes, §14.4f) is reported as `BadSegmentHeader` rather than
+        // a raw `UnexpectedEof`, keeping recovery total (D11).
         let mut header = [0u8; HEADER_SIZE as usize];
-        active.read_exact_at(&mut header, 0)?;
+        match active.read_exact_at(&mut header, 0) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                return Err(WalError::BadSegmentHeader);
+            }
+            Err(e) => return Err(WalError::Io(e)),
+        }
         let parsed = segment::decode_header(&header)?;
         if parsed.base_lsn != active_base {
             return Err(WalError::BadSegmentHeader);
         }
 
-        // Forward scan the active segment's clean record run.
-        let mut buf = Vec::new();
-        let mut offset = HEADER_SIZE;
-        let mut expected = active_base;
-        let mut last = Lsn::NONE;
-        let mut any = false;
-        loop {
-            let outcome = segment::read_record_at(
-                &active,
-                offset,
-                config.segment_size,
-                config.max_record_size,
-                &mut buf,
-            )?;
-            let (lsn, framed_len) = match outcome {
-                segment::ScanOutcome::Record {
-                    lsn, framed_len, ..
-                } => (lsn, framed_len),
-                segment::ScanOutcome::End => break,
-            };
-            // A clean log is dense and in order; a break is the end of records.
-            if lsn != expected {
-                break;
-            }
-            offset += framed_len as u64;
-            last = lsn;
-            expected = lsn.next();
-            any = true;
-        }
+        // Intra-segment recovery: tail detection, durable zero-to-EOF on a torn
+        // tail, fatal on mid-log corruption (§8.2).
+        let rec = recovery::recover_segment(
+            &active,
+            active_base,
+            true,
+            config.segment_size,
+            config.max_record_size,
+        )?;
 
-        // An empty active segment's durable_lsn is `base_lsn - 1` (§8.1).
-        let last_lsn = if any { last } else { Lsn(active_base.0 - 1) };
         Ok((
             active,
             active_base,
-            offset,
-            last_lsn,
+            rec.write_offset,
+            rec.max_lsn,
             oldest_lsn,
             bases.len(),
+            rec.tail_state,
         ))
     }
 

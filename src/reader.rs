@@ -87,7 +87,10 @@ impl<'w> Reader<'w> {
                     self.done = true;
                     return Some(Err(e));
                 }
-                Ok(ScanOutcome::End) => {
+                Ok(ScanOutcome::CleanEnd) | Ok(ScanOutcome::Invalid) => {
+                    // A sentinel, short read, or invalid record ends the live
+                    // stream cleanly; torn-tail/corruption classification is a
+                    // recovery concern (§8.2), not a read.
                     self.done = true;
                     return None;
                 }

@@ -29,6 +29,7 @@ mod lsn;
 mod observer;
 mod reader;
 mod record;
+mod recovery;
 mod segment;
 mod wal;
 
