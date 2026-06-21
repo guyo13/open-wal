@@ -121,6 +121,7 @@ name = "open-wal"
 version = "0.1.0"
 dependencies = [
  "crc32c",
+ "libc",
  "proptest",
  "rustix",
  "tempfile",

@@ -15,15 +15,23 @@
 //!   `fifo_path_completed` FIFO, which LazyFS opens `O_WRONLY` once at startup
 //!   and which gates all command processing on a persistent reader.
 //!
-//! Run with, e.g.:
+//! The easiest way to run these is the harness, which builds + mounts LazyFS and
+//! runs this suite for you (see `scripts/README.md`):
 //! ```text
-//! LAZYFS_MNT=/tmp/wal.mnt LAZYFS_FIFO=/tmp/lz.faults.fifo LAZYFS_LOG=/tmp/lz.log \
+//! scripts/lazyfs-gate.sh deps   # once: install fuse3 + build deps (apt)
+//! scripts/lazyfs-gate.sh all    # build + mount + run + always unmount
+//! ```
+//! Or, against an already-running mount, set the three env vars and run directly
+//! (single-threaded — `clear-cache` is global to the mount, so parallel tests
+//! would corrupt each other):
+//! ```text
+//! LAZYFS_MNT=… LAZYFS_FIFO=… LAZYFS_LOG=… \
 //!   cargo test --test lazyfs_gate -- --ignored --test-threads=1
 //! ```
 
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -70,14 +78,35 @@ fn clear_cache() {
     let log = env("LAZYFS_LOG");
     let before = cleared_count(&log);
 
-    let mut f = OpenOptions::new().write(true).open(&fifo).unwrap();
+    // Open the faults FIFO **non-blocking**: a blocking `O_WRONLY` open of a FIFO
+    // hangs forever if no reader is attached, so a dead LazyFS daemon would stall
+    // the test (and the CI runner) indefinitely. `O_NONBLOCK` returns `ENXIO`
+    // immediately instead; we retry briefly to absorb a startup race where the
+    // daemon's FIFO reader is not yet attached, then fail loudly.
+    let start = Instant::now();
+    let mut f = loop {
+        match OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&fifo)
+        {
+            Ok(f) => break f,
+            Err(e)
+                if e.raw_os_error() == Some(libc::ENXIO)
+                    && start.elapsed() < Duration::from_secs(5) =>
+            {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => panic!("cannot open LazyFS faults FIFO {fifo} (daemon down?): {e}"),
+        }
+    };
     writeln!(f, "lazyfs::clear-cache").unwrap();
     f.flush().unwrap();
     drop(f);
 
-    let start = Instant::now();
+    let barrier = Instant::now();
     while cleared_count(&log) <= before {
-        if start.elapsed() > Duration::from_secs(30) {
+        if barrier.elapsed() > Duration::from_secs(30) {
             panic!("clear-cache did not complete within 30s (LAZYFS_LOG barrier)");
         }
         std::thread::sleep(Duration::from_millis(10));
