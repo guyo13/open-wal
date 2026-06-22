@@ -17,9 +17,10 @@
 //! a streaming [`Reader`], the [`DurabilityObserver`] hook, segment
 //! pre-allocation and `fdatasync`, and a zero-allocation hot path. **M3** adds
 //! intra-segment crash recovery (torn-tail detection + durable zeroing, fatal
-//! mid-log corruption). Multi-segment roll/split (M4) and checkpoint (M5) arrive
-//! later — `open` currently recovers a single segment and rejects a
-//! multi-segment directory with [`Unsupported`](WalError::Unsupported).
+//! mid-log corruption). **M4** adds the multi-segment write path — segment roll,
+//! commit-time whole-record split, sealed-segment immutability — and
+//! multi-segment recovery (discovery, cross-segment continuity, crash-during-roll
+//! handling). Checkpoint/retention (M5) arrives later.
 
 // This is an embeddable library; every public item must be documented. With
 // CI's `clippy -D warnings`, an undocumented public item fails the build.

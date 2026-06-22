@@ -62,16 +62,6 @@ pub enum WalError {
     /// Retained segments do not form a contiguous LSN suffix (§8.1).
     ContiguityViolation,
 
-    /// An on-disk layout this build cannot safely recover — distinct from
-    /// corruption (the bytes may be fine). Currently returned when a directory
-    /// holds more than one segment: multi-segment recovery (§8.1) is an M4
-    /// feature, so until then `open()` refuses rather than silently recover only
-    /// the active segment and present an internal gap (D2/D6).
-    Unsupported {
-        /// Short, static description of the unsupported layout/operation.
-        detail: &'static str,
-    },
-
     /// The handle was poisoned by a prior durability failure (§12). All
     /// subsequent `append`/`commit` calls return this.
     Poisoned,
@@ -101,7 +91,6 @@ impl fmt::Display for WalError {
             WalError::Locked => write!(f, "WAL directory is already locked by another writer"),
             WalError::FsyncFailed => write!(f, "fsync failed; handle is poisoned"),
             WalError::ContiguityViolation => write!(f, "retained segments are not contiguous"),
-            WalError::Unsupported { detail } => write!(f, "unsupported WAL layout: {detail}"),
             WalError::Poisoned => write!(f, "WAL handle is poisoned by a prior durability failure"),
         }
     }

@@ -176,6 +176,22 @@ pub(crate) fn encode_into(buf: &mut Vec<u8>, lsn: Lsn, payload: &[u8]) -> usize 
     framed
 }
 
+/// Read the `lsn` and total framed length of the record at the front of `buf`,
+/// which MUST hold at least one whole record as produced by [`encode_into`].
+///
+/// Used by `commit` to walk the staging buffer at whole-record boundaries for
+/// the §7.3 commit-time segment split. It performs **no** validation (no CRC, no
+/// bound check): these are records this process just encoded, not untrusted
+/// on-disk bytes — so unlike [`decode`] it is not part of the D11 surface.
+pub(crate) fn peek(buf: &[u8]) -> (Lsn, usize) {
+    debug_assert!(buf.len() >= RECORD_HEADER_SIZE, "peek needs a whole record");
+    let length = u32::from_le_bytes(buf[LEN_OFF..LEN_OFF + 4].try_into().unwrap()) as usize;
+    let lsn = Lsn(u64::from_le_bytes(
+        buf[LSN_OFF..LSN_OFF + 8].try_into().unwrap(),
+    ));
+    (lsn, framed_size(length))
+}
+
 /// Decode the record at the front of `buf`, bounded by `max_record_size`.
 ///
 /// Never panics and never reads out of bounds for any input (D11, record level).
