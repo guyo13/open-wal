@@ -7,38 +7,10 @@
 
 use std::path::Path;
 
-use open_wal::{Lsn, TailState, Wal, WalConfig, WalError};
+mod common;
+use common::*;
 
-const SEGMENT_SIZE: u64 = 64 * 1024;
-const HEADER_SIZE: u64 = 64;
-
-fn config() -> WalConfig {
-    WalConfig {
-        segment_size: SEGMENT_SIZE,
-        max_record_size: 4096,
-    }
-}
-
-fn framed(len: usize) -> u64 {
-    let pad = (8 - ((20 + len) % 8)) % 8;
-    (20 + len + pad) as u64
-}
-
-fn offset_of(payloads: &[&[u8]], i: usize) -> u64 {
-    HEADER_SIZE + payloads[..i].iter().map(|p| framed(p.len())).sum::<u64>()
-}
-
-fn seg_path(dir: &Path) -> std::path::PathBuf {
-    dir.join("00000000000000000001.wal")
-}
-
-fn write_clean(dir: &Path, payloads: &[&[u8]]) {
-    let (mut wal, _) = Wal::open(dir, config()).unwrap();
-    for p in payloads {
-        wal.append(p).unwrap();
-    }
-    wal.commit().unwrap();
-}
+use open_wal::{Lsn, TailState, Wal, WalError};
 
 fn truncate_to(dir: &Path, len: u64) {
     let f = std::fs::OpenOptions::new()
@@ -47,19 +19,6 @@ fn truncate_to(dir: &Path, len: u64) {
         .unwrap();
     f.set_len(len).unwrap();
     f.sync_all().unwrap();
-}
-
-fn replay(wal: &Wal) -> Vec<Vec<u8>> {
-    let mut r = wal.reader_from(Lsn(0)).unwrap();
-    let mut out = Vec::new();
-    let mut expected = 1u64;
-    while let Some(item) = r.next() {
-        let (lsn, payload) = item.unwrap();
-        assert_eq!(lsn, Lsn(expected), "dense from 1");
-        out.push(payload.to_vec());
-        expected += 1;
-    }
-    out
 }
 
 /// Reopen, asserting the recovered prefix is `&payloads[..keep]`, the tail was

@@ -9,6 +9,11 @@ description = "An embedded Write-Ahead Log (WAL) library for Rust."
 license = "BSD-3-Clause"
 repository = "https://github.com/guyo13/open-wal"
 readme = "README.md"
+# `src/bin/crash_child.rs` is a test-only helper spawned by
+# `tests/process_crash.rs` (§14.4a). It is built locally/in CI for the tests but
+# MUST NOT ship to crates.io consumers, so exclude it from the published package.
+# (Excluding only affects packaging; local `cargo test` still builds the bin.)
+exclude = ["src/bin"]
 
 [dependencies]
 # Castagnoli CRC-32C (hardware-accelerated, software fallback). NOT crc32fast,

@@ -13,37 +13,12 @@
 //! FATAL") is exercised as a white-box unit test in `src/recovery.rs`, since the
 //! M3 writer cannot yet produce a sealed segment (rolls are M4).
 
-use std::os::unix::fs::FileExt;
 use std::path::Path;
 
-use open_wal::{Lsn, TailState, Wal, WalConfig, WalError};
+mod common;
+use common::*;
 
-const SEGMENT_SIZE: u64 = 64 * 1024;
-const MAX_RECORD_SIZE: u32 = 4096;
-const HEADER_SIZE: u64 = 64;
-
-fn config() -> WalConfig {
-    WalConfig {
-        segment_size: SEGMENT_SIZE,
-        max_record_size: MAX_RECORD_SIZE,
-    }
-}
-
-/// On-disk framed size of a record with a `len`-byte payload (header + payload
-/// + 8-byte-alignment padding) — mirrors the internal `record::framed_size`.
-fn framed(len: usize) -> u64 {
-    let pad = (8 - ((20 + len) % 8)) % 8;
-    (20 + len + pad) as u64
-}
-
-/// Byte offset of the `i`-th record (0-based) in a segment holding `payloads`.
-fn offset_of(payloads: &[&[u8]], i: usize) -> u64 {
-    HEADER_SIZE + payloads[..i].iter().map(|p| framed(p.len())).sum::<u64>()
-}
-
-fn seg_path(dir: &Path) -> std::path::PathBuf {
-    dir.join("00000000000000000001.wal")
-}
+use open_wal::{Lsn, TailState, Wal, WalError};
 
 /// `Wal::open`'s error, or panic if it unexpectedly succeeded. (`Wal` is not
 /// `Debug`, so `Result::unwrap_err` is unavailable.)
@@ -52,43 +27,6 @@ fn open_err(dir: &Path) -> WalError {
         Ok(_) => panic!("expected recovery to fail, but open() succeeded"),
         Err(e) => e,
     }
-}
-
-/// Write and commit `payloads` as a clean single-segment log, then close it.
-fn write_clean(dir: &Path, payloads: &[&[u8]]) {
-    let (mut wal, _) = Wal::open(dir, config()).unwrap();
-    for p in payloads {
-        wal.append(p).unwrap();
-    }
-    wal.commit().unwrap();
-}
-
-/// Flip the high bit of one byte at `offset` in the segment file.
-fn flip_byte(dir: &Path, offset: u64) {
-    let f = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(seg_path(dir))
-        .unwrap();
-    let mut b = [0u8; 1];
-    f.read_at(&mut b, offset).unwrap();
-    b[0] ^= 0xFF;
-    f.write_all_at(&b, offset).unwrap();
-    f.sync_all().unwrap();
-}
-
-/// Replay the whole log into owned payloads, asserting dense LSNs from 1.
-fn replay(wal: &Wal) -> Vec<Vec<u8>> {
-    let mut r = wal.reader_from(Lsn(0)).unwrap();
-    let mut out = Vec::new();
-    let mut expected = 1u64;
-    while let Some(item) = r.next() {
-        let (lsn, payload) = item.unwrap();
-        assert_eq!(lsn, Lsn(expected), "recovered LSNs must be dense from 1");
-        out.push(payload.to_vec());
-        expected += 1;
-    }
-    out
 }
 
 #[test]
