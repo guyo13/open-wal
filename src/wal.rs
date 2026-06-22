@@ -138,6 +138,19 @@ impl<O: DurabilityObserver> Wal<O> {
         }
         bases.sort_unstable();
 
+        // M3 is single-segment. Multi-segment recovery (sealed-header validation
+        // + cross-segment continuity, §8.1) is M4; until then refuse a directory
+        // with more than one segment rather than silently recover only the active
+        // one and present `oldest_lsn` records that replay can't return — a
+        // silent internal gap (D2/D6). The writer cannot produce this state in M3
+        // (no roll; `create` is `O_EXCL`), so this only guards a stray/foreign
+        // `.wal` file. M4 replaces this with real multi-segment recovery.
+        if bases.len() > 1 {
+            return Err(WalError::Unsupported {
+                detail: "multiple segments found; multi-segment recovery is not implemented yet (M4)",
+            });
+        }
+
         let (active, active_base, write_offset, last_lsn, oldest_lsn, segments_scanned, tail_state) =
             if bases.is_empty() {
                 let (f, base, off, last, oldest, n) = Self::cold_start(dir, config.segment_size)?;
@@ -181,17 +194,14 @@ impl<O: DurabilityObserver> Wal<O> {
         Ok((active, Lsn::FIRST, HEADER_SIZE, Lsn::NONE, Lsn::FIRST, 1))
     }
 
-    /// Reopen the highest-base segment and run intra-segment recovery on it
-    /// (§8.2, M3). The lower bases (if any) only set `oldest_lsn`.
+    /// Reopen the single segment and run intra-segment recovery on it (§8.2, M3).
     ///
-    /// **M3 single-segment scope:** this recovers only the highest-base (active)
-    /// segment — with full torn-tail/corruption classification — but does **not**
-    /// yet validate the sealed segments' headers or cross-segment LSN continuity
-    /// (§8.1 steps 2–3); `segments_scanned` counts the files discovered, not the
-    /// ones scanned. The writer cannot produce multiple segments before M4, so
-    /// those checks (and the §8.4 discard of an incomplete-header highest-base
-    /// file) arrive with the roll machinery in M4. The active segment's
-    /// classifier path is already exercised here.
+    /// **M3 single-segment scope:** `open_with` guarantees `bases.len() == 1`
+    /// before calling this (it rejects multi-segment directories with
+    /// [`Unsupported`](WalError::Unsupported) until M4), so `bases[0]` is the only
+    /// — and active — segment. Sealed-header validation, cross-segment LSN
+    /// continuity (§8.1 steps 2–3), and the §8.4 discard of an incomplete-header
+    /// highest-base file arrive with the roll machinery in M4.
     fn reopen(
         dir: &Path,
         bases: &[u64],

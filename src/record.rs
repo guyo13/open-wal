@@ -21,8 +21,10 @@
 //! `length` is known; `length` and `padding` are **inside** CRC coverage, which
 //! closes the "hide bytes in the padding" gap (§5.3). The decoder is bounded and
 //! never panics or reads out of bounds for any input — the record-level slice of
-//! D11. LSN-continuity is *not* a codec concern: recovery (M3) layers
-//! `lsn == expected_next` on top of [`decode`].
+//! D11. LSN-continuity is *not* a codec concern: recovery (M3) layers the
+//! ordering checks on top of [`decode`] — `lsn == expected_next` for the dense
+//! run, and `lsn >= expected_next` for the bounded tail-vs-corruption forward
+//! scan (§8.2 step 5, v6.1).
 
 use crate::Lsn;
 use crate::crc::crc32c;

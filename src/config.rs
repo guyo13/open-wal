@@ -16,8 +16,9 @@ pub struct WalConfig {
     /// 20-byte record header + up to 7 padding bytes). The bound is written in
     /// additive form on purpose: the equivalent `segment_size - 91` underflows
     /// for `segment_size < 91`, which would *bypass* the check. That precondition
-    /// is **not** enforced here; `open()` validates it and returns
-    /// [`InvalidConfig`](crate::WalError::InvalidConfig) (a later milestone).
+    /// is **not** enforced by this struct; [`Wal::open`](crate::Wal::open)
+    /// validates it and returns
+    /// [`InvalidConfig`](crate::WalError::InvalidConfig) when violated.
     pub max_record_size: u32,
 }
 

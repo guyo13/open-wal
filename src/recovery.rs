@@ -47,6 +47,17 @@ pub(crate) struct SegmentRecovery {
     pub(crate) tail_state: TailState,
 }
 
+/// The fixed parameters of one segment recovery, threaded through the scan and
+/// its `classify`/forward-scan helpers (keeps their signatures small).
+struct RecoverCtx {
+    base_lsn: Lsn,
+    /// Active segment ⇒ a torn tail is legitimate; sealed ⇒ any invalid record
+    /// is fatal (§8.2 step 5).
+    is_active: bool,
+    segment_size: u64,
+    max_record_size: u32,
+}
+
 /// Recover the record run of one segment (§8.2). `is_active` selects the
 /// active-segment forward-scan/torn-tail path over the sealed-segment
 /// fatal-on-any-invalid path (§8.2 step 5).
@@ -61,6 +72,12 @@ pub(crate) fn recover_segment(
     segment_size: u64,
     max_record_size: u32,
 ) -> Result<SegmentRecovery> {
+    let ctx = RecoverCtx {
+        base_lsn,
+        is_active,
+        segment_size,
+        max_record_size,
+    };
     let mut buf = Vec::new();
     let mut offset = HEADER_SIZE;
     let mut expected = base_lsn;
@@ -75,17 +92,7 @@ pub(crate) fn recover_segment(
                 if lsn != expected {
                     // An LSN mismatch is an invalid record at this offset
                     // (§8.2 step 4) — classify it as tail vs corruption.
-                    return classify(
-                        file,
-                        base_lsn,
-                        is_active,
-                        offset,
-                        expected,
-                        last_valid,
-                        segment_size,
-                        max_record_size,
-                        &mut buf,
-                    );
+                    return classify(file, &ctx, offset, expected, last_valid, &mut buf);
                 }
                 // A valid, in-order record (§8.2 step 6): advance. No payload is
                 // retained (§8.5).
@@ -102,17 +109,7 @@ pub(crate) fn recover_segment(
                 });
             }
             ScanOutcome::Invalid => {
-                return classify(
-                    file,
-                    base_lsn,
-                    is_active,
-                    offset,
-                    expected,
-                    last_valid,
-                    segment_size,
-                    max_record_size,
-                    &mut buf,
-                );
+                return classify(file, &ctx, offset, expected, last_valid, &mut buf);
             }
         }
     }
@@ -120,46 +117,42 @@ pub(crate) fn recover_segment(
 
 /// Classify an invalid record at offset `x` (§8.2 step 5). On a torn tail this
 /// also performs the durable physical invalidation (§8.2.1) before returning.
-#[allow(clippy::too_many_arguments)]
 fn classify(
     file: &File,
-    base_lsn: Lsn,
-    is_active: bool,
+    ctx: &RecoverCtx,
     x: u64,
     expected: Lsn,
     last_valid: Lsn,
-    segment_size: u64,
-    max_record_size: u32,
     buf: &mut Vec<u8>,
 ) -> Result<SegmentRecovery> {
-    if !is_active {
+    if !ctx.is_active {
         // A sealed segment is fully synced before the next segment exists
         // (§7.3): it contains no torn tail, so any invalid record is fatal
         // corruption (§8.2 step 5). No forward scan.
         return Err(WalError::Corruption {
-            segment: base_lsn,
+            segment: ctx.base_lsn,
             offset: x,
             detail: "invalid record in sealed segment",
         });
     }
 
-    if forward_scan_finds_valid(file, x, expected, segment_size, max_record_size, buf)? {
+    if forward_scan_finds_valid(file, ctx, x, expected, buf)? {
         // A genuine, acknowledged record exists after the gap: truncating would
         // silently drop it (D5). Fatal and loud, never silent truncation.
         return Err(WalError::TornMidLog {
-            segment: base_lsn,
+            segment: ctx.base_lsn,
             offset: x,
         });
     }
 
     // Torn tail: durably invalidate `[x, EOF)` (§8.2.1) so no stale record can be
     // resurrected (D10), then report the truncation.
-    segment::zero_to_eof(file, x, segment_size)?;
+    segment::zero_to_eof(file, x, ctx.segment_size)?;
     Ok(SegmentRecovery {
         max_lsn: last_valid,
         write_offset: x,
         tail_state: TailState::TruncatedAt {
-            segment_base: base_lsn,
+            segment_base: ctx.base_lsn,
             offset: x,
         },
     })
@@ -184,18 +177,20 @@ fn classify(
 /// `segment_size` inside [`segment::read_record_at`].
 fn forward_scan_finds_valid(
     file: &File,
+    ctx: &RecoverCtx,
     x: u64,
     expected: Lsn,
-    segment_size: u64,
-    max_record_size: u32,
     buf: &mut Vec<u8>,
 ) -> Result<bool> {
-    let bound = u64::from(max_record_size) + 28;
+    let bound = u64::from(ctx.max_record_size) + 28;
+    // Inclusive: candidate start offsets are `X+8 .. X+8+bound`, i.e. distance
+    // ≤ `max_record_size + 28` from `X+8` — the largest a single record's frame
+    // can be, so the next genuine record (if any) starts within this window.
     let end = x.saturating_add(8).saturating_add(bound);
     let mut p = x.saturating_add(8);
     while p <= end {
         if let ScanOutcome::Record { lsn, .. } =
-            segment::read_record_at(file, p, segment_size, max_record_size, buf)?
+            segment::read_record_at(file, p, ctx.segment_size, ctx.max_record_size, buf)?
         {
             if lsn >= expected {
                 return Ok(true);
@@ -456,6 +451,97 @@ mod tests {
         assert_eq!(again.max_lsn, Lsn(1));
         assert_eq!(again.write_offset, x);
         assert_eq!(again.tail_state, TailState::Clean);
+    }
+
+    /// Write a valid record for `lsn`/`payload` at absolute `offset`.
+    fn write_record_at(file: &File, offset: u64, lsn: Lsn, payload: &[u8]) {
+        let mut buf = Vec::new();
+        record::encode_into(&mut buf, lsn, payload);
+        file.write_all_at(&buf, offset).unwrap();
+    }
+
+    /// Write a CRC-corrupt (invalid) record for `lsn` at absolute `offset`, so the
+    /// scanner classifies it as a boundary. Returns its framed length.
+    fn write_torn_at(file: &File, offset: u64, lsn: Lsn, payload: &[u8]) -> u64 {
+        let mut buf = Vec::new();
+        let framed = record::encode_into(&mut buf, lsn, payload);
+        buf[0] ^= 0xFF; // corrupt the CRC field
+        file.write_all_at(&buf, offset).unwrap();
+        framed as u64
+    }
+
+    #[test]
+    fn forward_scan_just_within_bound_is_fatal_tornmidlog() {
+        // B2: a genuine continuation record whose start is at the *far edge* of
+        // the bounded forward scan (`<= X+8 + (max_record_size+28)`) must still be
+        // found ⇒ fatal `TornMidLog` (D5), not a silent truncation.
+        let dir = tempfile::tempdir().unwrap();
+        let file = fresh_segment(dir.path(), Lsn(1));
+        let x = write_dense(&file, Lsn(1), &[b"first"]); // expected at x = 2
+        write_torn_at(&file, x, Lsn(2), b"z"); // invalid record at the boundary
+
+        let bound = u64::from(MAX_RECORD_SIZE) + 28;
+        let end = x + 8 + bound;
+        let within = (end / 8) * 8; // largest 8-aligned start <= end (scan reaches it)
+        assert!(within > x + 8 && within <= end);
+        write_record_at(&file, within, Lsn(2), b"genuine-continuation");
+        file.sync_data().unwrap();
+
+        let err = recover_segment(&file, Lsn(1), true, SEGMENT_SIZE, MAX_RECORD_SIZE).unwrap_err();
+        assert!(
+            matches!(err, WalError::TornMidLog { offset, .. } if offset == x),
+            "a continuation at the bound edge must be fatal, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn forward_scan_just_beyond_bound_is_torn_tail() {
+        // B2 (other side): the same continuation one 8-byte slot *beyond* the
+        // bound is not reached ⇒ torn tail, truncate at X and zero it away (D4).
+        let dir = tempfile::tempdir().unwrap();
+        let file = fresh_segment(dir.path(), Lsn(1));
+        let x = write_dense(&file, Lsn(1), &[b"first"]);
+        write_torn_at(&file, x, Lsn(2), b"z");
+
+        let bound = u64::from(MAX_RECORD_SIZE) + 28;
+        let end = x + 8 + bound;
+        let beyond = (end / 8) * 8 + 8; // first 8-aligned start strictly > end
+        assert!(beyond > end);
+        write_record_at(&file, beyond, Lsn(2), b"genuine-continuation");
+        file.sync_data().unwrap();
+
+        let rec = recover_segment(&file, Lsn(1), true, SEGMENT_SIZE, MAX_RECORD_SIZE).unwrap();
+        assert_eq!(rec.max_lsn, Lsn(1));
+        assert!(matches!(rec.tail_state, TailState::TruncatedAt { offset, .. } if offset == x));
+        // The just-beyond record was zeroed away, so it can't be resurrected.
+        let mut buf = Vec::new();
+        assert!(matches!(
+            segment::read_record_at(&file, beyond, SEGMENT_SIZE, MAX_RECORD_SIZE, &mut buf),
+            Ok(ScanOutcome::CleanEnd)
+        ));
+    }
+
+    #[test]
+    fn unknown_rec_type_at_tail_is_treated_as_torn_tail() {
+        // B3: a CRC-valid record with a reserved `rec_type` (2) is `Invalid`
+        // (UnknownRecType) to the codec; at the tail, recovery truncates it as a
+        // torn tail rather than surfacing it or panicking.
+        let dir = tempfile::tempdir().unwrap();
+        let file = fresh_segment(dir.path(), Lsn(1));
+        let x = write_dense(&file, Lsn(1), &[b"first"]);
+
+        // Craft a CRC-valid record at `x` but with rec_type = 2 (reserved).
+        let mut buf = Vec::new();
+        let framed = record::encode_into(&mut buf, Lsn(2), b"reserved-type");
+        buf[16] = 2; // rec_type byte (0=sentinel, 1=Full, 2.. reserved)
+        let crc = crate::crc::crc32c(&buf[4..framed]);
+        buf[0..4].copy_from_slice(&crc.to_le_bytes());
+        file.write_all_at(&buf, x).unwrap();
+        file.sync_data().unwrap();
+
+        let rec = recover_segment(&file, Lsn(1), true, SEGMENT_SIZE, MAX_RECORD_SIZE).unwrap();
+        assert_eq!(rec.max_lsn, Lsn(1));
+        assert!(matches!(rec.tail_state, TailState::TruncatedAt { offset, .. } if offset == x));
     }
 
     #[test]

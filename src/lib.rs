@@ -15,8 +15,11 @@
 //! encode/decode of the §5.3 framing). **M2** adds the single-segment write
 //! path and replay: [`Wal::open`]/[`append`](Wal::append)/[`commit`](Wal::commit),
 //! a streaming [`Reader`], the [`DurabilityObserver`] hook, segment
-//! pre-allocation and `fdatasync`, and a zero-allocation hot path. Multi-segment
-//! roll/split (M4), torn-tail recovery (M3), and checkpoint (M5) arrive later.
+//! pre-allocation and `fdatasync`, and a zero-allocation hot path. **M3** adds
+//! intra-segment crash recovery (torn-tail detection + durable zeroing, fatal
+//! mid-log corruption). Multi-segment roll/split (M4) and checkpoint (M5) arrive
+//! later — `open` currently recovers a single segment and rejects a
+//! multi-segment directory with [`Unsupported`](WalError::Unsupported).
 
 // This is an embeddable library; every public item must be documented. With
 // CI's `clippy -D warnings`, an undocumented public item fails the build.
