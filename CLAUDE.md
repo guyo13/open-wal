@@ -77,7 +77,7 @@ The entire value of this component is **correct behavior under crashes and fault
 | **M1** | Record codec (encode/decode, bounds, padding-in-CRC) | §14.1 codec + §14.2 round-trip + proptest (interim; §14.5 F2 decoder fuzz deferred to M9) |
 | **M2** | Single-segment `append`/`commit`/`Reader`; pre-alloc; zero-alloc hot path | §14.1, §14.2, §14.7 alloc assertion |
 | **M3** | **Intra-segment recovery** — tail detect, durable zero-to-EOF, bounded scan, sealed-vs-active, sparse index | **GATE — see below** |
-| **M4** | Multi-segment + commit-time whole-record split, empty active segment, dir fsync, **sealed-segment immutability (D12)** | §14.2 P4/P7, §14.4c (split-batch), §14.4d, §14.4h immutability |
+| **M4** | Multi-segment + commit-time whole-record split, empty active segment, dir fsync, **sealed-segment immutability (D12)**. **Also: remove the M3 single-segment guard in `wal.rs::open_with` (the `bases.len() > 1 ⇒ WalError::Unsupported` check) — real multi-segment recovery replaces it; then drop the now-likely-dead `WalError::Unsupported` variant unless a new use exists (`#[non_exhaustive]` + pre-1.0, so safe to remove).** | §14.2 P4/P7, §14.4c (split-batch), §14.4d, §14.4h immutability |
 | **M5** | Checkpoint (oldest-first, dir fsync, contiguous suffix) | §14.1 math, §14.2 P5, §14.4c |
 | **M6** | Stateful model/oracle harness | §14.3 high-iteration |
 | **M7** | Benchmarks + regression gates + zero-alloc | §14.7 |
