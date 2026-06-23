@@ -1,12 +1,14 @@
-//! The single-writer `Wal` handle — open, append, commit, replay.
+//! The single-writer `Wal` handle — open, append, commit, replay, checkpoint.
 //!
-//! **Scope through M3:** a single, pre-allocated segment. `append` is pure
-//! memory (§7.1); `commit` writes the staged batch and `fdatasync`s it (§7.2,
-//! single-segment only); `open` cold-starts an empty directory or reopens a
-//! single segment, running full intra-segment recovery on it (§8.2,
-//! [`recovery`](crate::recovery) — torn-tail truncation + durable zeroing, and
-//! fatal-on-mid-log-corruption). Segment roll, commit-time split, and
-//! checkpoint are later milestones (M4–M5) and are deliberately absent here.
+//! **Scope through M5:** `append` is pure memory (§7.1); `commit` writes the
+//! staged batch and `fdatasync`s it, splitting across segments on whole-record
+//! boundaries and rolling as needed (§7.2–7.4); `open` cold-starts an empty
+//! directory or runs full multi-segment recovery (§8 — torn-tail truncation +
+//! durable zeroing, fatal mid-log corruption, cross-segment continuity); and
+//! `checkpoint` reclaims space by deleting whole sealed segments fully
+//! superseded by `up_to`, oldest-first + dir-fsync, advancing `oldest_lsn` (§9).
+//! The active segment is never deleted and survivors stay a contiguous suffix at
+//! every crash point (D8/D9).
 
 use std::cell::Cell;
 use std::fs::{File, OpenOptions};
@@ -540,6 +542,76 @@ impl<O: DurabilityObserver> Wal<O> {
             self.max_record_size,
         ))
     }
+
+    /// Delete whole sealed segments fully superseded by `up_to`, reclaiming space
+    /// (§9). A segment covering `[b, b')` (`b'` = the next segment's base) is
+    /// deletable iff `b' − 1 ≤ up_to`; the **active segment is never deleted**.
+    ///
+    /// Deletion is **oldest-first**, then a single directory `fsync` makes the
+    /// unlinks durable. Because only a prefix is ever removed, survivors remain a
+    /// contiguous suffix at *every* crash point (D8/D9): a crash before the
+    /// dir-fsync recovers via the §4 D2 "missing prefix accepted silently" path to
+    /// the same suffix. Checkpoint only unlinks whole files — it never rewrites or
+    /// compacts — and advances `oldest_lsn (P)`.
+    ///
+    /// **Caller rule (§9):** pass only `up_to ≤ your latest durable *snapshot*
+    /// LSN`, never `durable_lsn` — recovery is "latest durable snapshot + replay of
+    /// the log after it", so deleting the log past your snapshot silently caps
+    /// recovery. The WAL trusts the caller and cannot verify this (the inverse of
+    /// D8). Any unlink/fsync failure **poisons** the handle (§12).
+    pub fn checkpoint(&mut self, up_to: Lsn) -> Result<()> {
+        if self.poisoned {
+            return Err(WalError::Poisoned);
+        }
+
+        let n = deletable_prefix_len(&self.segments, up_to);
+        if n == 0 {
+            // Nothing fully superseded (or only the active segment remains).
+            return Ok(());
+        }
+
+        // Unlink oldest-first. A `NotFound` is tolerated so a checkpoint re-run
+        // after a crash that already removed a file (but not yet its dir-fsync) is
+        // idempotent (D7) rather than fatal.
+        for &base in &self.segments[..n] {
+            match std::fs::remove_file(self.dir.join(segment::filename_for(base))) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    self.poisoned = true;
+                    return Err(WalError::Io(e));
+                }
+            }
+        }
+
+        // One dir-fsync makes the unlinks durable (§9); a failure poisons (§12).
+        if let Err(e) = fsync_dir(&self.dir) {
+            self.poisoned = true;
+            return Err(e);
+        }
+
+        // In-memory state is advanced only *after* the deletions are durable, so a
+        // crash before the dir-fsync recovers to the same contiguous suffix.
+        self.segments.drain(..n);
+        self.oldest_lsn = *self
+            .segments
+            .first()
+            .expect("the active segment is never deleted ⇒ ≥1 segment remains");
+        Ok(())
+    }
+}
+
+/// Count of oldest **sealed** segments fully superseded by `up_to` and therefore
+/// deletable (§9). Segment `i` covers `[bases[i], bases[i+1])`, so it is deletable
+/// iff `bases[i+1] − 1 ≤ up_to`. The active segment (`bases.last()`) is never
+/// deletable, so the result is always `< bases.len()` and `checkpoint` always
+/// leaves ≥1 segment. `bases` is sorted ascending (the writer's invariant).
+fn deletable_prefix_len(bases: &[Lsn], up_to: Lsn) -> usize {
+    let mut n = 0;
+    while n + 1 < bases.len() && bases[n + 1].0 - 1 <= up_to.0 {
+        n += 1;
+    }
+    n
 }
 
 /// `fsync` a directory so a newly-created filename within it is durable (§7.4).
@@ -1055,5 +1127,172 @@ mod tests {
         assert_eq!(reader.next().unwrap().unwrap(), (Lsn(4), &[4u8][..]));
         assert_eq!(reader.next().unwrap().unwrap(), (Lsn(5), &[5u8][..]));
         assert!(reader.next().is_none());
+    }
+
+    // ----- M5: checkpoint / retention (§9) -----
+
+    #[test]
+    fn deletable_prefix_len_boundary_math() {
+        // §14.1: exhaustive small-case boundary check of `b' − 1 ≤ up_to`.
+        // Segments based at 1, 3, 6 (active = 6, never deletable). Their covering
+        // ranges are [1,3), [3,6); the deletion boundaries are b'−1 = 2 and 5.
+        let bases = [Lsn(1), Lsn(3), Lsn(6)];
+        // up_to → expected number of deletable (oldest) segments.
+        let cases: &[(u64, usize)] = &[
+            (0, 0), // below everything
+            (1, 0), // one below seg-1's boundary (b'−1 = 2)
+            (2, 1), // exactly at seg-1's boundary ⇒ seg 1 deletable
+            (3, 1), // between boundaries
+            (4, 1), // one below seg-3's boundary (b'−1 = 5)
+            (5, 2), // exactly at seg-3's boundary ⇒ segs 1 and 3 deletable
+            (6, 2), // above the last sealed boundary; active (6) still kept
+            (1000, 2),
+        ];
+        for &(up_to, want) in cases {
+            assert_eq!(
+                deletable_prefix_len(&bases, Lsn(up_to)),
+                want,
+                "up_to={up_to}"
+            );
+        }
+        // The active segment is never counted: a single-segment log and an empty
+        // list yield 0 for any up_to (no underflow, no over-delete).
+        assert_eq!(deletable_prefix_len(&[Lsn(1)], Lsn(u64::MAX)), 0);
+        assert_eq!(deletable_prefix_len(&[Lsn(42)], Lsn(u64::MAX)), 0);
+        assert_eq!(deletable_prefix_len(&[], Lsn(u64::MAX)), 0);
+    }
+
+    /// Build a 3-segment log (bases 1, 3, 5) by committing five 200-byte records
+    /// into tiny (512-byte) segments; returns the dir handle.
+    fn three_segment_log(dir: &Path) -> Vec<Vec<u8>> {
+        let (mut wal, _) = Wal::open(dir, tiny_cfg()).unwrap();
+        let payloads: Vec<Vec<u8>> = (1..=5u8).map(|i| vec![i; 200]).collect();
+        for p in &payloads {
+            wal.append(p).unwrap();
+        }
+        assert_eq!(wal.commit().unwrap(), Lsn(5));
+        assert_eq!(wal.segments, vec![Lsn(1), Lsn(3), Lsn(5)]);
+        payloads
+    }
+
+    #[test]
+    fn checkpoint_deletes_superseded_sealed_segments_oldest_first() {
+        // §9: checkpoint(up_to) unlinks the fully-superseded oldest segments and
+        // advances oldest_lsn; the active segment is kept.
+        let dir = tmp();
+        three_segment_log(dir.path());
+        let (mut wal, _) = Wal::open(dir.path(), tiny_cfg()).unwrap();
+        // Seg 1 covers [1,3) ⇒ deletable at up_to ≥ 2. up_to = 2 deletes only it.
+        wal.checkpoint(Lsn(2)).unwrap();
+        assert_eq!(wal.segments, vec![Lsn(3), Lsn(5)]);
+        assert_eq!(wal.oldest_lsn, Lsn(3));
+        assert!(!dir.path().join(segment::filename_for(Lsn(1))).exists());
+        assert!(dir.path().join(segment::filename_for(Lsn(3))).exists());
+        assert!(dir.path().join(segment::filename_for(Lsn(5))).exists());
+    }
+
+    #[test]
+    fn checkpoint_never_deletes_the_active_segment() {
+        // §9: even an up_to far beyond durable keeps the active segment (it is the
+        // only one without a known b'); nothing is over-deleted.
+        let dir = tmp();
+        three_segment_log(dir.path());
+        let (mut wal, _) = Wal::open(dir.path(), tiny_cfg()).unwrap();
+        wal.checkpoint(Lsn(u64::MAX)).unwrap();
+        assert_eq!(wal.segments, vec![Lsn(5)]); // only the active base 5 remains
+        assert_eq!(wal.oldest_lsn, Lsn(5));
+        assert_eq!(wal.durable_lsn(), Lsn(5)); // untouched
+        assert_eq!(wal.last_lsn(), Lsn(5));
+    }
+
+    #[test]
+    fn checkpoint_boundary_is_exact() {
+        // D8: up_to one below a segment's b'−1 boundary keeps it; exactly at it
+        // deletes it. Seg 1 = [1,3) ⇒ boundary b'−1 = 2.
+        let dir = tmp();
+        three_segment_log(dir.path());
+        {
+            let (mut wal, _) = Wal::open(dir.path(), tiny_cfg()).unwrap();
+            wal.checkpoint(Lsn(1)).unwrap(); // one below ⇒ no deletion
+            assert_eq!(wal.segments, vec![Lsn(1), Lsn(3), Lsn(5)]);
+        }
+        let (mut wal, _) = Wal::open(dir.path(), tiny_cfg()).unwrap();
+        wal.checkpoint(Lsn(2)).unwrap(); // exactly at ⇒ delete seg 1
+        assert_eq!(wal.segments, vec![Lsn(3), Lsn(5)]);
+    }
+
+    #[test]
+    fn checkpoint_then_reopen_recovers_dense_suffix() {
+        // §14.2 P5 / D7,D8: after checkpoint the log reopens to a dense suffix from
+        // the new oldest_lsn; retained records are byte-identical; a reader from
+        // below the new P is a fatal gap (§15.4); none of the kept records is lost.
+        let dir = tmp();
+        let payloads = three_segment_log(dir.path());
+        {
+            let (mut wal, _) = Wal::open(dir.path(), tiny_cfg()).unwrap();
+            wal.checkpoint(Lsn(2)).unwrap(); // drop seg 1 (lsns 1,2)
+        }
+        let (wal, report) = Wal::open(dir.path(), tiny_cfg()).unwrap();
+        assert_eq!(report.oldest_lsn, Lsn(3));
+        assert_eq!(report.durable_lsn, Lsn(5));
+        // Below the new P ⇒ fatal gap, never a silent skip.
+        assert!(matches!(
+            wal.reader_from(Lsn(2)),
+            Err(WalError::ContiguityViolation)
+        ));
+        // Dense, byte-identical replay of the retained suffix [3, 5].
+        let mut r = wal.reader_from(Lsn(0)).unwrap();
+        for lsn in 3..=5u64 {
+            let (got_lsn, got) = r.next().unwrap().unwrap();
+            assert_eq!(got_lsn, Lsn(lsn));
+            assert_eq!(got, &payloads[lsn as usize - 1][..]);
+        }
+        assert!(r.next().is_none());
+    }
+
+    #[test]
+    fn checkpoint_is_idempotent_and_below_oldest_is_noop() {
+        // D7: repeating the same checkpoint is a no-op; an up_to below the current
+        // oldest deletes nothing.
+        let dir = tmp();
+        three_segment_log(dir.path());
+        let (mut wal, _) = Wal::open(dir.path(), tiny_cfg()).unwrap();
+        wal.checkpoint(Lsn(2)).unwrap();
+        assert_eq!(wal.segments, vec![Lsn(3), Lsn(5)]);
+        wal.checkpoint(Lsn(2)).unwrap(); // same call again ⇒ unchanged
+        assert_eq!(wal.segments, vec![Lsn(3), Lsn(5)]);
+        wal.checkpoint(Lsn(0)).unwrap(); // below oldest ⇒ unchanged
+        assert_eq!(wal.segments, vec![Lsn(3), Lsn(5)]);
+    }
+
+    #[test]
+    fn checkpoint_can_still_append_and_roll_after() {
+        // After reclaiming the prefix, appends continue into the active segment and
+        // roll as usual; replay stays dense from the new oldest_lsn.
+        let dir = tmp();
+        three_segment_log(dir.path());
+        let (mut wal, _) = Wal::open(dir.path(), tiny_cfg()).unwrap();
+        wal.checkpoint(Lsn(4)).unwrap(); // drop segs 1 and 3 ⇒ oldest = 5
+        assert_eq!(wal.segments, vec![Lsn(5)]);
+        for _ in 0..3 {
+            wal.append(&[9u8; 200]).unwrap();
+        }
+        assert_eq!(wal.commit().unwrap(), Lsn(8)); // rolls past seg 5
+        let mut r = wal.reader_from(Lsn(0)).unwrap();
+        for lsn in 5..=8u64 {
+            assert_eq!(r.next().unwrap().unwrap().0, Lsn(lsn));
+        }
+        assert!(r.next().is_none());
+    }
+
+    #[test]
+    fn checkpoint_on_poisoned_handle_errors_and_deletes_nothing() {
+        // §12: a poisoned handle refuses checkpoint and touches no files.
+        let dir = tmp();
+        three_segment_log(dir.path());
+        let (mut wal, _) = Wal::open(dir.path(), tiny_cfg()).unwrap();
+        wal.poisoned = true;
+        assert!(matches!(wal.checkpoint(Lsn(2)), Err(WalError::Poisoned)));
+        assert!(dir.path().join(segment::filename_for(Lsn(1))).exists());
     }
 }

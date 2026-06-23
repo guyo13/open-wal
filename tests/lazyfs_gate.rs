@@ -150,12 +150,23 @@ fn framed(len: usize) -> u64 {
 }
 
 fn replay(wal: &Wal) -> Vec<Vec<u8>> {
+    replay_from(wal, 1)
+}
+
+/// Replay, asserting the recovered run is dense starting at `start` (the oldest
+/// surviving LSN — `1` unless a checkpoint reclaimed a prefix). Returns the
+/// payloads in order.
+fn replay_from(wal: &Wal, start: u64) -> Vec<Vec<u8>> {
     let mut r = wal.reader_from(Lsn(0)).unwrap();
     let mut out = Vec::new();
-    let mut expected = 1u64;
+    let mut expected = start;
     while let Some(item) = r.next() {
         let (lsn, payload) = item.unwrap();
-        assert_eq!(lsn, Lsn(expected), "recovered run must be dense from 1");
+        assert_eq!(
+            lsn,
+            Lsn(expected),
+            "recovered run must be dense from {start}"
+        );
         out.push(payload.to_vec());
         expected += 1;
     }
@@ -358,4 +369,94 @@ fn roll_records_survive_power_loss() {
         "post-roll records lost on power loss"
     );
     assert_eq!(replay(&wal), payloads);
+}
+
+/// §14.4c (D8/D9): a completed `checkpoint` is durable across a power loss. The
+/// oldest-first unlinks + dir-fsync make the reclamation permanent, and the
+/// retained records recover as a dense, byte-identical suffix from the new
+/// `oldest_lsn` — no holes, no resurrection of a reclaimed prefix.
+#[test]
+#[ignore = "requires a running LazyFS mount"]
+fn checkpoint_survives_power_loss() {
+    let dir = fresh_wal_dir("ckpt");
+    let cfg = tiny_config();
+    let payloads = split_payloads(10); // bases 1,3,5,7,9 (2 records/segment)
+
+    {
+        let (mut wal, _) = Wal::open(&dir, cfg).unwrap();
+        for p in &payloads {
+            wal.append(p).unwrap();
+        }
+        assert_eq!(wal.commit().unwrap(), Lsn(10));
+        // Reclaim everything ≤ 4: drops segs [1,3) and [3,5) ⇒ oldest_lsn = 5.
+        wal.checkpoint(Lsn(4)).unwrap();
+    }
+
+    // Power loss after a committed checkpoint: the deletions (and the dir-fsync)
+    // are durable, and the retained suffix [5,10] survives intact.
+    clear_cache();
+
+    let (wal, report) = Wal::open(&dir, cfg).unwrap();
+    assert_eq!(
+        report.oldest_lsn,
+        Lsn(5),
+        "D8: reclaimed prefix must stay gone"
+    );
+    assert_eq!(report.durable_lsn, Lsn(10), "D8: retained records lost");
+    assert!(
+        !dir.join("00000000000000000001.wal").exists(),
+        "checkpointed segment reappeared after power loss"
+    );
+    assert_eq!(
+        replay_from(&wal, 5),
+        payloads[4..],
+        "D6: retained suffix must be byte-identical"
+    );
+}
+
+/// §14.4c (D8/D9): an **interrupted** checkpoint — crash after unlinking the
+/// oldest segment but *before* the directory fsync — recovers to a contiguous
+/// suffix with no holes. We model the crash point by unlinking the oldest segment
+/// directly (no dir-fsync) and then issuing a power-loss `clear-cache`; recovery
+/// must accept the missing prefix silently (§4 D2 / §8.4 interrupted-checkpoint)
+/// and reconstruct a dense suffix.
+#[test]
+#[ignore = "requires a running LazyFS mount"]
+fn interrupted_checkpoint_recovers_contiguous_suffix() {
+    let dir = fresh_wal_dir("ckpt-torn");
+    let cfg = tiny_config();
+    let payloads = split_payloads(10); // bases 1,3,5,7,9
+
+    {
+        let (mut wal, _) = Wal::open(&dir, cfg).unwrap();
+        for p in &payloads {
+            wal.append(p).unwrap();
+        }
+        assert_eq!(wal.commit().unwrap(), Lsn(10));
+    }
+
+    // Simulate a checkpoint killed mid-deletion: the oldest segment was unlinked,
+    // but the run crashed before the dir-fsync (and before unlinking the next).
+    std::fs::remove_file(dir.join("00000000000000000001.wal")).unwrap();
+
+    // Power loss at that point.
+    clear_cache();
+
+    // Recovery accepts the missing prefix and yields a dense contiguous suffix.
+    let (wal, report) = Wal::open(&dir, cfg).unwrap();
+    assert_eq!(
+        report.oldest_lsn,
+        Lsn(3),
+        "survivors must be a contiguous suffix"
+    );
+    assert_eq!(
+        report.durable_lsn,
+        Lsn(10),
+        "no record above the cut may be lost"
+    );
+    assert_eq!(
+        replay_from(&wal, 3),
+        payloads[2..],
+        "D8/D9: contiguous suffix, no holes, byte-identical"
+    );
 }
