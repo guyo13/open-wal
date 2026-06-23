@@ -15,6 +15,14 @@ readme = "README.md"
 # (Excluding only affects packaging; local `cargo test` still builds the bin.)
 exclude = ["src/bin"]
 
+[features]
+# Test-only NEGATIVE CONTROL for §14.4d: build the writer to deliberately OMIT
+# the directory fsync after a segment roll, so the rolled segment's filename is
+# not made durable. The `tests/lazyfs_gate.rs` dir-fsync-omission detector is run
+# both without this feature (must pass) and with it (must FAIL under LazyFS
+# `clear-cache` after a roll). NEVER enable in a real build.
+inject_no_dir_fsync = []
+
 [dependencies]
 # Castagnoli CRC-32C (hardware-accelerated, software fallback). NOT crc32fast,
 # which uses the ISO-HDLC/zlib polynomial (§5, §16 of docs/wal_design_v6.md).

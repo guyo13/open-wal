@@ -9,9 +9,10 @@
 
 ## Changelog (v6 → v6.1)
 
-A single normative correction surfaced while implementing M3 (intra-segment recovery); no other sections change.
+Normative corrections surfaced while implementing M3 (intra-segment recovery) and M4 (multi-segment); no other sections change.
 
 - **§8.2 step 5 (active-segment forward scan) — condition corrected `lsn == expected_next_lsn` → `lsn >= expected_next_lsn`.** The equality form is wrong and would silently truncate acknowledged data (a **D5** violation): when the invalid record at offset X is itself a *corrupted acked record*, the next genuine record carries `expected_next_lsn + 1`, never `expected_next_lsn`, so the equality test never matches and recovery misclassifies mid-log corruption as a torn tail — discarding the valid records after X. It was also internally inconsistent with §14.4e ("finds the **next** valid record"). The corrected `>=` form matches every genuine continuation; soundness against a coincidental stale match still rests on the §8.2.1 durable zeroing of `[X, EOF)` keeping the post-tail region clear within the scan bound. (Found and fixed during M3 implementation.)
+- **§14.4d (dir-fsync omission negative control) — re-assigned from LazyFS to the §14.8/M8 metadata-fault tooling.** The original wording ("a build that skips the directory fsync on roll MUST fail recovery under LazyFS `clear-cache`") assigned the wrong instrument. LazyFS's fault model is **data-only** (`clear-cache` = lost/un-fsynced *data*, plus `torn-op`/`torn-seq`); it intercepts metadata ops (`create`/`rename`/…) only to maintain its page cache and tracing, not as a *losable* directory entry. As a passthrough it persists a `create` to the backing filesystem immediately, so a freshly-rolled segment's directory entry is never dropped by `clear-cache` — and because the segment's *data* is independently `fdatasync`'d, omitting the parent-directory fsync produces **no observable loss** under LazyFS. The negative control therefore structurally cannot run there. It is a directory-entry/namespace-durability scenario, which is the same capability §14.8 H3 needs: **dm-flakey** (drop the metadata-journal write at the block layer) or a real **power-pull**. Resolution: **M4/LazyFS covers the *positive* split+roll power-loss case (a real D9 check); the §14.4d *negative control* moves to M8 under §14.8's metadata-fault tooling** and is tracked as an open release-gate item (§14.12, §14.13). The `inject_no_dir_fsync` build toggle and the scaffold test are retained for M8 to drive. The dir-fsync itself remains **required** on every roll (§7.4 step 5) — only the *test* tool changed, not the contract. (Found during M4 implementation.)
 
 ## Changelog (v5 → v6)
 
@@ -520,7 +521,9 @@ Crash + cache-clear immediately before and after each durability boundary; recov
 - **Checkpoint:** after unlinking segment k, before k+1; before the dir fsync. Contiguous suffix, no holes (**D8, D9**).
 
 #### 14.4d Negative control — dir-fsync omission detector
-A deliberately-buggy build that **skips the directory fsync** on roll MUST **fail** recovery under LazyFS `clear-cache` after a roll (the new filename was not durable). Assert the test detects it; assert the correct build passes the identical scenario. *(Proves the harness can catch the classic gotcha.)*
+A deliberately-buggy build that **skips the directory fsync** on roll MUST **fail** recovery after a roll (the new filename was not durable). Assert the test detects it; assert the correct build passes the identical scenario. *(Proves the harness can catch the classic gotcha.)*
+
+> **Tooling (corrected v6.1 — see changelog): this negative control belongs to M8, not LazyFS.** A missing parent-directory fsync risks only the *directory entry*, which is a metadata/namespace-durability fault. **LazyFS cannot model it** — its faults are data-only (`clear-cache`/`torn-op`/`torn-seq`) and, as a passthrough, it persists a `create` to the backing fs immediately; with the segment's data independently `fdatasync`'d, omitting the dir-fsync yields no observable loss under `clear-cache`. The detector therefore runs under the **§14.8 metadata-fault tooling** (dm-flakey: drop the directory's metadata-journal write at the block layer; or a real power-pull). **M4 status:** the dir-fsync is implemented and required on every roll (§7.4), and the LazyFS gate covers the *positive* split+roll power-loss case (D9); the `inject_no_dir_fsync` build toggle + scaffold test exist and compile, but the negative control is **OPEN pending M8** (§14.12, §14.13). It must not be reported as satisfied until dm-flakey/power-pull actually makes the buggy build fail.
 
 #### 14.4e Corruption / bit-flip injection
 Flip bits in a **sealed** segment and in the **active** segment at: (i) payload of the **last** record, (ii) payload of a **middle** record, (iii) the `length` field, (iv) the `crc` field, (v) the segment header, (vi) a **padding** byte. Assert:
@@ -600,7 +603,7 @@ Multi-hour randomized workload with periodic injected crashes+recoveries and che
 ### 14.13 Definition of Done (release gate)
 - Every row of §14.12 has ≥ 1 passing test.
 - Every enumerated crash point in §14.4c (including split-batch and roll sub-cases) has a test.
-- §14.4d negative control catches the injected bug **and** the correct build passes.
+- §14.4d negative control catches the injected bug **and** the correct build passes. *(Release-gate item satisfied in **M8**: the negative control requires §14.8 metadata-fault tooling — dm-flakey/power-pull — because LazyFS cannot model directory-entry loss. **OPEN** until then; the correct-build positive split+roll power-loss case already passes under LazyFS in M4. See the v6.1 changelog and §14.4d.)*
 - §14.4g resurrection test passes **and** is demonstrated to fail both (a) if zeroing-on-truncate is disabled and (b) if the invalidation is not durably synced (the power-loss-of-zeroing assertion).
 - Fuzzers F1–F4: ≥ N CPU-hours since the last parser/format change, zero outstanding crashes; bounded-scan counter never exceeds the bound.
 - §14.8 H1: ≥ M power-pull cycles on target hardware, zero acked-record loss.

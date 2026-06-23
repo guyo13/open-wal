@@ -7,15 +7,20 @@
 //! announced watermark (D2/D3/D6/D9).
 //!
 //! Not part of the library; it only exists so an integration test can crash a
-//! real writer process. Single segment (M3): the segment is sized to hold the
-//! whole workload, so no roll occurs.
+//! real writer process. **Multi-segment (M4):** the segment is sized so the
+//! ~32-byte records roll across many segments and an 8-record commit batch
+//! periodically straddles a segment boundary (a commit-time split) — so a SIGKILL
+//! can land during a roll or split as well as mid-`write`/mid-`fdatasync`, and
+//! recovery must still yield a dense suffix (§14.4a, D9).
 
 use std::io::Write;
 use std::path::Path;
 
 use open_wal::{Wal, WalConfig};
 
-const SEGMENT_SIZE: u64 = 16 * 1024 * 1024;
+// Small enough that the workload rolls many times (~2k records per 64-KiB
+// segment) and an 8-record (~256-byte) batch periodically spans two segments.
+const SEGMENT_SIZE: u64 = 64 * 1024;
 const MAX_RECORD_SIZE: u32 = 256;
 const TOTAL: u64 = 50_000;
 const BATCH: u64 = 8;
@@ -44,9 +49,10 @@ fn main() {
 
         // Commit (and announce) after the very FIRST record, then every BATCH.
         // The first announcement is the parent's readiness signal: by the time
-        // it arrives, segment creation has fully completed and ≥1 record is
-        // durable, so the parent's kill window lands in steady-state operation
-        // (not crash-during-create, which is the M4 §8.4 path).
+        // it arrives, the initial cold-start segment is fully created and ≥1
+        // record is durable, so the kill window starts in steady-state operation
+        // (not crash-during-cold-start). Mid-run *roll* creates can still be
+        // interrupted — that is the §8.4 path recovery handles.
         if next_lsn == 2 || since_commit == BATCH {
             let durable = wal.commit().expect("commit");
             since_commit = 0;

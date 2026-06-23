@@ -487,6 +487,13 @@ impl<O: DurabilityObserver> Wal<O> {
                 return Err(e);
             }
         };
+        // Make the new filename durable. The `inject_no_dir_fsync` feature is the
+        // §14.4d negative control: a deliberately-buggy build that omits this
+        // dir-fsync MUST fail recovery under a LazyFS `clear-cache` after a roll
+        // (the rolled segment's filename was never made durable, so the
+        // post-roll records vanish). It is a test-only feature — never enable it
+        // in a real build.
+        #[cfg(not(feature = "inject_no_dir_fsync"))]
         if let Err(e) = fsync_dir(&self.dir) {
             self.poisoned = true;
             return Err(e);

@@ -7,14 +7,19 @@
 //! - **D3:** no record at or below the last announced durable LSN is lost.
 //! - **D2:** the recovered run is dense `1..=k` (no internal gap).
 //! - **D6:** each recovered payload is byte-identical to what was written.
-//! - **D9:** a crash *anywhere* recovers to a valid dense suffix (a SIGKILL
-//!   mid-`write` leaves a torn tail that recovery truncates — never a fatal
-//!   mid-log error, since nothing valid follows a partial sequential write).
+//! - **D9:** a crash *anywhere* — mid-`write`, mid-`fdatasync`, during a segment
+//!   roll, or between the two syncs of a split batch — recovers to a valid dense
+//!   suffix (a torn tail truncates; an incomplete roll is discarded or adopted as
+//!   an empty active segment per §8.4 — never a fatal mid-log error).
+//!
+//! The `crash_child` workload uses a small `segment_size` so it rolls across many
+//! segments and commit batches periodically straddle a boundary, exercising the
+//! M4 roll/split crash points (§14.4a).
 //!
 //! This is the process-crash subset: dirty page cache survives a process death,
 //! so committed (and even merely-written) records persist. The power-loss
-//! subset — where un-`fdatasync`'d writes vanish — needs LazyFS and is the M3
-//! gate (§14.4b), run separately.
+//! subset — where un-`fdatasync`'d writes vanish — needs LazyFS (§14.4b/c),
+//! run separately via the gate.
 
 #![cfg(unix)]
 
@@ -25,8 +30,11 @@ use std::time::Duration;
 use open_wal::{Lsn, Wal, WalConfig};
 
 fn cfg() -> WalConfig {
+    // Must match `crash_child`'s config (same dir, same segment_size — recovery
+    // keys off it). Small, so the workload rolls many times and a SIGKILL can
+    // land during a roll/split (§14.4a multi-segment), not just mid-record.
     WalConfig {
-        segment_size: 16 * 1024 * 1024,
+        segment_size: 64 * 1024,
         max_record_size: 256,
     }
 }
