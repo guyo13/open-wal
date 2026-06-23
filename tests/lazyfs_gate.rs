@@ -1,5 +1,11 @@
-//! M3 LazyFS gate (§14.4b + §14.4g durability-of-zeroing) — the power-loss
-//! tests that intra-segment recovery must pass before M3 is done.
+//! LazyFS power-loss gate — the fault-injection tests that recovery must pass.
+//! M3: §14.4b (lost writes) + §14.4g (durability-of-zeroing). M4 adds §14.4c
+//! (split-batch survives power loss) and the positive half of the dir-fsync
+//! scaffold. The §14.4d *negative control* (a dir-fsync-omitting build must FAIL)
+//! is **deferred to M8**: LazyFS models data-write faults only, not the loss of an
+//! unsynced directory entry, so it cannot exercise it — that needs dm-flakey /
+//! power-pull (§14.8). The `inject_no_dir_fsync` feature is kept as scaffolding
+//! for M8. See `roll_records_survive_power_loss`.
 //!
 //! These require a running [LazyFS](https://github.com/dsrhaslab/lazyfs) mount
 //! (FUSE): the WAL writes into the mount, data lives in LazyFS's page cache, and
@@ -46,6 +52,27 @@ fn config() -> WalConfig {
         segment_size: SEGMENT_SIZE,
         max_record_size: MAX_RECORD_SIZE,
     }
+}
+
+/// Tiny segments (448 usable bytes after the 64-byte header) so a handful of
+/// 200-byte records roll across several segments and a single commit batch spans
+/// ≥2 segments — exercising the M4 roll/split power-loss paths (§14.4c/d).
+fn tiny_config() -> WalConfig {
+    WalConfig {
+        segment_size: 512,
+        max_record_size: 256,
+    }
+}
+
+/// `n` distinct 200-byte payloads (two per tiny segment ⇒ bases 1, 3, 5, …).
+fn split_payloads(n: u8) -> Vec<Vec<u8>> {
+    (1..=n)
+        .map(|i| {
+            let mut p = vec![0u8; 200];
+            p[0] = i;
+            p
+        })
+        .collect()
 }
 
 fn env(name: &str) -> String {
@@ -251,4 +278,84 @@ fn zeroed_tail_survives_power_loss() {
         "D10: [X, EOF) must remain zero after power loss (zeroing was not durable)"
     );
     assert_eq!(replay(&wal), vec![r1.to_vec()]);
+}
+
+/// §14.4c (D9): a single commit batch that splits across several segments is
+/// fully durable after a power-loss `clear-cache` — the per-segment `fdatasync`s
+/// (and the dir-fsync on each roll) made every rolled segment's records and
+/// filename durable, so the whole dense suffix recovers.
+#[test]
+#[ignore = "requires a running LazyFS mount"]
+fn split_batch_survives_power_loss() {
+    let dir = fresh_wal_dir("split");
+    let cfg = tiny_config();
+    let payloads = split_payloads(10); // 10 records, 2/segment ⇒ 5 segments
+
+    {
+        let (mut wal, _) = Wal::open(&dir, cfg).unwrap();
+        for p in &payloads {
+            wal.append(p).unwrap();
+        }
+        // One commit: the split + rolls all happen here, each segment fdatasync'd.
+        assert_eq!(wal.commit().unwrap(), Lsn(10));
+    }
+
+    // Power loss after the full split commit: nothing committed may vanish.
+    clear_cache();
+
+    let (wal, report) = Wal::open(&dir, cfg).unwrap();
+    assert_eq!(
+        report.durable_lsn,
+        Lsn(10),
+        "D9: split-batch records lost on power loss"
+    );
+    assert_eq!(
+        replay(&wal),
+        payloads,
+        "D6: recovered bytes must be identical"
+    );
+}
+
+/// Positive half of the directory-fsync scaffold (D9): on the **correct** build,
+/// records written across a roll survive a power-loss `clear-cache` as a dense
+/// suffix. This is *not* §14.4d's negative control.
+///
+/// **The §14.4d negative control is deferred to M8.** Its premise — a build that
+/// omits the roll's directory fsync must FAIL recovery here — is **not realizable
+/// under LazyFS**: LazyFS's faults are data-only (`clear-cache`/`torn-op`/
+/// `torn-seq`) and it is a passthrough, so a `create`'s directory entry is
+/// persisted to the backing fs and never dropped by `clear-cache`. The new
+/// segment's *data* is independently `fdatasync`'d, so omitting the parent-dir
+/// fsync produces no observable loss. Truly losing an unsynced directory entry
+/// needs block-layer metadata-fault injection (dm-flakey) or a real power-pull —
+/// §14.8 / M8. The `inject_no_dir_fsync` feature + this test body are the
+/// scaffolding that injector will drive: under it, this same assertion MUST fail.
+#[test]
+#[ignore = "requires a running LazyFS mount"]
+fn roll_records_survive_power_loss() {
+    let dir = fresh_wal_dir("dirfsync");
+    let cfg = tiny_config();
+    let payloads = split_payloads(6); // 6 records, 2/segment ⇒ ≥1 roll (segs 1,3,5)
+
+    {
+        let (mut wal, _) = Wal::open(&dir, cfg).unwrap();
+        for p in &payloads {
+            wal.append(p).unwrap();
+        }
+        assert_eq!(wal.commit().unwrap(), Lsn(6));
+    }
+
+    // Power loss after a committed roll. On the correct build all 6 survive. Under
+    // the `inject_no_dir_fsync` build *with a metadata-fault injector* (M8), the
+    // rolled segments' dir entries would be lost and this assertion would fail —
+    // but LazyFS alone cannot drop them (see the doc comment).
+    clear_cache();
+
+    let (wal, report) = Wal::open(&dir, cfg).unwrap();
+    assert_eq!(
+        report.durable_lsn,
+        Lsn(6),
+        "post-roll records lost on power loss"
+    );
+    assert_eq!(replay(&wal), payloads);
 }

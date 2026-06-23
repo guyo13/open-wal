@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 #
-# lazyfs-gate.sh — build, mount, and run the M3 LazyFS power-loss gate.
+# lazyfs-gate.sh — build, mount, and run the LazyFS power-loss gate.
 #
-# The gate (`tests/lazyfs_gate.rs`, §14.4b + §14.4g) needs a LazyFS/FUSE mount:
+# The gate (`tests/lazyfs_gate.rs`, §14.4b + §14.4g, plus M4's §14.4c split-batch
+# and §14.4d dir-fsync negative control) needs a LazyFS/FUSE mount:
 # the WAL writes into the mount, data lives in LazyFS's page cache, and a
 # `lazyfs::clear-cache` command drops everything not `fdatasync`'d — a faithful
 # power loss. This script makes that environment reproducible locally, in CI, and
@@ -161,10 +162,28 @@ EOF
 
 cmd_run() {
   _is_mounted || die "LazyFS not mounted — run 'scripts/lazyfs-gate.sh mount' first"
-  log "running the gate (single-threaded; clear-cache is global to the mount)"
+  log "running the gate (correct build; single-threaded; clear-cache is global)"
   ( cd "$REPO_ROOT" && \
     LAZYFS_MNT="$LAZYFS_MNT" LAZYFS_FIFO="$LAZYFS_FIFO" LAZYFS_LOG="$LAZYFS_LOG" \
     cargo test --test lazyfs_gate -- --ignored --test-threads=1 --nocapture )
+
+  # §14.4d negative control is DEFERRED to M8. It needs a build that omits the
+  # roll's directory fsync to FAIL recovery — but LazyFS cannot model that: its
+  # faults are data-only (clear-cache/torn-op/torn-seq) and it is a passthrough,
+  # so a freshly-created segment's directory entry is persisted to the backing fs
+  # and is never dropped by clear-cache (the file data is independently
+  # fdatasync'd). Losing an unsynced dir entry needs block-layer metadata-fault
+  # injection (dm-flakey) or a real power-pull — §14.8 / M8.
+  #
+  # We still COMPILE the `inject_no_dir_fsync` scaffold so it stays valid for M8,
+  # but we do NOT run it as a pass/fail gate (under LazyFS it would always
+  # "survive", which must never be mistaken for a satisfied negative control).
+  log "compiling the §14.4d negative-control scaffold (inject_no_dir_fsync; not run)"
+  ( cd "$REPO_ROOT" && cargo test --no-run --features inject_no_dir_fsync --test lazyfs_gate )
+  log "================================================================"
+  log "§14.4d NEGATIVE CONTROL NOT EXERCISED — LazyFS does not model"
+  log "directory-entry durability; deferred to M8 (dm-flakey/power-pull)."
+  log "================================================================"
 }
 
 cmd_env() {
