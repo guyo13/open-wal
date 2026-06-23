@@ -249,9 +249,10 @@ impl<O: DurabilityObserver> Wal<O> {
         match file.read_exact_at(&mut header, 0) {
             Ok(()) => {
                 // Header valid + matching its filename ⇒ a legitimate active
-                // segment (possibly empty); leave it for `recover_all`.
-                if let Ok(parsed) = segment::decode_header(&header)
-                    && parsed.base_lsn == base
+                // segment (possibly empty); leave it for `recover_all`. (Written
+                // as `matches!` with a guard rather than a let-chain to stay on
+                // the 1.85 MSRV.)
+                if matches!(segment::decode_header(&header), Ok(parsed) if parsed.base_lsn == base)
                 {
                     return Ok(());
                 }
@@ -342,9 +343,8 @@ impl<O: DurabilityObserver> Wal<O> {
 
             // Cross-segment continuity (§8.1 step 3): this segment's base must
             // immediately follow the previous non-empty segment's max LSN.
-            if let Some(pm) = prev_max
-                && pm.next() != base
-            {
+            // (`is_some_and` rather than a let-chain to stay on the 1.85 MSRV.)
+            if prev_max.is_some_and(|pm| pm.next() != base) {
                 return Err(WalError::ContiguityViolation);
             }
 
