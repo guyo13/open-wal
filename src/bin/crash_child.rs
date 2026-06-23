@@ -12,24 +12,46 @@
 //! periodically straddles a segment boundary (a commit-time split) — so a SIGKILL
 //! can land during a roll or split as well as mid-`write`/mid-`fdatasync`, and
 //! recovery must still yield a dense suffix (§14.4a, D9).
+//!
+//! **Checkpoint mode (M5, `crash_child <dir> checkpoint`):** uses tiny segments
+//! and `checkpoint`s the fully-superseded prefix after every batch, so a SIGKILL
+//! can land inside the oldest-first unlink loop (before its dir-fsync). Recovery
+//! must then yield a contiguous suffix from whatever oldest segment survived —
+//! no holes, no resurrection (§14.4a checkpoint-unlink points, D8/D9). It
+//! announces `oldest durable` per line so the parent learns the floor.
 
 use std::io::Write;
 use std::path::Path;
 
 use open_wal::{Wal, WalConfig};
 
-// Small enough that the workload rolls many times (~2k records per 64-KiB
-// segment) and an 8-record (~256-byte) batch periodically spans two segments.
+// Append-only mode: small enough that the workload rolls many times (~2k records
+// per 64-KiB segment) and an 8-record (~256-byte) batch periodically spans two
+// segments.
 const SEGMENT_SIZE: u64 = 64 * 1024;
 const MAX_RECORD_SIZE: u32 = 256;
+// Checkpoint mode: tiny segments so rolls (and thus reclaimable sealed segments)
+// pile up fast and a SIGKILL frequently lands during a checkpoint unlink.
+const CKPT_SEGMENT_SIZE: u64 = 512;
+const CKPT_MAX_RECORD_SIZE: u32 = 256;
 const TOTAL: u64 = 50_000;
 const BATCH: u64 = 8;
 
 fn main() {
-    let dir = std::env::args().nth(1).expect("usage: crash_child <dir>");
-    let cfg = WalConfig {
-        segment_size: SEGMENT_SIZE,
-        max_record_size: MAX_RECORD_SIZE,
+    let dir = std::env::args()
+        .nth(1)
+        .expect("usage: crash_child <dir> [checkpoint]");
+    let checkpoint_mode = std::env::args().nth(2).as_deref() == Some("checkpoint");
+    let cfg = if checkpoint_mode {
+        WalConfig {
+            segment_size: CKPT_SEGMENT_SIZE,
+            max_record_size: CKPT_MAX_RECORD_SIZE,
+        }
+    } else {
+        WalConfig {
+            segment_size: SEGMENT_SIZE,
+            max_record_size: MAX_RECORD_SIZE,
+        }
     };
     let (mut wal, report) = Wal::open(Path::new(&dir), cfg).expect("open");
 
@@ -56,6 +78,13 @@ fn main() {
         if next_lsn == 2 || since_commit == BATCH {
             let durable = wal.commit().expect("commit");
             since_commit = 0;
+            // In checkpoint mode, reclaim every fully-superseded sealed segment
+            // (the active segment is never deleted). The SIGKILL may interrupt the
+            // oldest-first unlink loop before its dir-fsync — recovery must still
+            // yield a contiguous suffix (§14.4a, D8/D9).
+            if checkpoint_mode {
+                wal.checkpoint(durable).expect("checkpoint");
+            }
             // Announce the durable floor, flushed, so the parent sees it before
             // any kill that follows.
             let _ = writeln!(out, "{}", durable.0);
@@ -64,6 +93,9 @@ fn main() {
     }
 
     let durable = wal.commit().expect("commit");
+    if checkpoint_mode {
+        wal.checkpoint(durable).expect("checkpoint");
+    }
     let _ = writeln!(out, "{}", durable.0);
     let _ = out.flush();
 }
