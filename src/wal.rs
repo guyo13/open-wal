@@ -607,11 +607,16 @@ impl<O: DurabilityObserver> Wal<O> {
 /// deletable, so the result is always `< bases.len()` and `checkpoint` always
 /// leaves ≥1 segment. `bases` is sorted ascending (the writer's invariant).
 fn deletable_prefix_len(bases: &[Lsn], up_to: Lsn) -> usize {
-    let mut n = 0;
-    while n + 1 < bases.len() && bases[n + 1].0 - 1 <= up_to.0 {
-        n += 1;
+    if bases.is_empty() {
+        return 0;
     }
-    n
+    // The candidate `b'` boundaries are `bases[1..]` (the active segment, index 0
+    // of this tail's owner, is never its own `b'`; slicing from 1 also excludes the
+    // last segment as a deletable). Since `bases` is strictly increasing, the
+    // predicate `b − 1 ≤ up_to` is monotone over that tail, so `partition_point`
+    // binary-searches the cut in O(log N). `b.0 − 1` cannot underflow: a valid base
+    // is ≥ 1 (`Lsn(0)` is the reserved sentinel, rejected at header decode).
+    bases[1..].partition_point(|&b| b.0 - 1 <= up_to.0)
 }
 
 /// `fsync` a directory so a newly-created filename within it is durable (§7.4).
