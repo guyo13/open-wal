@@ -46,3 +46,18 @@ tempfile = "3"
 # rather than hanging CI. Test-only; the library proper depends on `rustix`, not
 # `libc`. Already present transitively, so this adds no new crate.
 libc = "0.2"
+# §14.7 benchmarks (`benches/wal.rs`). `harness = false` (below) lets the bench
+# own `main` via criterion's macros. `default-features = false` drops the
+# `plotters`/`rayon` HTML-report stack we don't use — keeps the dev-dep tree lean.
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+# HdrHistogram for the commit-latency tail percentiles (p50/p99/p999). Criterion
+# only reports point estimates (mean/median), not arbitrary percentiles (§14.7),
+# so the commit-latency group records per-iteration timings here and emits the
+# tails itself.
+hdrhistogram = "7"
+
+# §14.7 perf benches. `harness = false` ⇒ criterion provides `main`. NIGHTLY/manual
+# tier (§14.11); per-PR CI only compile-checks them (`cargo bench --no-run`).
+[[bench]]
+name = "wal"
+harness = false
