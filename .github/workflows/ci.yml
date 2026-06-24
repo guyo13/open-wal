@@ -45,6 +45,12 @@ jobs:
         run: cargo build --all-targets --verbose
       - name: test
         run: cargo test --verbose
+      # Per-PR perf coverage is the zero-alloc gate (a normal `cargo test`) plus a
+      # compile-only build of the criterion benches so they cannot bitrot. The
+      # benches themselves are NIGHTLY/manual (§14.11, `bench.yml`) — too slow and
+      # too noisy to run on every PR.
+      - name: bench (compile only)
+        run: cargo bench --no-run
 
   msrv:
     name: MSRV (1.85)

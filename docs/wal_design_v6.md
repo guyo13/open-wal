@@ -9,7 +9,9 @@
 
 ## Changelog (v6 → v6.1)
 
-Normative corrections surfaced while implementing M3 (intra-segment recovery) and M4 (multi-segment), plus M6 testing-status annotations; no contract section changes.
+Normative corrections surfaced while implementing M3 (intra-segment recovery) and M4 (multi-segment), plus M6/M7 testing-status annotations; no contract section changes.
+
+- **§14.7 (performance & regression) — IMPLEMENTED in M7; the regression-gate CI *enforcement* is OPEN-pending-controlled-runner.** Added the M7 status block to §14.7, the per-PR/nightly split to §14.11, and the M7 note to the §14.13 zero-alloc DoD row. `benches/wal.rs` implements the four criterion groups (throughput / commit-latency / recovery / split-batch) over the public API against a real `fdatasync`; since criterion reports no arbitrary percentiles, the commit-latency tail (p50/p99/p999) comes from an `hdrhistogram` persisted to `target/perf/`. `tests/zero_alloc.rs` is hardened (proves no-roll in the measured window via segment-file count + `durable_lsn` advance; adds a `max_record_size` variant). `scripts/perf-gate.sh` implements the >10% throughput/median-time and >20% p999 thresholds (median, not the outlier-sensitive mean, from criterion `estimates.json`; p999 from the histogram JSON) and was shown to flag an injected regression. Per the line's own "pin CPU governor", enforcement is real on a controlled runner; on hosted CI the gate runs **informational** (`bench.yml`, `continue-on-error`) like the LazyFS gate — a stopgap, not a downgrade. No `src/` change; testing-status annotations only. (Added during M7 implementation.)
 
 - **§8.2 step 5 (active-segment forward scan) — condition corrected `lsn == expected_next_lsn` → `lsn >= expected_next_lsn`.** The equality form is wrong and would silently truncate acknowledged data (a **D5** violation): when the invalid record at offset X is itself a *corrupted acked record*, the next genuine record carries `expected_next_lsn + 1`, never `expected_next_lsn`, so the equality test never matches and recovery misclassifies mid-log corruption as a torn tail — discarding the valid records after X. It was also internally inconsistent with §14.4e ("finds the **next** valid record"). The corrected `>=` form matches every genuine continuation; soundness against a coincidental stale match still rests on the §8.2.1 durable zeroing of `[X, EOF)` keeping the post-tail region clear within the scan bound. (Found and fixed during M3 implementation.)
 - **§14.3 (stateful model/oracle test) — IMPLEMENTED in M6 as an in-tree proptest harness; §14.5 F4 (the cargo-fuzz variant) DEFERRED to M9.** Added the M6 status note to §14.3, the F4 deferral to §14.5 and §14.13, and `§14.3` to the D7/D8 rows of the §14.12 matrix. The harness (`tests/model_oracle.rs` + the proptest-free executor `tests/model/mod.rs`) checks the §14.3 envelope as a refinement relation against an independent in-memory oracle after every state-machine crash/recover, and was shown to catch a seeded recovery-loss bug (D1/D3) and a seeded checkpoint over-delete (D8) per §14.0.3. No contract change — these are testing-status annotations only. (Added during M6 implementation.)
@@ -567,6 +569,26 @@ Construct the specific resurrection hazard: write records, induce a torn tail su
 - **Zero-allocation assertion:** an allocation counter (`dhat` / custom allocator) proves steady-state `append`+`commit` (no roll) and `Reader::next` perform **zero** heap allocations after warm-up.
 - **Regression gates:** stored baselines; CI fails if throughput regresses > 10% or p999 > 20% (tune to runner variance; pin CPU governor).
 
+> **M7 status (IMPLEMENTED, with one enforcement caveat tracked honestly).** `benches/wal.rs`
+> implements all four criterion groups (throughput, commit-latency, recovery, split-batch) over
+> the public API against a real `fdatasync`, with fixtures built outside the measured closure.
+> Because criterion reports only point estimates (mean/median), **not** arbitrary percentiles, the
+> commit-latency group records per-iteration timings into an `hdrhistogram` and emits p50/p99/p999
+> itself — persisted to `target/perf/commit_latency_<batch>.json`. The **zero-allocation
+> assertion** (`tests/zero_alloc.rs`) is hardened: it now proves the measured window did **not**
+> roll (segment-file count + `durable_lsn` advance, both checked outside the counted region) and
+> adds a `max_record_size`-payload variant. The **regression gate** (`scripts/perf-gate.sh`)
+> implements the thresholds — throughput/**median-time** (median, not the outlier-sensitive mean)
+> from criterion's `estimates.json`, **p999** from the histogram JSON (criterion has no percentile
+> to read) — with subcommands `baseline`/`compare`/`check` and a falsifiability demo (it flags an
+> injected regression). **The "CI fails …" enforcement is honored on a controlled, pinned-CPU-
+> governor runner — exactly what this line's own "pin CPU governor" assumes.** On hosted runners
+> the gate runs **informational** (`continue-on-error`, `bench.yml`), like the LazyFS gate, because
+> shared CPUs / variable fsync make a hard gate flap; the thresholds stay a real gate on a
+> controlled runner and enforcement is **OPEN-pending-controlled-runner**, never dropped. Absolute
+> numbers on hosted/tmpfs hardware are unrepresentative (curve shape, not headline throughput — the
+> real numbers are the §14.8 H1/H2 hardware gate). *(Added in M7.)*
+
 ### 14.8 Hardware durability validation (the real guarantee)
 - **H1 Power-pull (only true durability test).** On target storage, sustained committed writes record the highest acked LSN to a side channel; hard-cut power (PDU/VM force-stop, not graceful); on reboot, `open` and assert every acked LSN ≤ side-channel value is present (**D1**). ≥ M cycles (e.g. 50) with zero loss to pass. Pre-release and on hardware change.
 - **H2 Cache-mode / lying-device check.** Verify/​document VM/cloud block-device cache mode (`cache=none`/`writethrough`). Label devices that pass only with PLP cache; flag consumer devices that lose acked data.
@@ -580,8 +602,8 @@ A deliberately slow, obviously-correct **reference parser** (separate code path,
 Multi-hour randomized workload with periodic injected crashes+recoveries and checkpoints. Monitor: invariant violations, fd leaks, **disk-space leaks** (unreclaimed segments), memory growth, latency drift.
 
 ### 14.11 CI matrix
-- **Per-PR (fast):** §14.1, §14.2 (reduced), §14.6 compile-fail + Miri subset, §14.7 alloc assertion.
-- **Nightly:** full §14.2/§14.3 (high iteration), §14.4 LazyFS suite, §14.5 fuzz (time-boxed), §14.7 benchmarks + gates, §14.9 differential.
+- **Per-PR (fast):** §14.1, §14.2 (reduced), §14.6 compile-fail + Miri subset, §14.7 alloc assertion (enforced, `ci.yml` `cargo test`) + `cargo bench --no-run` (benches must compile, can't bitrot).
+- **Nightly:** full §14.2/§14.3 (high iteration), §14.4 LazyFS suite, §14.5 fuzz (time-boxed), §14.7 benchmarks + gates *(M7: `bench.yml`, schedule + manual; the gate runs **informational** on hosted runners until a controlled/pinned-governor runner makes the §14.7 thresholds enforceable — same stopgap as the LazyFS gate)*, §14.9 differential.
 - **Pre-release / manual:** §14.8 H1 power-pull on target hardware, §14.10 soak.
 - **OS matrix:** Linux (primary — sole platform for the §14.8 hardware-durability gate), macOS (dev/correctness — exercises `F_FULLFSYNC`; unit/property/fuzz only, not §14.8). Windows is out of scope for v1 (§8.3).
 - **FS matrix (Linux):** ext4, xfs, btrfs (CoW), tmpfs (logic only — never durability claims).
@@ -610,7 +632,7 @@ Multi-hour randomized workload with periodic injected crashes+recoveries and che
 - §14.4g resurrection test passes **and** is demonstrated to fail both (a) if zeroing-on-truncate is disabled and (b) if the invalidation is not durably synced (the power-loss-of-zeroing assertion).
 - Fuzzers F1–F4: ≥ N CPU-hours since the last parser/format change, zero outstanding crashes; bounded-scan counter never exceeds the bound. *(All four are **DEFERRED to M9**. Interim coverage: §14.5 F1–F3 by in-tree proptest on the codec/parser; **F4 by the §14.3 in-tree proptest oracle harness (M6)**, whose executor the F4 cargo-fuzz target will reuse verbatim. **OPEN** until M9.)*
 - §14.8 H1: ≥ M power-pull cycles on target hardware, zero acked-record loss.
-- Zero-allocation assertion (§14.7) passes for append/commit and `Reader::next`.
+- Zero-allocation assertion (§14.7) passes for append/commit and `Reader::next`. *(M7: PASSES — hardened to also prove no-roll in the measured window and to cover a `max_record_size` payload. The §14.7 benches + regression gate exist; **gate enforcement is OPEN-pending-controlled-runner** — informational on hosted CI per §14.11, a real gate on a pinned-governor runner.)*
 - Miri clean on covered suites.
 
 ---

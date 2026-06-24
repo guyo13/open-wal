@@ -1,0 +1,67 @@
+name: Benchmarks
+
+# §14.7 performance benchmarks (`benches/wal.rs`) + the regression gate
+# (`scripts/perf-gate.sh`). These are the NIGHTLY/manual tier (§14.11): too slow and
+# too noisy for per-PR CI (per-PR only compile-checks them via `cargo bench --no-run`
+# in ci.yml, and runs the zero-alloc assertion as a normal test).
+#
+# Currently INFORMATIONAL (the run step is `continue-on-error`), exactly like the
+# LazyFS gate: hosted runners share CPUs, have no governor control, and have variable
+# fsync timing, so a hard >10%/>20% gate would flap on noise. The thresholds in
+# perf-gate.sh remain a REAL, enforced gate on a controlled / pinned-CPU-governor
+# (self-hosted) runner; informational here is the hosted-runner stopgap, not a
+# permanent downgrade. ENFORCEMENT IS OPEN-PENDING-CONTROLLED-RUNNER (tracked in
+# §14.7/§14.11/§14.13). Absolute numbers on hosted/tmpfs hardware are unrepresentative
+# — these catch gross regressions and show curve shape, not headline throughput
+# (real durability numbers are the §14.8 H1/H2 hardware gate).
+#
+# Each run uploads target/criterion + target/perf as an artifact so regressions can
+# be compared offline (or on a controlled runner) until cross-run enforcement lands.
+
+on:
+  schedule:
+    # 03:17 UTC daily — off the :00 rush.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: bench-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bench:
+    name: criterion benches + gate (informational)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run benches + gate (informational until proven stable)
+        id: bench
+        continue-on-error: true
+        run: |
+          # Store this run as a baseline (runs all four bench groups; emits the
+          # commit-latency p999 histograms the gate reads). On a controlled runner
+          # with a persisted prior baseline this is followed by
+          # `scripts/perf-gate.sh check <prev> nightly` to enforce the thresholds.
+          scripts/perf-gate.sh baseline nightly
+
+      - name: Upload bench results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: criterion-${{ github.run_id }}
+          path: |
+            target/criterion/**
+            target/perf/**
+          retention-days: 30
+          if-no-files-found: warn
