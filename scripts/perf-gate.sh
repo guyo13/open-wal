@@ -33,6 +33,9 @@ P999_REGRESS_PCT="${P999_REGRESS_PCT:-20}"
 # Extra args forwarded to the bench harness, e.g. BENCH_ARGS="--measurement-time 1
 # --warm-up-time 0.3 --sample-size 10" for a quick run. Default: full criterion run.
 BENCH_ARGS="${BENCH_ARGS:-}"
+# A stable p999 needs many commit() samples; warn (do not gate) if a baseline's
+# commit_latency histogram has fewer than this — typically a reduced BENCH_ARGS run.
+MIN_P999_SAMPLES="${MIN_P999_SAMPLES:-500}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CRIT_DIR="$ROOT/target/criterion"
@@ -55,6 +58,13 @@ Environment:
   THROUGHPUT_REGRESS_PCT  median-time regression threshold, percent (default 10)
   P999_REGRESS_PCT        commit-latency p999 regression threshold, percent (default 20)
   BENCH_ARGS              extra args for the criterion harness (e.g. a quick run)
+
+NOTE: gate on a FULL bench run. A stable p999 needs many commit() samples, so a
+reduced BENCH_ARGS (e.g. --sample-size 10) is fine for a smoke but must NOT be used
+for `check` — `check`/`compare` warn when a histogram has too few samples.
+
+Environment threshold for that warning:
+  MIN_P999_SAMPLES        warn if a commit_latency histogram has fewer (default 500)
 
 Examples:
   scripts/perf-gate.sh baseline main
@@ -94,6 +104,7 @@ run_benches() {
 compare_py() {
   CRIT_DIR="$CRIT_DIR" PERF_DIR="$PERF_DIR" \
   THROUGHPUT_REGRESS_PCT="$THROUGHPUT_REGRESS_PCT" P999_REGRESS_PCT="$P999_REGRESS_PCT" \
+  MIN_P999_SAMPLES="$MIN_P999_SAMPLES" \
   python3 - "$@" <<'PY'
 import glob, json, os, sys
 
@@ -102,6 +113,7 @@ crit = os.environ["CRIT_DIR"]
 perf = os.environ["PERF_DIR"]
 thr_t = float(os.environ["THROUGHPUT_REGRESS_PCT"])
 thr_p = float(os.environ["P999_REGRESS_PCT"])
+min_p999_samples = int(os.environ["MIN_P999_SAMPLES"])
 
 def load(path):
     with open(path) as f:
@@ -132,13 +144,18 @@ for group, ident in sorted(ids):
     print(f"{group + '/' + ident:<34} {'med-time':<10} {b:>14.1f} {n:>14.1f} {delta:>+8.1f}%  {status}")
 
 # 2) commit-latency p999 deltas from the bench's own histogram snapshots.
+low_sample = []
 for bp in sorted(glob.glob(os.path.join(perf, base, "commit_latency_*.json"))):
     fn = os.path.basename(bp)
     npth = os.path.join(perf, new, fn)
     if not os.path.exists(npth):
         continue
-    b = load(bp)["p999_ns"]
-    n = load(npth)["p999_ns"]
+    bd, nd = load(bp), load(npth)
+    b, n = bd["p999_ns"], nd["p999_ns"]
+    # A stable p999 needs many samples; flag a baseline taken with a reduced run.
+    for tag, d in ((base, bd), (new, nd)):
+        if d.get("samples", 0) < min_p999_samples:
+            low_sample.append(f"{tag}/{fn}: {d.get('samples', 0)} samples")
     delta = (n - b) / b * 100.0 if b else 0.0
     bad = delta > thr_p
     label = fn.replace("commit_latency_", "commit_lat/b").replace(".json", "")
@@ -148,6 +165,14 @@ for bp in sorted(glob.glob(os.path.join(perf, base, "commit_latency_*.json"))):
     print(f"{label:<34} {'p999':<10} {b:>14.1f} {n:>14.1f} {delta:>+8.1f}%  {status}")
 
 print("-" * 90)
+if low_sample:
+    print(
+        f"\nWARNING: p999 is unstable below {min_p999_samples} samples — do not gate on "
+        "this run (use a full bench run, not a reduced BENCH_ARGS):",
+        file=sys.stderr,
+    )
+    for x in low_sample:
+        print(f"  - {x}", file=sys.stderr)
 if breaches:
     print(f"\n{len(breaches)} regression(s):")
     for x in breaches:
