@@ -35,7 +35,9 @@ P999_REGRESS_PCT="${P999_REGRESS_PCT:-20}"
 BENCH_ARGS="${BENCH_ARGS:-}"
 # A stable p999 needs many commit() samples; warn (do not gate) if a baseline's
 # commit_latency histogram has fewer than this — typically a reduced BENCH_ARGS run.
-MIN_P999_SAMPLES="${MIN_P999_SAMPLES:-500}"
+# Default 1000: p999 is a directly-measured quantile only at >=1000 samples (below
+# that HdrHistogram interpolates), so this fires whenever p999 isn't truly measured.
+MIN_P999_SAMPLES="${MIN_P999_SAMPLES:-1000}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CRIT_DIR="$ROOT/target/criterion"
@@ -64,7 +66,7 @@ reduced BENCH_ARGS (e.g. --sample-size 10) is fine for a smoke but must NOT be u
 for `check` — `check`/`compare` warn when a histogram has too few samples.
 
 Environment threshold for that warning:
-  MIN_P999_SAMPLES        warn if a commit_latency histogram has fewer (default 500)
+  MIN_P999_SAMPLES        warn if a commit_latency histogram has fewer (default 1000)
 
 Examples:
   scripts/perf-gate.sh baseline main
