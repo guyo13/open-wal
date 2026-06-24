@@ -27,7 +27,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use open_wal::{Lsn, Wal, WalConfig};
+use open_wal::{Lsn, RecoveryReport, Wal, WalConfig, WalError};
 
 fn cfg() -> WalConfig {
     // Must match `crash_child`'s config (same dir, same segment_size — recovery
@@ -94,10 +94,29 @@ fn run_and_kill_mode(dir: &std::path::Path, delay: Duration, checkpoint: bool) -
         .unwrap_or(0)
 }
 
+/// Reopen `dir` after a SIGKILL, tolerating the brief window in which the killed
+/// child's `flock` is still being released by the kernel during process teardown.
+/// Even though `run_and_kill` reaps the child with `wait()`, lock release on the
+/// dying process's fds is not strictly ordered before a racing `open` on another
+/// fd, so an immediate reopen can occasionally see `Locked`. Bounded retry: it
+/// masks nothing — any non-`Locked` error still panics, and a dir that stays
+/// locked past the ceiling fails loudly (the lock is always freed once teardown
+/// completes, well within 1s).
+fn open_after_crash(dir: &std::path::Path, config: WalConfig) -> (Wal, RecoveryReport) {
+    for _ in 0..50 {
+        match Wal::open(dir, config) {
+            Ok(opened) => return opened,
+            Err(WalError::Locked) => std::thread::sleep(Duration::from_millis(20)),
+            Err(e) => panic!("open after crash failed with a non-lock error: {e:?}"),
+        }
+    }
+    panic!("WAL dir stayed Locked >1s after the crashed child was reaped");
+}
+
 /// Reopen `dir` and assert the recovered log is a dense, byte-identical suffix
 /// no shorter than `announced` (D2/D3/D6).
 fn assert_recovers(dir: &std::path::Path, announced: u64) {
-    let (wal, report) = Wal::open(dir, cfg()).unwrap();
+    let (wal, report) = open_after_crash(dir, cfg());
     assert!(
         report.durable_lsn.0 >= announced,
         "D3: lost a committed record — recovered durable {} < announced {}",
@@ -143,13 +162,13 @@ fn sigkill_then_resume_then_kill_again_stays_dense() {
     let dir = tempfile::tempdir().unwrap();
     let a1 = run_and_kill(dir.path(), Duration::from_millis(6));
     assert_recovers(dir.path(), a1);
-    let (_, r1) = Wal::open(dir.path(), cfg()).unwrap();
+    let (_, r1) = open_after_crash(dir.path(), cfg());
     let after_first = r1.durable_lsn.0;
 
     // Resume in a second process and crash again; the suffix only grows.
     let a2 = run_and_kill(dir.path(), Duration::from_millis(12));
     assert_recovers(dir.path(), a2.max(after_first));
-    let (_, r2) = Wal::open(dir.path(), cfg()).unwrap();
+    let (_, r2) = open_after_crash(dir.path(), cfg());
     assert!(
         r2.durable_lsn.0 >= after_first,
         "a resumed run must not lose earlier survivors: {} < {}",
@@ -163,7 +182,7 @@ fn sigkill_then_resume_then_kill_again_stays_dense() {
 /// (§14.4a checkpoint-unlink, D8/D9). The oldest LSN is whatever survived the
 /// possibly-interrupted reclamation — the run need not start at 1.
 fn assert_recovers_checkpointed(dir: &std::path::Path, announced: u64) {
-    let (wal, report) = Wal::open(dir, ckpt_cfg()).unwrap();
+    let (wal, report) = open_after_crash(dir, ckpt_cfg());
     assert!(
         report.durable_lsn.0 >= announced,
         "D3: lost a committed record — recovered durable {} < announced {}",
