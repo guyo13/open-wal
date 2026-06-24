@@ -9,9 +9,10 @@
 
 ## Changelog (v6 → v6.1)
 
-Normative corrections surfaced while implementing M3 (intra-segment recovery) and M4 (multi-segment); no other sections change.
+Normative corrections surfaced while implementing M3 (intra-segment recovery) and M4 (multi-segment), plus M6 testing-status annotations; no contract section changes.
 
 - **§8.2 step 5 (active-segment forward scan) — condition corrected `lsn == expected_next_lsn` → `lsn >= expected_next_lsn`.** The equality form is wrong and would silently truncate acknowledged data (a **D5** violation): when the invalid record at offset X is itself a *corrupted acked record*, the next genuine record carries `expected_next_lsn + 1`, never `expected_next_lsn`, so the equality test never matches and recovery misclassifies mid-log corruption as a torn tail — discarding the valid records after X. It was also internally inconsistent with §14.4e ("finds the **next** valid record"). The corrected `>=` form matches every genuine continuation; soundness against a coincidental stale match still rests on the §8.2.1 durable zeroing of `[X, EOF)` keeping the post-tail region clear within the scan bound. (Found and fixed during M3 implementation.)
+- **§14.3 (stateful model/oracle test) — IMPLEMENTED in M6 as an in-tree proptest harness; §14.5 F4 (the cargo-fuzz variant) DEFERRED to M9.** Added the M6 status note to §14.3, the F4 deferral to §14.5 and §14.13, and `§14.3` to the D7/D8 rows of the §14.12 matrix. The harness (`tests/model_oracle.rs` + the proptest-free executor `tests/model/mod.rs`) checks the §14.3 envelope as a refinement relation against an independent in-memory oracle after every state-machine crash/recover, and was shown to catch a seeded recovery-loss bug (D1/D3) and a seeded checkpoint over-delete (D8) per §14.0.3. No contract change — these are testing-status annotations only. (Added during M6 implementation.)
 - **§14.4d (dir-fsync omission negative control) — re-assigned from LazyFS to the §14.8/M8 metadata-fault tooling.** The original wording ("a build that skips the directory fsync on roll MUST fail recovery under LazyFS `clear-cache`") assigned the wrong instrument. LazyFS's fault model is **data-only** (`clear-cache` = lost/un-fsynced *data*, plus `torn-op`/`torn-seq`); it intercepts metadata ops (`create`/`rename`/…) only to maintain its page cache and tracing, not as a *losable* directory entry. As a passthrough it persists a `create` to the backing filesystem immediately, so a freshly-rolled segment's directory entry is never dropped by `clear-cache` — and because the segment's *data* is independently `fdatasync`'d, omitting the parent-directory fsync produces **no observable loss** under LazyFS. The negative control therefore structurally cannot run there. It is a directory-entry/namespace-durability scenario, which is the same capability §14.8 H3 needs: **dm-flakey** (drop the metadata-journal write at the block layer) or a real **power-pull**. Resolution: **M4/LazyFS covers the *positive* split+roll power-loss case (a real D9 check); the §14.4d *negative control* moves to M8 under §14.8's metadata-fault tooling** and is tracked as an open release-gate item (§14.12, §14.13). The `inject_no_dir_fsync` build toggle and the scaffold test are retained for M8 to drive. The dir-fsync itself remains **required** on every roll (§7.4 step 5) — only the *test* tool changed, not the contract. (Found during M4 implementation.)
 
 ## Changelog (v5 → v6)
@@ -502,6 +503,8 @@ Maintain an oracle: the **committed** set `(lsn, payload)` (a returned `commit`)
 
 Run with high iteration count in CI and as a fuzz target (seed/op-script from `cargo-fuzz`, §14.5 F4).
 
+> **M6 status — IMPLEMENTED as an in-tree proptest harness; F4 fuzz-target variant DEFERRED to M9** (like F1–F3). `tests/model_oracle.rs` generates randomized op-scripts (`Op::{Append, Commit, Checkpoint, CrashAndRecover, Reopen}`) and drives them through the proptest-free executor in `tests/model/mod.rs` against an independent in-memory oracle (`BTreeMap` committed set + staged `Vec` + `oldest_lsn`/`durable_lsn`/`max_ckpt_up_to` watermarks). After every recovery it asserts the envelope above as a **refinement relation** (⊇, dense, byte-identical, density-preserving tail) plus `durable_lsn`/`oldest_lsn` monotonicity and D7 idempotence across no-mutation reopens; a terminal reopen anchors the D8 "checkpoint didn't over-delete" check with an authoritative `RecoveryReport.oldest_lsn`. This harness models the **state machine** crash (drop the handle without committing ⇒ reopen), per §14.0 — it does **not** validate power-loss durability or torn tails (that is §14.4b/c, already passing). Case count is `PROPTEST_CASES`-overridable (§14.11). The executor is factored so the deferred F4 cargo-fuzz target (and a later optional LazyFS-backed crash variant) drives the *identical* `run(cfg, ops)` with zero duplication. Falsifiability (§14.0.3) was demonstrated: a seeded recovery loss bug trips the D1/D3 check and a seeded checkpoint over-delete trips the D8 check, each shrinking to a minimal op-script.
+
 ### 14.4 Crash-consistency & fault injection (core)
 
 #### 14.4a Process-crash matrix (SIGKILL)
@@ -547,7 +550,7 @@ Construct the specific resurrection hazard: write records, induce a torn tail su
 - **F1 Recovery-parser fuzz (highest priority).** Arbitrary bytes as a segment file / directory of segments. Parser MUST never panic, never read OOB (verify under ASan/Miri), never infinite-loop, never allocate unboundedly, and the **forward scan MUST stay within its bound** (assert via an instrumented counter). Always terminates with `Ok(suffix)` or clean `Err` (**D11**).
 - **F2 Decoder fuzz** — single-record decoder in isolation.
 - **F3 Structure-aware fuzz** — `arbitrary`-generated mostly-valid segments with localized mutations (flip CRC, extend length, zero a region, tamper padding), driving the tail-vs-corruption classifier.
-- **F4 Operation-script fuzz** — drive the §14.3 oracle harness from fuzzer-provided op scripts.
+- **F4 Operation-script fuzz** — drive the §14.3 oracle harness from fuzzer-provided op scripts. **DEFERRED to M9** (like F1–F3); the §14.3 in-tree proptest harness (M6, `tests/model_oracle.rs`) is the interim generative coverage, and its executor (`tests/model/mod.rs::run`) is already proptest-free so the F4 target reuses it verbatim.
 - Maintain a corpus; run continuously; release gate: N CPU-hours, zero new crashes.
 
 ### 14.6 Concurrency & memory-model
@@ -593,8 +596,8 @@ Multi-hour randomized workload with periodic injected crashes+recoveries and che
 | D4 Torn-tail truncation | §14.4b torn-op, §14.4e (i), §14.4f, §14.4g |
 | D5 Mid-log corruption fatal | §14.4e (ii)(iii)(v), sealed-segment cases |
 | D6 Read-back fidelity | §14.2 P1, §14.3 |
-| D7 Idempotent recovery | §14.2 P6 |
-| D8 Checkpoint safety | §14.1 math, §14.2 P5, §14.4c |
+| D7 Idempotent recovery | §14.2 P6, §14.3 (no-mutation reopen) |
+| D8 Checkpoint safety | §14.1 math, §14.2 P5, §14.3 (terminal reopen), §14.4c |
 | D9 Crash-anywhere recoverable | §14.4a, §14.4c (incl. split-batch & roll) |
 | D10 No buried garbage / resurrection | §14.4g (incl. stale-valid-record case) |
 | D11 Bounded recovery parsing | §14.5 F1/F2/F3, §14.4f, §14.6 Miri, bounded-scan counter |
@@ -605,7 +608,7 @@ Multi-hour randomized workload with periodic injected crashes+recoveries and che
 - Every enumerated crash point in §14.4c (including split-batch and roll sub-cases) has a test.
 - §14.4d negative control catches the injected bug **and** the correct build passes. *(Release-gate item satisfied in **M8**: the negative control requires §14.8 metadata-fault tooling — dm-flakey/power-pull — because LazyFS cannot model directory-entry loss. **OPEN** until then; the correct-build positive split+roll power-loss case already passes under LazyFS in M4. See the v6.1 changelog and §14.4d.)*
 - §14.4g resurrection test passes **and** is demonstrated to fail both (a) if zeroing-on-truncate is disabled and (b) if the invalidation is not durably synced (the power-loss-of-zeroing assertion).
-- Fuzzers F1–F4: ≥ N CPU-hours since the last parser/format change, zero outstanding crashes; bounded-scan counter never exceeds the bound.
+- Fuzzers F1–F4: ≥ N CPU-hours since the last parser/format change, zero outstanding crashes; bounded-scan counter never exceeds the bound. *(All four are **DEFERRED to M9**. Interim coverage: §14.5 F1–F3 by in-tree proptest on the codec/parser; **F4 by the §14.3 in-tree proptest oracle harness (M6)**, whose executor the F4 cargo-fuzz target will reuse verbatim. **OPEN** until M9.)*
 - §14.8 H1: ≥ M power-pull cycles on target hardware, zero acked-record loss.
 - Zero-allocation assertion (§14.7) passes for append/commit and `Reader::next`.
 - Miri clean on covered suites.
