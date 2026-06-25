@@ -218,13 +218,17 @@ On macOS/APFS a plain `fsync` does not flush the drive cache; durability require
 
 - Smoke (plain macOS CI): `tests/macos_fullfsync.rs::commit_is_durable_on_macos`.
 - Syscall-trace proof (root): run a commit under `dtruss -t fcntl` and confirm an
-  `F_FULLFSYNC` fcntl appears:
+  `F_FULLFSYNC` fcntl appears. **Note:** on a SIP-enabled host dtruss does **not**
+  symbolize the fcntl command — it prints the raw number `0x33` (== 51 ==
+  `F_FULLFSYNC`, per `<sys/fcntl.h>`), so grep for both:
 
 ```bash
-# automated:
+# automated (matches symbolic name OR the numeric 0x33 command):
 sudo cargo test --test macos_fullfsync -- --ignored --nocapture
 # or manual:
-sudo dtruss -t fcntl target/debug/power_pull_workload /tmp/h4wal stdout 8 8 64 2>&1 | grep F_FULLFSYNC
+sudo dtruss -t fcntl target/debug/power_pull_workload /tmp/h4wal stdout 8 8 64 2>&1 \
+  | grep -E 'F_FULLFSYNC|, 0x33,'
+# expect lines like:  fcntl(0x4, 0x33, 0x0)  = 0 0
 ```
 
 **Status: OPEN-pending-macOS** (cannot run on a Linux host; the cfg(macos) test does
