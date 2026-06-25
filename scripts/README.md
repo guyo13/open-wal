@@ -133,3 +133,48 @@ cost is unrepresentative, so these catch gross regressions and show the curve
 *shape*, not headline throughput. Real durability-throughput numbers belong on
 documented target hardware (§14.8 H1/H2). `baseline` prints `uname`/fs/cpu so a
 stored baseline records where it was taken.
+
+## `m8/` — hardware/platform durability gates (§14.8 + §14.4d)
+
+M8 is the milestone whose gates **cannot be honestly self-certified in a sandbox**
+(an `fdatasync` to tmpfs/RAM returns in ~1.5µs — the data was never at risk, so a
+power-pull there passes *vacuously*). These scripts split into what genuinely runs
+on any host and what the **owner** must run on real (or properly cache-configured
+virtual) hardware. The owner-facing procedure is `docs/m8-runbook.md`. Nothing here
+fakes green — the owner-run gates print loud "NOT EXERCISED"/OPEN banners.
+
+| Script | Gate | Runs in sandbox/CI? |
+|---|---|---|
+| `m8/storage-check.sh` | **H2** vacuous-pass guard (deny-by-default FS/cache classification + empirical loss probe) | static part **yes** |
+| `m8/fsync-fault.sh` | **H3 §12 poison state machine** (LD_PRELOAD EIO shim) | **yes — green** |
+| `m8/dm-flakey.sh` | **H3 physical** + **§14.4d** dir-fsync negative control | no (needs device-mapper) |
+| `m8/power-pull.sh` | **H1** power-pull (≥50 cycles, zero acked loss) | no (needs a cuttable target) |
+
+### Runs here (CI-safe)
+
+```bash
+scripts/m8/storage-check.sh classify .     # PASS on durable block FS, FAIL on tmpfs/overlay
+scripts/m8/fsync-fault.sh                  # build the EIO shim + run the §12 poison gate (green)
+```
+
+`fsync-fault.sh` LD_PRELOADs `tests/fault/eio_preload.c` to fail the commit's libc
+`fdatasync` and asserts the §12 poison machine (FsyncFailed, no `durable_lsn`
+advance, split-batch rest-at-seg1-max, handle poison). An anti-vacuous guard
+asserts the EIO actually fired — running without the shim **fails loudly**. It is an
+*application-logic* test of the WAL's reaction to a flush failure, **not** a
+durability test and **not** a substitute for dm-flakey/power-pull (the shim returns
+a fake EIO with data still in cache, and only catches the libc `fdatasync` — the
+rustix directory fsync needs the block-layer gate).
+
+### Owner-run (real hardware)
+
+```bash
+scripts/m8/dm-flakey.sh check              # detect device-mapper; loud OPEN banner if absent
+sudo scripts/m8/dm-flakey.sh h3 ext4       # physical fsync-failure → poison
+sudo scripts/m8/dm-flakey.sh dirfsync-negative ext4   # §14.4d (certify on ext4; FS-/timing-sensitive)
+scripts/m8/power-pull.sh cycle             # prints the ≥50-cycle power-pull procedure
+```
+
+See `docs/m8-runbook.md` for cut mechanisms (and why `sysrq-b`/`reboot` are **not**
+valid cuts), the network side-channel topology, the FS matrix, and the §14.4d
+filesystem-dependence caveat.

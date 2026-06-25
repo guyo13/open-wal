@@ -1,0 +1,83 @@
+name: M8 durability gates
+
+# M8 (§14.8) splits sharply into "runs anywhere" and "needs real hardware":
+#
+#   * The H2 vacuous-pass guard and the H3 §12 poison STATE MACHINE (LD_PRELOAD
+#     EIO shim) run on any Linux host and are REAL gates here — in particular the
+#     gate's anti-vacuous "injection actually fired" assertion is a HARD failure
+#     (red), never continue-on-error: "the shim didn't fire" means the test
+#     verified nothing, which must go red even though the job is otherwise about
+#     environment availability.
+#
+#   * The H3 PHYSICAL gate (dm-flakey), §14.4d, and H1 power-pull need device-mapper
+#     / a cuttable target that hosted runners lack. The `physical-availability` job
+#     only REPORTS whether the tooling is present (continue-on-error) and never
+#     fakes green — exactly like the LazyFS stopgap. The real runs are owner-driven
+#     (docs/m8-runbook.md).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "tests/fault/**"
+      - "tests/fsync_fault_gate.rs"
+      - "scripts/m8/**"
+      - ".github/workflows/m8.yml"
+      - "Cargo.toml"
+  pull_request:
+    paths:
+      - "src/**"
+      - "tests/fault/**"
+      - "tests/fsync_fault_gate.rs"
+      - "scripts/m8/**"
+      - ".github/workflows/m8.yml"
+      - "Cargo.toml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # REAL gates — these block the merge.
+  runnable:
+    name: H2 guard + H3 §12 poison gate (real)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # H2: the deny-by-default storage durability guard. The runner workspace must
+      # be a real durable block FS; tmpfs/overlay would (correctly) fail this.
+      - name: H2 storage durability guard
+        run: scripts/m8/storage-check.sh classify .
+
+      # H3 §12 poison state machine. The shim must compile, intercept the WAL's
+      # libc fdatasync, and the gate's injection-fired guard must hold — HARD fail.
+      - name: H3 §12 poison gate (LD_PRELOAD EIO shim)
+        run: scripts/m8/fsync-fault.sh run
+
+  # INFORMATIONAL — reports tooling availability for the owner-run physical gates.
+  # Never blocks the merge; never reports the gate itself as passed.
+  physical-availability:
+    name: H3-physical / §14.4d / H1 availability (informational)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: device-mapper / dm-flakey availability
+        continue-on-error: true
+        run: |
+          echo "Reporting whether the §14.8 physical fault tooling is present."
+          echo "Hosted runners typically LACK dm-flakey ⇒ expect the loud OPEN banner."
+          scripts/m8/dm-flakey.sh check
+      - name: Note
+        run: |
+          echo "H3-physical, §14.4d, and H1 power-pull are OWNER-RUN on real hardware."
+          echo "See docs/m8-runbook.md. This job is informational and does not gate."
