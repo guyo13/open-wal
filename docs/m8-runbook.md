@@ -177,8 +177,14 @@ ext2 is **journal-less**, so `fdatasync(segment)` does **not** transitively pers
 parent dirent — the one substrate where the omission is behaviorally observable:
 
 ```bash
-sudo scripts/m8/dm-flakey.sh dirfsync-negative ext2
+sudo -E scripts/m8/dm-flakey.sh dirfsync-negative ext2
 ```
+
+> **Note on `sudo` + rustup:** `sudo` drops the invoking user's `~/.cargo/bin` from
+> root's `PATH`, so a naive run hits `cargo: command not found`. The harness handles
+> this — when `cargo` isn't on `PATH` it builds **as `$SUDO_USER`** (their rustup
+> toolchain; artifacts land in `target/` and root just execs them). So `sudo -E
+> scripts/m8/dm-flakey.sh …` works; no need to put cargo on root's PATH.
 
 The harness uses a **synchronized mid-run cut** (`src/bin/dirfsync_cut_workload.rs`):
 the workload rolls **once**, puts an acked record in the brand-new segment, signals

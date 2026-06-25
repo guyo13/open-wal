@@ -55,6 +55,31 @@ EOF
 
 as_root() { if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo "$@"; fi; }
 
+# Resolve a usable `cargo` even when this script is invoked via `sudo` — which drops
+# the invoking user's ~/.cargo/bin from root's PATH, the cause of "cargo: command not
+# found" when run as `sudo scripts/m8/dm-flakey.sh …` (rustup installs cargo for the
+# user, not root). Prefer cargo on PATH (the CI case: non-root user, only dmsetup/
+# mount need sudo); otherwise build AS the invoking user with their rustup toolchain,
+# so artifacts land in $REPO_ROOT/target (owned by them) and root just execs them.
+# Run from a `( cd "$REPO_ROOT" && _cargo … )` subshell — sudo preserves the cwd.
+_cargo() {
+  if command -v cargo >/dev/null 2>&1; then
+    cargo "$@"
+    return
+  fi
+  if [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != root ]; then
+    local uhome
+    uhome="$(getent passwd "$SUDO_USER" 2>/dev/null | cut -d: -f6)"
+    [ -n "$uhome" ] || uhome="/home/$SUDO_USER"
+    sudo -u "$SUDO_USER" env "HOME=$uhome" \
+      "PATH=$uhome/.cargo/bin:/usr/local/bin:/usr/bin:/bin" \
+      cargo "$@"
+    return
+  fi
+  echo "cargo not found and no SUDO_USER to build as — install Rust or run as a user with cargo on PATH" >&2
+  return 127
+}
+
 # Emit a §5 evidence artifact for a gate (scripts/m8/evidence.sh). A gate's PASS
 # MUST be backed by a ledger artifact (#15) — so this NEVER leaves a gate without
 # a file: if the emitter fails (e.g. transient python3 issue — the cause of the #16
@@ -297,7 +322,7 @@ cmd_h3() {
   local fs="${1:-ext4}"
   setup "$fs"
   trap cmd_teardown EXIT
-  ( cd "$REPO_ROOT" && cargo build --bin power_pull_workload >/dev/null 2>&1 )
+  ( cd "$REPO_ROOT" && _cargo build --bin power_pull_workload >/dev/null 2>&1 )
 
   # Default 4 attempts: PASS now ANDs two conditions (WAL poison + observed block EIO),
   # so allow one extra window to absorb a dmesg/timing miss before declaring INCONCLUSIVE.
@@ -373,12 +398,12 @@ _d44d_run_one() {
   # look identical to "workload exited before the roll signal" (missing binary ⇒
   # immediate exec failure). Surface a build break loudly and distinctly.
   local bl="$WORK/build_${tag}.log"
-  if ! ( cd "$REPO_ROOT" && cargo build --bin dirfsync_cut_workload "${feat[@]}" ) >"$bl" 2>&1; then
+  if ! ( cd "$REPO_ROOT" && _cargo build --bin dirfsync_cut_workload "${feat[@]}" ) >"$bl" 2>&1; then
     log "§14.4d/${tag}: BUILD FAILED for dirfsync_cut_workload ${feat[*]} — see below (HARNESS, not a gate result):"
     cat "$bl" >&2
     return 2
   fi
-  ( cd "$REPO_ROOT" && cargo build --bin power_pull_verify ) >>"$bl" 2>&1 || { log "§14.4d/${tag}: BUILD FAILED for power_pull_verify:"; cat "$bl" >&2; return 2; }
+  ( cd "$REPO_ROOT" && _cargo build --bin power_pull_verify ) >>"$bl" 2>&1 || { log "§14.4d/${tag}: BUILD FAILED for power_pull_verify:"; cat "$bl" >&2; return 2; }
 
   # Launch the synchronized-cut workload. Its stderr is CAPTURED (not /dev/null'd) so
   # that if it dies before signalling we can show exactly why (a panic, a config
