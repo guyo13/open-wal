@@ -43,6 +43,17 @@ trail. A nightly regression is surfaced by the **red build**, not an issue comme
 (quiet on the issue, loud as a build). To produce a durable sign-off comment for a
 DoD flip, trigger the workflow manually (`workflow_dispatch`) and point to that run.
 
+> **A green `m8-dmflakey` run is NOT automatically a passed gate.** If the run
+> carries the loud `::warning:: dm-flakey unavailable` annotation, the gate **did not
+> run** (best-effort + loud skip) and **#16/#17 stay OPEN** — the green check only
+> means "nothing failed," not "the fault was injected." A gate closes only on a run
+> whose log shows the actual injection: H3 ext4 **PASS** with a **source-confirmed
+> block-layer EIO** (`detail.block_layer_eio_observed: 1` in the evidence), and
+> §14.4d ext4 **PASS** with the **positive control live**
+> (`detail.drop_positive_control: "pass"`). An `INCONCLUSIVE` (timing) or a §14.4d
+> `HARNESS_FAIL` (exit 4 — `drop_writes` not dropping) likewise certifies nothing.
+> Read the uploaded evidence JSON, not just the check colour.
+
 **Still owner-run (this runbook):** **H1** power-pull (needs a cuttable target), the
 **H2 empirical loss-probe**, and **H4 Half B** (`dtruss`). The dm-flakey gates can
 also still be run by hand here (e.g. on xfs/btrfs, or to certify on your own kernel).

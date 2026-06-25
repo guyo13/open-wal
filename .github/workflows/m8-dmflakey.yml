@@ -13,13 +13,25 @@ name: M8 dm-flakey gates (H3-physical + §14.4d)
 #   * The injection-fired (#16) and asymmetry (#17) checks live IN the script and are
 #     the anti-vacuous guards. A real durability FAIL (exit 1) reds the build; an
 #     INCONCLUSIVE (exit 2, timing) is loud-but-not-red — never a pass.
-#   * Not per-PR (timing-sensitive). Nightly + manual.
+#   * Not per-PR (timing-sensitive). Push-to-main + nightly + manual.
 #   * Evidence ledger (§5) uploaded every run; posted to the issue ONLY on a manual
-#     workflow_dispatch (the human sign-off), never on the nightly cron.
+#     workflow_dispatch (the human sign-off), never on the push/nightly runs.
 
+# TRIGGERS: NOT per-PR (slow; §14.4d is timing-flaky; can loud-skip; the recovery/
+# poison logic is already PR-covered by the unit/property/LazyFS/§12-shim tests). But
+# push-to-main (paths-filtered) catches a genuine durability regression shortly after
+# merge instead of up to 24h later. Flap-safe: INCONCLUSIVE (exit 2) is a warning, only
+# a real FAIL (exit 1) reds the build. Plus nightly + manual dispatch.
 on:
   schedule:
     - cron: "23 4 * * *" # nightly, off the :00 mark (§14.11)
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "scripts/m8/**"
+      - "Cargo.toml"
+      - ".github/workflows/m8-dmflakey.yml"
   workflow_dispatch:
 
 permissions:
@@ -89,6 +101,7 @@ jobs:
           case "$rc" in
             0) echo "§14.4d ext4: PASS (correct build survives, inject build loses the rolled segment)";;
             2) echo "::warning title=§14.4d INCONCLUSIVE::ext4 asymmetry did not reproduce within the retry budget (timing/FS-sensitive); NOT a pass (see evidence artifact).";;
+            4) echo "::error title=§14.4d HARNESS BROKEN::positive control failed — dm-flakey drop_writes did NOT drop an un-synced write on this runner, so the negative control is non-functional and certifies nothing. Louder than INCONCLUSIVE by design."; exit 1;;
             *) echo "::error title=§14.4d FAIL::ext4 exited ${rc} — the CORRECT build lost acked post-roll data (durability regression)."; exit 1;;
           esac
 

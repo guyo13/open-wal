@@ -132,21 +132,46 @@ cmd_teardown() {
   log "torn down"
 }
 
+# Scan the NEW kernel-log lines since $1 (a prior `dmesg | wc -l`) for a real
+# block-layer I/O error — the SOURCE confirmation that an injected EIO actually hit
+# the device (#16), not merely that the WAL reacted. Prints "1" if found, else "0".
+_block_eio_since() {
+  local pre="$1"
+  as_root dmesg 2>/dev/null | tail -n "+$((pre + 1))" \
+    | grep -qiE 'i/o error|buffer i/o error|blk_update_request.*error|critical (target|medium) error' \
+    && echo 1 || echo 0
+}
+
 # One H3 attempt: run the workload while injecting error_writes mid-run, capturing
-# the workload's stderr so we can prove the EIO actually reached a commit.
-#   return 0  PASS         — rc==7 (poisoned) AND the poison line is present: an
+# the workload's stderr AND the kernel log so we can SOURCE-CONFIRM the EIO actually
+# reached the device (not just infer it from the WAL's reaction — #16).
+#   return 0  PASS         — rc==7 (poisoned) AND the poison line is present AND a
+#                            real block-layer EIO was observed in the window: an
 #                            injected EIO reached a commit's fdatasync (§12 upheld).
 #   return 1  FAIL         — rc==0: the workload returned SUCCESS while writes were
 #                            erroring ⇒ the WAL ignored a durability failure.
-#   return 2  INCONCLUSIVE — the error window did not demonstrably hit a commit
-#                            (no poison) ⇒ retry; never counted as a pass.
-# Sets H3_LAST_RC / H3_LAST_FIRED for the evidence ledger.
+#   return 2  INCONCLUSIVE — the error window did not demonstrably hit a commit (no
+#                            poison), OR the WAL poisoned but no block-layer EIO was
+#                            observed (possible misattribution / unreadable dmesg)
+#                            ⇒ retry; never counted as a pass.
+# Sets H3_LAST_RC / H3_LAST_FIRED / H3_LAST_BLOCK_EIO / H3_LAST_DMESG_OK.
 H3_LAST_RC=""
 H3_LAST_FIRED=""
+H3_LAST_BLOCK_EIO=""
+H3_LAST_DMESG_OK=""
 _h3_attempt() {
   local delay="$1"
   local wal="$MNT/h3wal" err="$WORK/h3.err"
   rm -rf "$wal"; mkdir -p "$wal"; : > "$err"
+
+  # Snapshot the kernel-log length so we only scan lines produced in THIS window.
+  # dmesg needs root; if it is unreadable we cannot source-confirm ⇒ INCONCLUSIVE.
+  local pre dmesg_ok=1
+  pre="$(as_root dmesg 2>/dev/null | wc -l)" || dmesg_ok=0
+  if ! { [ -n "$pre" ] && [ "$pre" -ge 0 ] 2>/dev/null; }; then
+    dmesg_ok=0; pre=0
+  fi
+
   ( sleep "$delay"; flakey_fault error_writes ) &
   local inj=$!
   set +e
@@ -155,11 +180,19 @@ _h3_attempt() {
   local rc=$?
   set -e
   wait "$inj" 2>/dev/null || true
-  flakey_up
-  local fired=0
+
+  local fired=0 block_eio=0
   grep -q "handle poisoned" "$err" && fired=1
+  [ "$dmesg_ok" -eq 1 ] && block_eio="$(_block_eio_since "$pre")"
+
+  flakey_up
   H3_LAST_RC="$rc"; H3_LAST_FIRED="$fired"
-  if [ "$rc" -eq 7 ] && [ "$fired" -eq 1 ]; then return 0; fi
+  H3_LAST_BLOCK_EIO="$block_eio"; H3_LAST_DMESG_OK="$dmesg_ok"
+
+  # PASS requires BOTH halves ANDed: WAL poisoned AND a real block-layer EIO observed
+  # in the window. Poison without an observed EIO ⇒ INCONCLUSIVE (misattribution
+  # window closed), never a pass.
+  if [ "$rc" -eq 7 ] && [ "$fired" -eq 1 ] && [ "$block_eio" -eq 1 ]; then return 0; fi
   if [ "$rc" -eq 0 ]; then return 1; fi
   return 2
 }
@@ -177,8 +210,10 @@ cmd_h3() {
   trap cmd_teardown EXIT
   ( cd "$REPO_ROOT" && cargo build --bin power_pull_workload >/dev/null 2>&1 )
 
-  local max="${WAL_M8_H3_ATTEMPTS:-3}" attempts=0 verdict="INCONCLUSIVE" rc_class
-  local delays=(2 1 3)
+  # Default 4 attempts: PASS now ANDs two conditions (WAL poison + observed block EIO),
+  # so allow one extra window to absorb a dmesg/timing miss before declaring INCONCLUSIVE.
+  local max="${WAL_M8_H3_ATTEMPTS:-4}" attempts=0 verdict="INCONCLUSIVE" rc_class
+  local delays=(2 1 3 2)
   while [ "$attempts" -lt "$max" ]; do
     local delay="${delays[$attempts]:-2}"
     attempts=$((attempts + 1))
@@ -186,13 +221,17 @@ cmd_h3() {
     set +e; _h3_attempt "$delay"; rc_class=$?; set -e
     if [ "$rc_class" -eq 0 ]; then verdict="PASS"; break; fi
     if [ "$rc_class" -eq 1 ]; then verdict="FAIL"; break; fi
-    log "INCONCLUSIVE this attempt (workload rc=${H3_LAST_RC}, poisoned=${H3_LAST_FIRED}) — the error window did not land on a commit; retrying."
+    if [ "$H3_LAST_DMESG_OK" -eq 0 ]; then
+      log "INCONCLUSIVE this attempt: kernel log UNREADABLE (need root dmesg) — cannot SOURCE-CONFIRM the block-layer EIO (#16); retrying."
+    else
+      log "INCONCLUSIVE this attempt (workload rc=${H3_LAST_RC}, poisoned=${H3_LAST_FIRED}, block_eio_observed=${H3_LAST_BLOCK_EIO}) — the error window did not land on a commit with a confirmed EIO; retrying."
+    fi
   done
 
   local pass=0 fail=0 verdict_exit=2
   case "$verdict" in
     PASS) pass=1; verdict_exit=0
-      log "PASS (H3): a real block-layer EIO poisoned the handle (§12 upheld physically; covers the dir fsync too)." ;;
+      log "PASS (H3): a real block-layer EIO was observed AND poisoned the handle (§12 upheld physically; source-confirmed, covers the dir fsync too)." ;;
     FAIL) fail=1; verdict_exit=1
       log "FAIL (H3): the workload returned SUCCESS while writes were erroring — the WAL did NOT poison on a durability failure (§12 violation)." ;;
     *)    verdict_exit=2
@@ -207,6 +246,7 @@ cmd_h3() {
     "cut.mechanism=dm-flakey error_writes" cut.valid=true \
     run.cycles_required=1 "run.cycles_pass=$pass" "run.fail=$fail" "run.inconclusive_rerun=$((attempts - 1))" \
     "detail.workload_rc=$H3_LAST_RC" "detail.injection_fired=$H3_LAST_FIRED" \
+    "detail.block_layer_eio_observed=$H3_LAST_BLOCK_EIO" "detail.dmesg_readable=$H3_LAST_DMESG_OK" \
     "verdict=$verdict"
 
   return "$verdict_exit"
@@ -252,13 +292,41 @@ _d44d_run_one() {
   return $?
 }
 
+# POSITIVE CONTROL (amended #17): independently confirm dm-flakey `drop_writes`
+# actually drops an UN-synced write on THIS host/run, using the same mechanism the
+# negative control relies on. Without it, an exhausted retry budget cannot tell
+# "timing didn't land" (benign INCONCLUSIVE) from "drop_writes never dropped anything"
+# (a structurally dead negative control that certifies nothing while looking like
+# flakiness). Write a marker but DO NOT sync it (it stays a dirty page, not yet a
+# bio — dm suspend's flush touches in-flight bios, not page cache), enter drop_writes,
+# then umount (forces writeback ⇒ bios ⇒ dropped); remount and check it is gone.
+#   return 0  drop is functional (the un-synced marker vanished across the cut)
+#   return 1  drop did NOT take effect (marker survived) ⇒ harness/env problem
+_d44d_drop_positive_control() {
+  local marker="$MNT/.m8_drop_probe"
+  as_root rm -f "$marker" 2>/dev/null || true
+  echo "m8-drop-probe" > "$marker"      # dirty page, intentionally NOT fsync'd
+  flakey_fault drop_writes
+  as_root umount "$MNT" 2>/dev/null || true
+  flakey_up
+  as_root mount "$DM_DEV" "$MNT"
+  as_root chmod 0777 "$MNT"
+  if [ -e "$marker" ]; then
+    as_root rm -f "$marker" 2>/dev/null || true
+    return 1                            # survived ⇒ drop_writes dropped nothing
+  fi
+  return 0
+}
+
 # §14.4d negative control: correct build MUST pass, inject build MUST fail.
 # ANTI-VACUOUS (amended #17): the asymmetry is timing-sensitive, so we grant a
 # bounded retry BUDGET (default 5) to reproduce it; a budget exhausted WITHOUT the
 # asymmetry is INCONCLUSIVE (never a pass, never a code-red). A correct build that
 # itself loses acked data is a genuine FAIL (red). The inject build merely not
 # failing is INCONCLUSIVE, not "dir-fsync omission is harmless".
-# Exit: 0 PASS · 1 FAIL · 2 INCONCLUSIVE · (3 ENV-UNAVAILABLE from `check`).
+# A POSITIVE CONTROL runs first: if drop_writes doesn't actually drop here, the
+# negative control is non-functional ⇒ exit 4 (HARNESS, louder than INCONCLUSIVE).
+# Exit: 0 PASS · 1 FAIL · 2 INCONCLUSIVE · 3 ENV-UNAVAILABLE (`check`) · 4 HARNESS.
 cmd_dirfsync_negative() {
   local fs="${1:-ext4}"
   setup "$fs"                     # cmd_check inside ⇒ loud OPEN + exit on a non-dm host
@@ -266,6 +334,29 @@ cmd_dirfsync_negative() {
   [ "$fs" = "ext4" ] || log "FS-DEPENDENCE: §14.4d is validated on ext4; on '$fs' a non-failure of the inject build may reflect FS metadata-journaling differences, NOT a working dir-fsync (see docs/m8-runbook.md)."
 
   printf '\033[1;33m%s\033[0m\n' "[m8/dm-flakey] §14.4d is timing-sensitive: the cut must land shortly after a roll, before the FS lazily writes back the new directory entry. A bounded retry budget reproduces it; an exhausted budget is INCONCLUSIVE, never self-certified green. Interpret per the FS caveat." >&2
+
+  # POSITIVE CONTROL first: if drop_writes doesn't actually drop on this host, the
+  # whole negative control is non-functional — that is a HARNESS/ENV problem (exit 4),
+  # LOUDER than a benign timing INCONCLUSIVE, and must NOT be mistaken for "the inject
+  # build didn't fail, so dir-fsync omission is harmless."
+  log "positive control: confirming dm-flakey drop_writes drops an un-synced write on this host..."
+  local drop_pc="pass"
+  set +e; _d44d_drop_positive_control; local pc_rc=$?; set -e
+  if [ "$pc_rc" -ne 0 ]; then
+    drop_pc="fail"
+    log "§14.4d POSITIVE CONTROL FAILED: an un-synced marker SURVIVED a drop_writes cut — drop_writes is NOT dropping writes here (mounted sync? wrong dm table? FS write-through?). The negative control is non-functional and certifies NOTHING on this runner. This is a harness/env problem, not a benign INCONCLUSIVE."
+    emit_evidence 14.4d \
+      gate=14.4d \
+      "target.uname=$(uname -sr)" "target.host=$(hostname)" \
+      "storage.fs=$fs" "storage.block_device=$DM_DEV" \
+      "storage.write_cache=n/a (dm-flakey)" "storage.h2_probe=n/a (fault-injection, not power-loss)" \
+      "cut.mechanism=dm-flakey drop_writes" cut.valid=false \
+      run.cycles_required=1 run.cycles_pass=0 run.fail=0 run.attempts_used=0 \
+      "detail.drop_positive_control=fail" \
+      "verdict=HARNESS_FAIL"
+    return 4
+  fi
+  log "positive control OK: drop_writes drops un-synced writes on this host — the negative control is live."
 
   local budget="${WAL_M8_D44D_BUDGET:-5}" attempt=0 verdict="INCONCLUSIVE"
   local rc_correct=-1 rc_inject=-1
@@ -306,6 +397,7 @@ cmd_dirfsync_negative() {
     run.cycles_required=1 "run.cycles_pass=$pass" "run.fail=$fail" \
     "run.attempts_used=$attempt" "run.inconclusive_rerun=$((attempt - 1))" \
     "detail.correct_rc=$rc_correct" "detail.inject_rc=$rc_inject" \
+    "detail.drop_positive_control=$drop_pc" \
     "verdict=$verdict"
 
   return "$verdict_exit"
