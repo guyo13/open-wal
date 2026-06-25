@@ -118,21 +118,23 @@ jobs:
       # new segment's dirent reaches disk transitively via the file's own fdatasync —
       # journal on ext4/xfs/btrfs; the ext4 driver's metadata/writeback on a journal-less
       # mount (incl. "ext2"-format, which modern kernels service via ext4). This step is
-      # the ONE bounded attempt left: a journaled ext4 mounted data=writeback (the ext4
-      # driver's weakest ordering). Reproduce ⇒ certifying; else §14.4d's behavioral form
-      # is a documented negative result (Tier-1 carries the DoD). Informational either way.
-      - name: §14.4d behavioral — ext4-writeback (bounded attempt; not reproduced anywhere yet)
+      # the last bounded attempt was a journaled ext4 mounted data=writeback (the ext4
+      # driver's weakest ordering) — it ALSO masks the omission (PR #21, owner Fedora 43),
+      # so §14.4d's behavioral form is CLOSED as a documented negative result; Tier-1 strace
+      # carries the DoD. This step still runs for the record + as a correct-build regression
+      # catcher: INCONCLUSIVE is the EXPECTED, documented outcome (a notice, never red).
+      - name: §14.4d behavioral — ext4-writeback (documented negative result; regression catcher)
         if: steps.dmcheck.outputs.available == 'true'
         env:
           WAL_M8_EVIDENCE_DIR: ${{ github.workspace }}/m8-evidence/ext4-writeback
         run: |
-          # PASS (0) would be a genuine behavioral demonstration. INCONCLUSIVE (2) is the
-          # expected outcome (matches every other config so far) — a warning, NOT red. A
-          # correct-build data loss (1) or broken positive control (4) is always red.
+          # INCONCLUSIVE (2) is the EXPECTED, documented negative result — a notice, NOT red.
+          # PASS (0) would be a (surprising) genuine demonstration. A correct-build data loss
+          # (1) or broken positive control (4) is always red.
           set +e; scripts/m8/dm-flakey.sh dirfsync-negative ext4-writeback; rc=$?; set -e
           case "$rc" in
-            0) echo "§14.4d ext4-writeback: PASS — correct survives, inject loses the rolled segment. Behavioral negative control DEMONSTRATED (record as certifying).";;
-            2) echo "::warning title=§14.4d ext4-writeback INCONCLUSIVE::not reproduced (the expected outcome so far) — the behavioral form is a documented negative result; Tier-1 strace is the gate. NOT red.";;
+            0) echo "::notice title=§14.4d ext4-writeback reproduced::unexpected — correct survives, inject loses the rolled segment. Behavioral negative control DEMONSTRATED; revisit the closed-negative-result classification.";;
+            2) echo "::notice title=§14.4d ext4-writeback INCONCLUSIVE-by-design::masks the omission (the documented negative result; data=writeback weakens data ordering, not the metadata/dirent). Tier-1 strace is the gate. NOT red.";;
             4) echo "::error title=§14.4d HARNESS BROKEN::ext4-writeback positive control failed — drop_writes did not drop an un-synced write; the control is non-functional."; exit 1;;
             *) echo "::error title=§14.4d FAIL::ext4-writeback exited ${rc} — the CORRECT build lost acked post-roll data (durability regression)."; exit 1;;
           esac
