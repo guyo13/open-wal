@@ -115,7 +115,18 @@ setup() {
 flakey_fault() {
   local mode="$1" loop sectors
   loop="$(cat "$WORK/loop")"; sectors="$(cat "$WORK/sectors")"
-  as_root dmsetup suspend "$DM_NAME"
+  # CRITICAL: --noflush --nolockfs when ENTERING the fault mode. The table is
+  # still in UP mode at suspend time (the fault table loads on the next line), so
+  # a default `dmsetup suspend` would FLUSH in-flight I/O and FREEZE the
+  # filesystem (lockfs ⇒ a full sync) — persisting the very un-synced data we are
+  # about to drop, to the backing store, BEFORE drop_writes is active. That is
+  # exactly why the §14.4d positive control failed ("un-synced marker SURVIVED a
+  # drop_writes cut") on hosted CI AND on real hardware: the freeze-sync wrote the
+  # dirty marker out before the cut. It also silently defeats the negative control
+  # (the inject build's un-synced dir entry gets persisted too ⇒ no asymmetry).
+  # Skipping the flush + freeze leaves the un-synced data dirty so the subsequent
+  # umount writeback hits the drop_writes target and is genuinely lost.
+  as_root dmsetup suspend --noflush --nolockfs "$DM_NAME"
   # up 0 / down 60 ⇒ immediately and continuously in the down state for 60s.
   as_root dmsetup load "$DM_NAME" --table "0 $sectors flakey $loop 0 0 60 1 $mode"
   as_root dmsetup resume "$DM_NAME"
@@ -317,8 +328,11 @@ _d44d_run_one() {
 # negative control relies on. Without it, an exhausted retry budget cannot tell
 # "timing didn't land" (benign INCONCLUSIVE) from "drop_writes never dropped anything"
 # (a structurally dead negative control that certifies nothing while looking like
-# flakiness). Write a marker but DO NOT sync it (it stays a dirty page, not yet a
-# bio — dm suspend's flush touches in-flight bios, not page cache), enter drop_writes,
+# flakiness). Write a marker but DO NOT sync it (it stays a dirty page). Entering
+# drop_writes via `flakey_fault` now suspends with --noflush --nolockfs, so the
+# transition neither flushes nor freeze-syncs the fs — the dirty marker stays
+# un-persisted (an earlier default suspend's lockfs freeze synced it out, which is
+# what made this very control fail on CI and on real hardware), enter drop_writes,
 # then umount (forces writeback ⇒ bios ⇒ dropped); remount and check it is gone.
 #   return 0  drop is functional (the un-synced marker vanished across the cut)
 #   return 1  drop did NOT take effect (marker survived) ⇒ harness/env problem
