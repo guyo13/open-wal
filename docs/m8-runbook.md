@@ -20,7 +20,7 @@ real (or properly-cache-configured virtual) hardware are marked
 | **H3 (§12 state machine)** | WAL poisons on fsync EIO (logic) | **yes — RUN+green** | `scripts/m8/fsync-fault.sh` passes here |
 | **H3 (physical)** | block-layer fsync-failure → poison | no (needs dm) | **OPEN-pending-owner-hardware** |
 | **§14.4d** Tier-1 dir-fsync presence | correct issues roll-time dir-fsync, inject does not (strace) | **yes — RUN+green** | `scripts/m8/dirfsync-presence.sh`, per-PR (`ci.yml`) |
-| **§14.4d** Tier-2 behavioral (ext2) | inject build loses a rolled segment under power loss | no (needs dm; ext2 only) | **OPEN — Phase-1 expected-to-reproduce** |
+| **§14.4d** Tier-2 behavioral (synchronized cut) | inject build loses a rolled segment under power loss | no (needs dm) | **NOT reproduced on any Linux config; one `ext4-writeback` attempt left, then negative result** |
 | **§14.4d** Tier-3 (ext4/xfs/btrfs) | — | n/a | **INCONCLUSIVE-by-design** (journaling masks it) |
 | **H1** power-pull | committed records survive a real cut (D1) | no (needs a cuttable target) | **OPEN-pending-owner-run** |
 | **H4** macOS `F_FULLFSYNC` | macOS durable path issues `F_FULLFSYNC` | no (Linux host) | **OPEN-pending-macOS** |
@@ -37,7 +37,7 @@ Two gates that the build sandbox could not run are now **automated on hosted CI*
 | Workflow | Gate | Runner | Notes |
 |---|---|---|---|
 | `.github/workflows/ci.yml` (`dirfsync-presence`) | **§14.4d Tier-1** (dir-fsync presence) | `ubuntu-latest` | **per-PR**, deterministic, `strace` only — correct issues the roll-time dir-fsync, inject does not. |
-| `.github/workflows/m8-dmflakey.yml` | **H3-physical (#16)** + **§14.4d Tier-2/3 (#17)** | `ubuntu-latest` | hosted VMs reach `dm-flakey`; H3 ext4 is the hard gate; §14.4d **certifies on ext2** (journal-less), ext4 is INCONCLUSIVE-by-design, xfs/btrfs informational. **Best-effort + loud skip** if a runner image lacks dm-flakey (gate stays OPEN, never faked). |
+| `.github/workflows/m8-dmflakey.yml` | **H3-physical (#16)** + **§14.4d Tier-2/3 (#17)** | `ubuntu-latest` | hosted VMs reach `dm-flakey`; H3 ext4 is the hard gate; §14.4d behavioral is the `ext4-writeback` bounded attempt (informational — not reproduced anywhere yet), ext4 INCONCLUSIVE-by-design. **Best-effort + loud skip** if a runner image lacks dm-flakey (gate stays OPEN, never faked). |
 | `.github/workflows/m8-macos.yml` | **H4 Half A (#19)** | `macos-latest` | `cargo test --test macos_fullfsync` (routing/smoke). **Half B** (the `dtruss` trace, root + SIP) stays owner-run below. |
 
 Both emit the §5 evidence ledger as a workflow artifact on **every** run, and post it
@@ -51,9 +51,10 @@ DoD flip, trigger the workflow manually (`workflow_dispatch`) and point to that 
 > run** (best-effort + loud skip) and **#16/#17 stay OPEN** — the green check only
 > means "nothing failed," not "the fault was injected." A gate closes only on a run
 > whose log shows the actual injection: H3 ext4 **PASS** with a **source-confirmed
-> block-layer EIO** (`detail.block_layer_eio_observed: 1` in the evidence), and the
-> §14.4d behavioral control **on ext2** (the journal-less certifying fs) **PASS** with
-> the **positive control live** (`detail.drop_positive_control: "pass"`). §14.4d on
+> block-layer EIO** (`detail.block_layer_eio_observed: 1` in the evidence). The §14.4d
+> behavioral control has **not reproduced on any Linux config tested** (one
+> `ext4-writeback` attempt remains, else it is a documented negative result); its
+> deterministic guard is the per-PR Tier-1 strace presence check (`ci.yml`). §14.4d on
 > **ext4 is INCONCLUSIVE-by-design** (journaling masks the omission) and certifies
 > nothing on its own — its deterministic guard is the per-PR Tier-1 strace presence
 > check (`ci.yml`). An `INCONCLUSIVE` (timing) or a §14.4d `HARNESS_FAIL` (exit 4 —
@@ -172,37 +173,39 @@ directory `fsync` per roll (cold-start + one per roll) while the **inject** buil
 issues only the cold-start one. Deterministic green: e.g. `correct=5` vs `inject=1`.
 This is the dir-fsync analogue of the H4 `F_FULLFSYNC` presence check.
 
-### Tier 2 — behavioral power-loss on ext2 (OWNER-RUN / CI; the only FS that shows it)
-ext2 is **journal-less**, so `fdatasync(segment)` does **not** transitively persist the
-parent dirent — the one substrate where the omission is behaviorally observable:
+### Tier 2 — behavioral power-loss: NOT reproduced on any Linux config tested (one attempt left)
+A **synchronized mid-run cut** (`src/bin/dirfsync_cut_workload.rs`) rolls **once**, puts an
+acked record in the brand-new segment, signals ready off-device, and **blocks** holding
+that segment's directory entry un-synced. The harness activates `drop_writes` *before*
+killing the workload / unmounting (so no writeback can beat the cut), `fsck`s, remounts,
+and verifies. Empirically (PR #21, owner Fedora 43) the inject build **still recovers
+fully** on every config tried — the new segment's dirent reaches disk transitively via the
+file's own `fdatasync`.
+
+> **Mechanism correction (retracts the earlier "ext2 block-adjacency" claim).** dmesg
+> showed a plain `ext2`-format volume is, on modern kernels, mounted by the **ext4 driver
+> journal-less** ("mounting ext2 file system using the ext4 subsystem") — the standalone
+> ext2 driver was removed in Linux 6.9 and Fedora 43 doesn't enable it. So no real ext2
+> driver was ever exercised; the masking there is the ext4 driver's metadata/writeback,
+> and on ext4/xfs/btrfs it is the journal. The exact mechanism was **not isolated**.
+
+The one bounded attempt left is the ext4 driver's **weakest ordering** — a *journaled*
+ext4 mounted `data=writeback` (journal-less ext4 is moot — it masks it, and
+`data=writeback` requires a journal anyway):
 
 ```bash
-sudo -E scripts/m8/dm-flakey.sh dirfsync-negative ext2
+sudo -E scripts/m8/dm-flakey.sh dirfsync-negative ext4-writeback
 ```
 
-> **Note on `sudo` + rustup:** `sudo` drops the invoking user's `~/.cargo/bin` from
-> root's `PATH`, so a naive run hits `cargo: command not found`. The harness handles
-> this — when `cargo` isn't on `PATH` it builds **as `$SUDO_USER`** (their rustup
-> toolchain; artifacts land in `target/` and root just execs them). So `sudo -E
-> scripts/m8/dm-flakey.sh …` works; no need to put cargo on root's PATH.
+- **Reproduces** (`correct=PASS / inject=FAIL`) → genuine behavioral demonstration on a
+  production-plausible config; record it as the certifying row.
+- **Doesn't reproduce** → **finalize §14.4d's behavioral form as a documented negative
+  result.** Honest close, not a gap: Tier-1 carries the gate. **Stop and report — do not
+  tune.**
 
-The harness uses a **synchronized mid-run cut** (`src/bin/dirfsync_cut_workload.rs`):
-the workload rolls **once**, puts an acked record in the brand-new segment, signals
-ready off-device, and **blocks** holding that segment's directory entry un-synced. The
-harness then activates `drop_writes` *before* killing the workload / unmounting (so no
-writeback can beat the cut), runs `fsck.ext2 -y`, remounts, and verifies. **Expected:**
-correct → PASS, inject → FAIL ⇒ negative control demonstrated. **Phase-1 status:
-expected to reproduce — verify** (observe a first PASS before hard-gating; until then an
-INCONCLUSIVE is a warning, not red).
-
-> **Why a synchronized cut (the key fix):** a run-to-completion workload cut *afterward*
-> does **not** reproduce the omission even on ext2 — by the cut, every rolled dirent has
-> aged out and been written back (`vm.dirty_expire_centisecs` default 30 s; observed
-> empirically on PR #21 run 28193051238 with the positive control LIVE). Blocking the
-> workload right after the roll keeps the dirent dirty with ~30 s of slack, so the cut
-> lands *inside* the un-synced window at leisure — converting a sub-millisecond race
-> into a robust gate. If it still doesn't reproduce after this, **stop and report** —
-> that's a real finding, not something to tune blindly.
+> **Note on `sudo` + rustup:** `sudo` drops the invoking user's `~/.cargo/bin` from root's
+> `PATH` (`cargo: command not found`). The harness builds **as `$SUDO_USER`** when `cargo`
+> isn't on `PATH`, so `sudo -E scripts/m8/dm-flakey.sh …` works.
 
 ### Tier 3 — ext4/xfs/btrfs: INCONCLUSIVE-by-design
 ```bash
@@ -213,9 +216,10 @@ data loss is still a real FAIL). A non-failing **inject** build here is **expect
 never read it as "dir-fsync omission is harmless." The deterministic guard for these is
 Tier 1.
 
-**Status:** Tier 1 **PASSES** (deterministic, per-PR). Tier 2 (ext2) **OPEN — Phase-1
-expected-to-reproduce, owner/CI to observe a first PASS**. The agent never self-certifies
-the behavioral tiers from a sandbox without dm-flakey.
+**Status:** Tier 1 **PASSES** (deterministic, per-PR) — satisfies the §14.4d DoD row.
+Tier 2 (behavioral) **not reproduced on any Linux config tested**; one bounded attempt
+left (`ext4-writeback`), then finalize as a documented negative result. The agent never
+self-certifies the behavioral tiers from a sandbox without dm-flakey.
 
 ---
 
@@ -316,8 +320,8 @@ Run the runnable physical gates (H3 physical, §14.4d) across **ext4 / xfs / btr
 sudo scripts/m8/dm-flakey.sh h3 ext4
 sudo scripts/m8/dm-flakey.sh h3 xfs
 sudo scripts/m8/dm-flakey.sh h3 btrfs
-sudo scripts/m8/dm-flakey.sh dirfsync-negative ext2   # §14.4d Tier-2: CERTIFY on ext2 (journal-less)
-sudo scripts/m8/dm-flakey.sh dirfsync-negative ext4   # §14.4d Tier-3: INCONCLUSIVE-by-design (journaling masks it)
+sudo -E scripts/m8/dm-flakey.sh dirfsync-negative ext4-writeback  # §14.4d Tier-2: bounded behavioral attempt (else negative result)
+sudo -E scripts/m8/dm-flakey.sh dirfsync-negative ext4            # §14.4d Tier-3: INCONCLUSIVE-by-design (journaling masks it)
 ```
 
 **tmpfs is logic-only and must NEVER carry a durability claim** — the H2 guard

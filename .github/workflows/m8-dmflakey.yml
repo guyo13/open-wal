@@ -80,8 +80,8 @@ jobs:
           uname -r
           sudo dmsetup targets 2>&1 || true
           echo "::endgroup::"
-          # e2fsprogs (mkfs.ext2/fsck.ext2 — the §14.4d certifying fs) is normally
-          # preinstalled; install defensively. xfs/btrfs for the informational matrix.
+          # e2fsprogs (mkfs.ext4/fsck.ext4 — the §14.4d ext4-writeback attempt) is
+          # normally preinstalled; install defensively. xfs/btrfs for the H3 matrix.
           sudo apt-get install -y e2fsprogs xfsprogs btrfs-progs
 
       # Probe availability. `check` exits 3 when dm-flakey is absent ⇒ loud skip
@@ -113,28 +113,28 @@ jobs:
           esac
 
       # §14.4d BEHAVIORAL negative control (Tier 2). The deterministic dir-fsync
-      # guard is the per-PR Tier-1 strace presence check (ci.yml, dirfsync-presence.sh);
-      # this behavioral power-loss proof is FS-dependent (see the AFSNCE OSDI '14
-      # masking note) and therefore split by filesystem:
-      #   * ext2 (journal-less) — the FS where the omission is OBSERVABLE; certifying.
-      #   * ext4 (journaling)   — INCONCLUSIVE-BY-DESIGN; run only to catch a genuine
-      #                           correct-build regression, never red on a masked miss.
-      - name: §14.4d behavioral — ext2 (certifying; expected to reproduce)
+      # guard is the per-PR Tier-1 strace presence check (ci.yml, dirfsync-presence.sh).
+      # The behavioral form has NOT reproduced on any Linux config tested (PR #21): the
+      # new segment's dirent reaches disk transitively via the file's own fdatasync —
+      # journal on ext4/xfs/btrfs; the ext4 driver's metadata/writeback on a journal-less
+      # mount (incl. "ext2"-format, which modern kernels service via ext4). This step is
+      # the ONE bounded attempt left: a journaled ext4 mounted data=writeback (the ext4
+      # driver's weakest ordering). Reproduce ⇒ certifying; else §14.4d's behavioral form
+      # is a documented negative result (Tier-1 carries the DoD). Informational either way.
+      - name: §14.4d behavioral — ext4-writeback (bounded attempt; not reproduced anywhere yet)
         if: steps.dmcheck.outputs.available == 'true'
         env:
-          WAL_M8_EVIDENCE_DIR: ${{ github.workspace }}/m8-evidence/ext2
+          WAL_M8_EVIDENCE_DIR: ${{ github.workspace }}/m8-evidence/ext4-writeback
         run: |
-          # PASS (0) is the goal. PHASE 1 ("observe before certify"): until a first
-          # PASS is observed, an INCONCLUSIVE (2) is a loud warning, NOT red — making
-          # it hard-red now would self-certify a gate never seen green. A correct-build
-          # data loss (1) or broken positive control (4) is always red. Once a PASS is
-          # observed, promote exit 2 here to red (Phase 2).
-          set +e; scripts/m8/dm-flakey.sh dirfsync-negative ext2; rc=$?; set -e
+          # PASS (0) would be a genuine behavioral demonstration. INCONCLUSIVE (2) is the
+          # expected outcome (matches every other config so far) — a warning, NOT red. A
+          # correct-build data loss (1) or broken positive control (4) is always red.
+          set +e; scripts/m8/dm-flakey.sh dirfsync-negative ext4-writeback; rc=$?; set -e
           case "$rc" in
-            0) echo "§14.4d ext2: PASS — correct build survives, inject build loses the rolled segment. Behavioral negative control DEMONSTRATED.";;
-            2) echo "::warning title=§14.4d ext2 INCONCLUSIVE::expected to reproduce on journal-less ext2 but did not within the retry budget — investigate cut timing (NOT a pass; not yet hard-gated — Phase 1).";;
-            4) echo "::error title=§14.4d HARNESS BROKEN::ext2 positive control failed — drop_writes did not drop an un-synced write; the control is non-functional."; exit 1;;
-            *) echo "::error title=§14.4d FAIL::ext2 exited ${rc} — the CORRECT build lost acked post-roll data (durability regression)."; exit 1;;
+            0) echo "§14.4d ext4-writeback: PASS — correct survives, inject loses the rolled segment. Behavioral negative control DEMONSTRATED (record as certifying).";;
+            2) echo "::warning title=§14.4d ext4-writeback INCONCLUSIVE::not reproduced (the expected outcome so far) — the behavioral form is a documented negative result; Tier-1 strace is the gate. NOT red.";;
+            4) echo "::error title=§14.4d HARNESS BROKEN::ext4-writeback positive control failed — drop_writes did not drop an un-synced write; the control is non-functional."; exit 1;;
+            *) echo "::error title=§14.4d FAIL::ext4-writeback exited ${rc} — the CORRECT build lost acked post-roll data (durability regression)."; exit 1;;
           esac
 
       - name: §14.4d behavioral — ext4 (informational; INCONCLUSIVE-by-design)
@@ -148,7 +148,7 @@ jobs:
           # regression: a correct-build data loss (1) or broken positive control (4) is red.
           set +e; scripts/m8/dm-flakey.sh dirfsync-negative ext4; rc=$?; set -e
           case "$rc" in
-            2) echo "::notice title=§14.4d ext4 INCONCLUSIVE-by-design::journaling masks the missing dir-fsync (expected, not a gap). Tier-1 strace + ext2 are the real controls.";;
+            2) echo "::notice title=§14.4d ext4 INCONCLUSIVE-by-design::journaling masks the missing dir-fsync (expected, not a gap). Tier-1 strace is the real control.";;
             0) echo "::notice title=§14.4d ext4 reproduced::unexpected on a journaling fs but harmless — recorded.";;
             4) echo "::error title=§14.4d HARNESS BROKEN::ext4 positive control failed — drop_writes did not drop."; exit 1;;
             *) echo "::error title=§14.4d FAIL::ext4 exited ${rc} — the CORRECT build lost acked post-roll data (durability regression)."; exit 1;;
@@ -193,7 +193,7 @@ jobs:
             gh issue comment "$issue" --repo "$GITHUB_REPOSITORY" --body-file body.md
           }
           post 16 "${{ github.workspace }}/m8-evidence/ext4/evidence-h3.json"    "H3-physical (ext4)"
-          # §14.4d: the certifying evidence is the ext2 (journal-less) run; ext4 is the
-          # INCONCLUSIVE-by-design informational control. Post both for the trail.
-          post 17 "${{ github.workspace }}/m8-evidence/ext2/evidence-14.4d.json" "§14.4d behavioral negative control (ext2 — certifying)"
+          # §14.4d: the behavioral form has not reproduced anywhere; post the
+          # ext4-writeback bounded attempt + the ext4 INCONCLUSIVE-by-design control.
+          post 17 "${{ github.workspace }}/m8-evidence/ext4-writeback/evidence-14.4d.json" "§14.4d behavioral — ext4-writeback (bounded attempt)"
           post 17 "${{ github.workspace }}/m8-evidence/ext4/evidence-14.4d.json" "§14.4d behavioral control (ext4 — INCONCLUSIVE-by-design)"

@@ -142,16 +142,43 @@ _udev_settle() { as_root udevadm settle >/dev/null 2>&1 || true; }
 # this is a deliberate no-op for them. `M8_FS` is set by cmd_dirfsync_negative.
 _post_cut_fsck() {
   case "${M8_FS:-}" in
-    ext2 | ext3) as_root "fsck.${M8_FS}" -y "$DM_DEV" >/dev/null 2>&1 || true ;;
+    ext2 | ext3)    as_root "fsck.${M8_FS}" -y "$DM_DEV" >/dev/null 2>&1 || true ;;
+    ext4-writeback) as_root fsck.ext4 -y "$DM_DEV" >/dev/null 2>&1 || true ;;
   esac
 }
 
-# Build a loop-backed ext2/ext4/xfs/btrfs on top of a dm-flakey device that is in
-# normal "up" mode. Returns with $DM_DEV mounted at $MNT.
+# Resolve the mkfs binary, mkfs flags, and mount options for a filesystem token.
+# Most tokens map to `mkfs.<fs>`; the pseudo-token `ext4-writeback` is the §14.4d
+# bounded attempt suggested by the designer: a JOURNAL-LESS ext4 (`-O ^has_journal`)
+# mounted `data=writeback` — the ext4 driver's *weakest* ordering, which the kernel
+# docs warn "can leave stale data exposed … in case of an unclean shutdown" (exactly
+# this class of bug). NOTE on "ext2": the standalone ext2 driver was removed in Linux
+# 6.9, so on modern kernels `mount -t ext2` is serviced by the ext4 subsystem
+# (journal-less) — a real ext2 *driver* is not exercised; that is why we lever the
+# ext4 driver's ordering directly here instead of chasing ext2.
+_fs_spec() {  # _fs_spec <fs>; sets MKFS_BIN, MKFS_EXTRA[], MOUNT_OPTS[]
+  MKFS_EXTRA=(); MOUNT_OPTS=()
+  case "$1" in
+    # NOTE: data=writeback is a JOURNAL data mode — it REQUIRES a journal, so it is
+    # NOT combinable with `-O ^has_journal` (that combo fails to mount: "bad
+    # option/superblock"). The ext4 driver's weakest *ordering* is therefore a
+    # journaled ext4 mounted data=writeback (metadata journaled, data unordered —
+    # kernel docs: "can leave stale data exposed on unclean shutdown"). Journal-less
+    # ext4 is the separate "ext2"-format case already shown to mask the omission.
+    ext4-writeback) MKFS_BIN=mkfs.ext4; MOUNT_OPTS=(-o data=writeback) ;;
+    *)              MKFS_BIN="mkfs.$1" ;;
+  esac
+}
+
+# Build a loop-backed filesystem on top of a dm-flakey device that is in normal "up"
+# mode. Returns with $DM_DEV mounted at $MNT. Accepts ext4/ext2/xfs/btrfs and the
+# pseudo-token ext4-writeback (see _fs_spec).
 setup() {
   local fs="${1:-ext4}"
   cmd_check
-  command -v "mkfs.${fs}" >/dev/null 2>&1 || die "mkfs.${fs} not installed"
+  local MKFS_BIN; local -a MKFS_EXTRA MOUNT_OPTS
+  _fs_spec "$fs"
+  command -v "$MKFS_BIN" >/dev/null 2>&1 || die "$MKFS_BIN not installed"
 
   # Reclaim anything a crashed prior run (or a still-settling udev hold) left
   # behind, so `dmsetup create` cannot fail "Device or resource busy" — the error
@@ -175,10 +202,10 @@ setup() {
   # detected fs (the "appears to contain an existing filesystem (ext4)" failure),
   # while mke2fs would otherwise need -F. Zeroing is FS-agnostic and bulletproof.
   as_root dd if=/dev/zero of="$DM_DEV" bs=1M count=16 status=none 2>/dev/null || true
-  as_root "mkfs.${fs}" "$DM_DEV" >/dev/null 2>&1 || die "mkfs.${fs} failed on $DM_DEV"
-  as_root mount "$DM_DEV" "$MNT"
+  as_root "$MKFS_BIN" "${MKFS_EXTRA[@]}" "$DM_DEV" >/dev/null 2>&1 || die "$MKFS_BIN ${MKFS_EXTRA[*]} failed on $DM_DEV"
+  as_root mount "${MOUNT_OPTS[@]}" "$DM_DEV" "$MNT"
   as_root chmod 0777 "$MNT"
-  log "ready: ${fs} on $DM_DEV mounted at $MNT (backing $loop)"
+  log "ready: ${fs} (${MKFS_BIN} ${MKFS_EXTRA[*]}; mount ${MOUNT_OPTS[*]:-defaults}) on $DM_DEV at $MNT (backing $loop)"
   echo "$sectors" > "$WORK/sectors"
 }
 
@@ -380,11 +407,18 @@ cmd_h3() {
 # OFF-device, and BLOCKS — so we activate drop_writes and cut INSIDE the un-synced
 # window (default dirty_expire ⇒ ~30s slack; the cut is unhurried, not a sub-ms race).
 #
-# FS-DEPENDENCE: expected to reproduce on **ext2** (journal-less). ext4/xfs/btrfs are
-# INCONCLUSIVE-BY-DESIGN (journaling transitively persists the new dirent on the
-# segment's own fsync — "All File Systems Are Not Created Equal", OSDI '14; design
-# §18). The DETERMINISTIC, FS-independent guard is the Tier-1 strace presence check
-# (scripts/m8/dirfsync-presence.sh, per-PR); this is the Tier-2 behavioral proof.
+# FS-DEPENDENCE (corrected, PR #21): the behavioral asymmetry has NOT been
+# demonstrated on any config tested. ext4/xfs/btrfs mask it via the journal; an
+# "ext2"-format volume is, on modern kernels (standalone ext2 driver removed in
+# Linux 6.9), serviced by the EXT4 DRIVER journal-less and masks it too via the ext4
+# driver's metadata/writeback — NOT any ext2 mechanism (the dmesg confirms "mounting
+# ext2 file system using the ext4 subsystem"). The `ext4-writeback` token is the last
+# bounded attempt (journal-less ext4 + data=writeback, the weakest ordering); if it
+# also doesn't reproduce, §14.4d's behavioral form is a documented negative result.
+# The DETERMINISTIC, FS-independent guard is the Tier-1 strace presence check
+# (scripts/m8/dirfsync-presence.sh, per-PR). The `dirfsync_cut_workload` bin rolls
+# ONCE, puts an acked record in the brand-new (still-dirty-dirent) segment, signals
+# ready OFF-device, and BLOCKS — so the cut lands INSIDE the un-synced window.
 # Echoes 0 PASS / 1 FAIL / 2 INCONCLUSIVE (incl. "the cut was missed").
 _d44d_run_one() {
   local tag="$1"; shift          # "correct" | "inject"
@@ -440,7 +474,7 @@ _d44d_run_one() {
   kill -9 "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
   as_root umount "$MNT" 2>/dev/null || as_root umount -l "$MNT" 2>/dev/null || true
   flakey_up
-  _post_cut_fsck            # journal-less (ext2) needs an fsck before a clean mount
+  _post_cut_fsck            # journal-less (ext2/ext4-writeback) needs an fsck first
   as_root mount "$DM_DEV" "$MNT"
 
   WAL_SEGMENT_SIZE=4096 WAL_MAX_RECORD_SIZE=256 \
@@ -488,17 +522,23 @@ _d44d_drop_positive_control() {
 # negative control is non-functional ⇒ exit 4 (HARNESS, louder than INCONCLUSIVE).
 # Exit: 0 PASS · 1 FAIL · 2 INCONCLUSIVE · 3 ENV-UNAVAILABLE (`check`) · 4 HARNESS.
 cmd_dirfsync_negative() {
-  # Default to ext2 — the journal-less fs where the behavioral asymmetry is expected
-  # to reproduce. ext4/xfs/btrfs are INCONCLUSIVE-BY-DESIGN (journaling masks the
-  # missing dir-fsync); the deterministic guard for them is the Tier-1 strace
-  # presence check (scripts/m8/dirfsync-presence.sh, per-PR).
-  local fs="${1:-ext2}"
+  # Default to the journal-less ext4 + data=writeback BOUNDED ATTEMPT (the ext4
+  # driver's weakest ordering — designer's PR #21 lever). The behavioral asymmetry
+  # has NOT been demonstrated on any config tested so far: ext4/xfs/btrfs mask it via
+  # the journal, and a plain "ext2"-format volume is, on modern kernels (the
+  # standalone ext2 driver was removed in Linux 6.9), serviced by the ext4 driver
+  # journal-less — so it masks it too via the ext4 driver's metadata/writeback, NOT
+  # via any ext2 mechanism. The deterministic guard is the Tier-1 strace presence
+  # check (scripts/m8/dirfsync-presence.sh, per-PR); this behavioral path is the
+  # last bounded attempt before §14.4d is finalized as a documented negative result.
+  local fs="${1:-ext4-writeback}"
   M8_FS="$fs"                     # consumed by _post_cut_fsck (journal-less fsck)
   setup "$fs"                     # cmd_check inside ⇒ loud OPEN + exit on a non-dm host
   trap cmd_teardown EXIT
   case "$fs" in
-    ext2 | ext3) log "FS: '$fs' is journal-less ⇒ the §14.4d behavioral asymmetry is EXPECTED to reproduce here (verify — not self-certified)." ;;
-    *) log "FS-DEPENDENCE: '$fs' journals ⇒ §14.4d is INCONCLUSIVE-BY-DESIGN here (a file fsync transitively persists the new dir entry, masking the omission — AFSNCE OSDI '14). A non-failing inject build is NOT 'dir-fsync omission is harmless'. The deterministic guard is the Tier-1 strace presence check; the behavioral proof is ext2." ;;
+    ext4-writeback) log "FS: journal-less ext4, mount data=writeback — the ext4 driver's WEAKEST ordering (kernel docs: 'can leave stale data exposed … on unclean shutdown'). §14.4d bounded attempt: reproduce ⇒ certifying; else finalize as a documented negative result (verify — not self-certified)." ;;
+    ext2 | ext3) log "FS: '$fs' is, on modern kernels, serviced by the EXT4 DRIVER journal-less (the standalone ext2 driver was removed in Linux 6.9) — NOT a real ext2 driver. The omission has so far been masked here by the ext4 driver's metadata/writeback, not by any ext2 mechanism. Prefer 'ext4-writeback'." ;;
+    *) log "FS-DEPENDENCE: '$fs' journals ⇒ §14.4d is INCONCLUSIVE-BY-DESIGN here (a file fsync transitively persists the new dir entry, masking the omission — AFSNCE OSDI '14). A non-failing inject build is NOT 'dir-fsync omission is harmless'. The deterministic guard is the Tier-1 strace presence check." ;;
   esac
 
   printf '\033[1;33m%s\033[0m\n' "[m8/dm-flakey] §14.4d behavioral control is timing-sensitive: the cut must land before the FS writes back the new directory entry. A bounded retry budget reproduces it; an exhausted budget is INCONCLUSIVE, never self-certified green. Interpret per the FS note above." >&2
@@ -553,7 +593,7 @@ cmd_dirfsync_negative() {
     FAIL) fail=1; verdict_exit=1
       log "§14.4d FAIL: the CORRECT build lost acked post-roll data (correct rc=${rc_correct}). That is a real durability regression, not a timing artefact." ;;
     *)    verdict_exit=2
-      log "§14.4d INCONCLUSIVE after ${attempt} attempts (correct=${rc_correct} inject=${rc_inject}). NOT a pass, NOT a code failure. On ext4/xfs/btrfs this is EXPECTED-by-design (journaling masks the omission — AFSNCE OSDI '14); the journal-less fs is **ext2**, and the deterministic guard is the Tier-1 strace presence check (scripts/m8/dirfsync-presence.sh). NEVER read a non-failing inject build as 'dir-fsync omission is harmless'." ;;
+      log "§14.4d INCONCLUSIVE after ${attempt} attempts (correct=${rc_correct} inject=${rc_inject}). NOT a pass, NOT a code failure. The behavioral asymmetry has not been demonstrated on any Linux config tested (the new segment's dir entry reaches disk transitively via the file's own fdatasync — journal on ext4/xfs/btrfs; the ext4 driver's metadata/writeback on a journal-less mount, incl. 'ext2'-format which modern kernels service via ext4). The deterministic guard is the Tier-1 strace presence check (scripts/m8/dirfsync-presence.sh). NEVER read a non-failing inject build as 'dir-fsync omission is harmless'." ;;
   esac
 
   emit_evidence 14.4d \
