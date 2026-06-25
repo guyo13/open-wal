@@ -58,15 +58,25 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Provision dm-flakey + FS tools
+      # DIAGNOSTIC (temporary): the linux-modules-extra install matched the running
+      # Azure kernel yet `modprobe dm-flakey` still didn't surface the `flakey` target
+      # — and the error was swallowed. Surface it: depmod, modinfo (is the .ko there?),
+      # modprobe -v (the real load error), dmesg (e.g. "Key was rejected by service" ⇒
+      # secure-boot/lockdown). `|| echo` keeps `set -e` from aborting before `check`
+      # gates. Revert to a clean provision once we know whether hosted is salvageable.
+      - name: Provision dm-flakey + FS tools (verbose diagnostic)
         run: |
           sudo apt-get update -y
-          # dm-flakey usually ships in linux-modules-extra for the running kernel,
-          # which hosted runners don't always pre-install. Best-effort: if the
-          # exact-kernel package isn't in the repo (image/kernel skew), fall through
-          # and let `check` loud-skip honestly.
-          sudo apt-get install -y "linux-modules-extra-$(uname -r)" || true
-          sudo modprobe dm-flakey 2>/dev/null || true
+          sudo apt-get install -y "linux-modules-extra-$(uname -r)" \
+            || echo "modules-extra: install failed (kernel/image skew?)"
+          sudo depmod -a || true
+          echo "::group::dm-flakey load diagnostics"
+          uname -r
+          modinfo dm_flakey 2>&1 || echo "modinfo: dm_flakey .ko NOT in module tree"
+          sudo modprobe -v dm_flakey 2>&1 || echo "modprobe dm_flakey FAILED rc=$?"
+          sudo dmesg 2>&1 | tail -n 25 || echo "dmesg unreadable"
+          sudo dmsetup targets 2>&1 || true
+          echo "::endgroup::"
           sudo apt-get install -y xfsprogs btrfs-progs
 
       # Probe availability. `check` exits 3 when dm-flakey is absent ⇒ loud skip

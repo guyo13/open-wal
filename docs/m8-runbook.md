@@ -58,6 +58,47 @@ DoD flip, trigger the workflow manually (`workflow_dispatch`) and point to that 
 **H2 empirical loss-probe**, and **H4 Half B** (`dtruss`). The dm-flakey gates can
 also still be run by hand here (e.g. on xfs/btrfs, or to certify on your own kernel).
 
+### Run the dm-flakey gates on your own Linux host (closes #16/#17 without hosted CI)
+
+Hosted `ubuntu-latest` runs a **locked-down Azure kernel image** that won't load the
+`dm-flakey` module (the `m8-dmflakey` job loud-skips there — `check` exits 3). But
+**#16/#17 need no physical hardware** — dm-flakey injects the faults (block-layer EIO
+for H3; dropped metadata writes for §14.4d) **in software**. So *any* Linux box where
+you have root and `dm-flakey` actually loads closes both gates. A throwaway cloud VM
+(e.g. a GCE `e2-micro` on **Ubuntu LTS**, not Container-Optimized OS) or any local VM
+works; only **H1** (#18) needs a real cuttable rig.
+
+```bash
+git clone https://github.com/guyo13/open-wal && cd open-wal
+sudo apt-get update
+sudo apt-get install -y dmsetup e2fsprogs xfsprogs btrfs-progs
+# On Ubuntu the flakey target ships in modules-extra for the running kernel:
+sudo apt-get install -y "linux-modules-extra-$(uname -r)"
+# Rust toolchain, if absent (MSRV 1.85+):
+command -v cargo || { curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y && . "$HOME/.cargo/env"; }
+
+# PRECONDITION — dm-flakey MUST load. This is exactly what hosted CI cannot do:
+sudo modprobe dm-flakey && sudo dmsetup targets | grep flakey
+
+export WAL_M8_EVIDENCE_DIR="$PWD/m8-evidence/ext4"
+scripts/m8/dm-flakey.sh check                     # must NOT exit 3
+sudo -E scripts/m8/dm-flakey.sh h3 ext4           # 0 PASS · 1 FAIL · 2 INCONCLUSIVE
+sudo -E scripts/m8/dm-flakey.sh dirfsync-negative ext4   # 0 PASS · 2 INCONC · 4 HARNESS · 1 FAIL
+cat m8-evidence/ext4/evidence-h3.json m8-evidence/ext4/evidence-14.4d.json
+```
+
+**Sign-off (DoD).** A gate closes **only** on:
+- **H3 ext4 PASS** with `detail.block_layer_eio_observed: 1` (a real block-layer EIO
+  was source-confirmed in the injection window — not just the WAL reacting), **and**
+- **§14.4d ext4 PASS** with `detail.drop_positive_control: "pass"` (the `drop_writes`
+  positive control proved the runner actually drops un-synced writes).
+
+An `INCONCLUSIVE` (exit 2, cut-timing) or a §14.4d `HARNESS_FAIL` (exit 4 =
+`drop_writes` inert on this kernel) **certifies nothing** — re-run. ext4 is the
+certifying filesystem; xfs/btrfs are informational. Attach the two evidence JSONs to
+issues #16/#17 to close them. (`sudo -E` preserves `WAL_M8_EVIDENCE_DIR` across the
+privilege boundary.)
+
 ---
 
 ## H2 — storage durability guard (precondition for H1)
