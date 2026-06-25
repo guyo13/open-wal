@@ -60,8 +60,13 @@ jobs:
 
       - name: Provision dm-flakey + FS tools
         run: |
-          sudo modprobe dm-flakey 2>/dev/null || true
           sudo apt-get update -y
+          # dm-flakey usually ships in linux-modules-extra for the running kernel,
+          # which hosted runners don't always pre-install. Best-effort: if the
+          # exact-kernel package isn't in the repo (image/kernel skew), fall through
+          # and let `check` loud-skip honestly.
+          sudo apt-get install -y "linux-modules-extra-$(uname -r)" || true
+          sudo modprobe dm-flakey 2>/dev/null || true
           sudo apt-get install -y xfsprogs btrfs-progs
 
       # Probe availability. `check` exits 3 when dm-flakey is absent ⇒ loud skip
