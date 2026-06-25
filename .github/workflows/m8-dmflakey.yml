@@ -165,7 +165,7 @@ jobs:
         run: |
           for fs in xfs btrfs; do
             echo "::group::H3-physical ${fs} (informational)"
-            scripts/m8/dm-flakey.sh h3 "$fs" || echo "::notice::H3 ${fs} non-PASS (informational; ext4 is the gate)."
+            scripts/m8/dm-flakey.sh h3 "$fs" || echo "::notice::H3 ${fs} non-PASS (informational; ext4 is the hard H3 gate)."
             echo "::endgroup::"
           done
 

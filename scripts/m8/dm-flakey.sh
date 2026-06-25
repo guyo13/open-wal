@@ -476,7 +476,7 @@ cmd_dirfsync_negative() {
     FAIL) fail=1; verdict_exit=1
       log "§14.4d FAIL: the CORRECT build lost acked post-roll data (correct rc=${rc_correct}). That is a real durability regression, not a timing artefact." ;;
     *)    verdict_exit=2
-      log "§14.4d INCONCLUSIVE after ${attempt} attempts (correct=${rc_correct} inject=${rc_inject}). Timing/FS-sensitive — NOT a pass, NOT a code failure. Prefer ext4; tune the cut timing (runbook). NEVER read a non-failing inject build as 'dir-fsync omission is harmless'." ;;
+      log "§14.4d INCONCLUSIVE after ${attempt} attempts (correct=${rc_correct} inject=${rc_inject}). NOT a pass, NOT a code failure. On ext4/xfs/btrfs this is EXPECTED-by-design (journaling masks the omission — AFSNCE OSDI '14); the journal-less fs is **ext2**, and the deterministic guard is the Tier-1 strace presence check (scripts/m8/dirfsync-presence.sh). NEVER read a non-failing inject build as 'dir-fsync omission is harmless'." ;;
   esac
 
   emit_evidence 14.4d \
