@@ -80,7 +80,9 @@ jobs:
           uname -r
           sudo dmsetup targets 2>&1 || true
           echo "::endgroup::"
-          sudo apt-get install -y xfsprogs btrfs-progs
+          # e2fsprogs (mkfs.ext2/fsck.ext2 — the §14.4d certifying fs) is normally
+          # preinstalled; install defensively. xfs/btrfs for the informational matrix.
+          sudo apt-get install -y e2fsprogs xfsprogs btrfs-progs
 
       # Probe availability. `check` exits 3 when dm-flakey is absent ⇒ loud skip
       # (gate not run, NOT a pass). Exit 0 ⇒ run the real gate below.
@@ -110,16 +112,45 @@ jobs:
             *) echo "::error title=H3-physical FAIL::ext4 H3 exited ${rc} — the WAL did not poison on a durability failure (§12 violation)."; exit 1;;
           esac
 
-      - name: §14.4d negative control — ext4 (HARD)
+      # §14.4d BEHAVIORAL negative control (Tier 2). The deterministic dir-fsync
+      # guard is the per-PR Tier-1 strace presence check (ci.yml, dirfsync-presence.sh);
+      # this behavioral power-loss proof is FS-dependent (see the AFSNCE OSDI '14
+      # masking note) and therefore split by filesystem:
+      #   * ext2 (journal-less) — the FS where the omission is OBSERVABLE; certifying.
+      #   * ext4 (journaling)   — INCONCLUSIVE-BY-DESIGN; run only to catch a genuine
+      #                           correct-build regression, never red on a masked miss.
+      - name: §14.4d behavioral — ext2 (certifying; expected to reproduce)
+        if: steps.dmcheck.outputs.available == 'true'
+        env:
+          WAL_M8_EVIDENCE_DIR: ${{ github.workspace }}/m8-evidence/ext2
+        run: |
+          # PASS (0) is the goal. PHASE 1 ("observe before certify"): until a first
+          # PASS is observed, an INCONCLUSIVE (2) is a loud warning, NOT red — making
+          # it hard-red now would self-certify a gate never seen green. A correct-build
+          # data loss (1) or broken positive control (4) is always red. Once a PASS is
+          # observed, promote exit 2 here to red (Phase 2).
+          set +e; scripts/m8/dm-flakey.sh dirfsync-negative ext2; rc=$?; set -e
+          case "$rc" in
+            0) echo "§14.4d ext2: PASS — correct build survives, inject build loses the rolled segment. Behavioral negative control DEMONSTRATED.";;
+            2) echo "::warning title=§14.4d ext2 INCONCLUSIVE::expected to reproduce on journal-less ext2 but did not within the retry budget — investigate cut timing (NOT a pass; not yet hard-gated — Phase 1).";;
+            4) echo "::error title=§14.4d HARNESS BROKEN::ext2 positive control failed — drop_writes did not drop an un-synced write; the control is non-functional."; exit 1;;
+            *) echo "::error title=§14.4d FAIL::ext2 exited ${rc} — the CORRECT build lost acked post-roll data (durability regression)."; exit 1;;
+          esac
+
+      - name: §14.4d behavioral — ext4 (informational; INCONCLUSIVE-by-design)
         if: steps.dmcheck.outputs.available == 'true'
         env:
           WAL_M8_EVIDENCE_DIR: ${{ github.workspace }}/m8-evidence/ext4
         run: |
+          # ext4 journals, so a file fdatasync transitively persists the new directory
+          # entry (AFSNCE OSDI '14) ⇒ the inject build does NOT fail ⇒ INCONCLUSIVE is
+          # the EXPECTED, correct outcome here, never red. Still run it to catch a real
+          # regression: a correct-build data loss (1) or broken positive control (4) is red.
           set +e; scripts/m8/dm-flakey.sh dirfsync-negative ext4; rc=$?; set -e
           case "$rc" in
-            0) echo "§14.4d ext4: PASS (correct build survives, inject build loses the rolled segment)";;
-            2) echo "::warning title=§14.4d INCONCLUSIVE::ext4 asymmetry did not reproduce within the retry budget (timing/FS-sensitive); NOT a pass (see evidence artifact).";;
-            4) echo "::error title=§14.4d HARNESS BROKEN::positive control failed — dm-flakey drop_writes did NOT drop an un-synced write on this runner, so the negative control is non-functional and certifies nothing. Louder than INCONCLUSIVE by design."; exit 1;;
+            2) echo "::notice title=§14.4d ext4 INCONCLUSIVE-by-design::journaling masks the missing dir-fsync (expected, not a gap). Tier-1 strace + ext2 are the real controls.";;
+            0) echo "::notice title=§14.4d ext4 reproduced::unexpected on a journaling fs but harmless — recorded.";;
+            4) echo "::error title=§14.4d HARNESS BROKEN::ext4 positive control failed — drop_writes did not drop."; exit 1;;
             *) echo "::error title=§14.4d FAIL::ext4 exited ${rc} — the CORRECT build lost acked post-roll data (durability regression)."; exit 1;;
           esac
 
@@ -162,4 +193,7 @@ jobs:
             gh issue comment "$issue" --repo "$GITHUB_REPOSITORY" --body-file body.md
           }
           post 16 "${{ github.workspace }}/m8-evidence/ext4/evidence-h3.json"    "H3-physical (ext4)"
-          post 17 "${{ github.workspace }}/m8-evidence/ext4/evidence-14.4d.json" "§14.4d negative control (ext4)"
+          # §14.4d: the certifying evidence is the ext2 (journal-less) run; ext4 is the
+          # INCONCLUSIVE-by-design informational control. Post both for the trail.
+          post 17 "${{ github.workspace }}/m8-evidence/ext2/evidence-14.4d.json" "§14.4d behavioral negative control (ext2 — certifying)"
+          post 17 "${{ github.workspace }}/m8-evidence/ext4/evidence-14.4d.json" "§14.4d behavioral control (ext4 — INCONCLUSIVE-by-design)"

@@ -87,12 +87,37 @@ cmd_check() {
   log "device-mapper + dm-flakey present — H3/§14.4d CAN run on this host."
 }
 
-# Build a loop-backed ext4 (or xfs/btrfs) on top of a dm-flakey device that is in
+# Let udev finish its block-device bookkeeping before/after create+mkfs+remove.
+# udevd grabs short-lived locks on a just-formatted/unmounted dm/loop device, the
+# source of the "Device or resource busy" seen running filesystems back-to-back.
+_udev_settle() { as_root udevadm settle >/dev/null 2>&1 || true; }
+
+# After a simulated power loss on a JOURNAL-LESS fs (ext2), the unclean mount can be
+# refused or flag corruption, and orphan inodes (data blocks present, directory
+# entry dropped) need clearing. Run `fsck -y` before remounting so the mount is
+# clean and the dropped dirent is reflected as a vanished file (orphan → lost+found
+# → not in the WAL's readdir). Journaling fs's (ext4/xfs/btrfs) recover on mount, so
+# this is a deliberate no-op for them. `M8_FS` is set by cmd_dirfsync_negative.
+_post_cut_fsck() {
+  case "${M8_FS:-}" in
+    ext2 | ext3) as_root "fsck.${M8_FS}" -y "$DM_DEV" >/dev/null 2>&1 || true ;;
+  esac
+}
+
+# Build a loop-backed ext2/ext4/xfs/btrfs on top of a dm-flakey device that is in
 # normal "up" mode. Returns with $DM_DEV mounted at $MNT.
 setup() {
   local fs="${1:-ext4}"
   cmd_check
   command -v "mkfs.${fs}" >/dev/null 2>&1 || die "mkfs.${fs} not installed"
+
+  # Reclaim anything a crashed prior run (or a still-settling udev hold) left
+  # behind, so `dmsetup create` cannot fail "Device or resource busy" — the error
+  # seen running fs's back-to-back in one CI step.
+  as_root dmsetup remove "$DM_NAME" 2>/dev/null \
+    || as_root dmsetup remove -f --deferred "$DM_NAME" 2>/dev/null || true
+  _udev_settle
+
   mkdir -p "$WORK" "$MNT"
   [ -f "$IMG" ] || dd if=/dev/zero of="$IMG" bs=1M count="$IMG_SIZE_MB" status=none
   local loop
@@ -102,7 +127,13 @@ setup() {
   sectors="$(as_root blockdev --getsz "$loop")"
   # Normal operation: up forever (down 0 ⇒ never drops/errors).
   as_root dmsetup create "$DM_NAME" --table "0 $sectors flakey $loop 0 1 0"
-  as_root "mkfs.${fs}" -q "$DM_DEV"
+  _udev_settle
+  # Zero the first 16 MiB so any prior fs's superblock/signature is gone — the
+  # backing image is reused across fs's, and mkfs.xfs/btrfs refuse to overwrite a
+  # detected fs (the "appears to contain an existing filesystem (ext4)" failure),
+  # while mke2fs would otherwise need -F. Zeroing is FS-agnostic and bulletproof.
+  as_root dd if=/dev/zero of="$DM_DEV" bs=1M count=16 status=none 2>/dev/null || true
+  as_root "mkfs.${fs}" "$DM_DEV" >/dev/null 2>&1 || die "mkfs.${fs} failed on $DM_DEV"
   as_root mount "$DM_DEV" "$MNT"
   as_root chmod 0777 "$MNT"
   log "ready: ${fs} on $DM_DEV mounted at $MNT (backing $loop)"
@@ -150,7 +181,17 @@ flakey_up() {
 
 cmd_teardown() {
   as_root umount "$MNT" 2>/dev/null || true
-  as_root dmsetup remove "$DM_NAME" 2>/dev/null || true
+  _udev_settle
+  # Retry the dm remove: udev can briefly hold the just-unmounted device, so a
+  # single remove sometimes fails "Device or resource busy". Fall back to a
+  # deferred remove, settle, and retry a few times before giving up.
+  local attempt
+  for attempt in 1 2 3 4 5; do
+    as_root dmsetup remove "$DM_NAME" 2>/dev/null && break
+    as_root dmsetup remove -f --deferred "$DM_NAME" 2>/dev/null && break
+    log "teardown: dm remove busy (attempt ${attempt}/5) — settling and retrying"
+    sleep 0.3; _udev_settle
+  done
   if [ -f "$WORK/loop" ]; then
     as_root losetup -d "$(cat "$WORK/loop")" 2>/dev/null || true
   fi
@@ -290,10 +331,16 @@ cmd_h3() {
 # (--features inject_no_dir_fsync) skipped that dir-fsync, so the rolled segment's
 # filename can be lost and recovery MUST fail (or lose acked post-roll records).
 #
-# FS-DEPENDENCE CAVEAT: this is most reliably reproducible on ext4. On xfs/btrfs the
-# inject build may NOT fail under dm-flakey due to their metadata-ordering/journaling
-# semantics — a non-failure there reflects FS differences, NOT a working dir-fsync.
-# Do not read "inject build didn't fail on btrfs" as "dir-fsync omission is harmless."
+# FS-DEPENDENCE (corrected — see PR #20 discussion + design §14.4d): this behavioral
+# control is expected to reproduce on **ext2** ONLY, and is INCONCLUSIVE-BY-DESIGN on
+# ext4/xfs/btrfs. Those journaling filesystems transitively persist a newly-created
+# file's directory entry on the segment's OWN fsync (the running journal/log
+# transaction already contains the dir change), so the inject build's missing
+# fsync_dir is masked — the dirent reaches disk anyway ("All File Systems Are Not
+# Created Equal", OSDI '14; design §18). ext2 has no journal, so fdatasync(segment)
+# does NOT persist the parent dirent ⇒ the omission is observable. The DETERMINISTIC,
+# FS-independent regression guard is the Tier-1 strace presence check
+# (scripts/m8/dirfsync-presence.sh, per-PR); this is the Tier-2 behavioral proof.
 # Run one build of the workload through a roll + simulated power loss, then verify.
 # Echoes the verifier's exit code (0 PASS / 1 FAIL / 2 INCONCLUSIVE).
 _d44d_run_one() {
@@ -315,6 +362,7 @@ _d44d_run_one() {
   flakey_fault drop_writes
   as_root umount "$MNT" 2>/dev/null || true
   flakey_up
+  _post_cut_fsck            # journal-less (ext2) needs an fsck before a clean mount
   as_root mount "$DM_DEV" "$MNT"
 
   ( cd "$REPO_ROOT" && cargo build --bin power_pull_verify >/dev/null 2>&1 )
@@ -343,6 +391,7 @@ _d44d_drop_positive_control() {
   flakey_fault drop_writes
   as_root umount "$MNT" 2>/dev/null || true
   flakey_up
+  _post_cut_fsck            # journal-less (ext2) needs an fsck before a clean mount
   as_root mount "$DM_DEV" "$MNT"
   as_root chmod 0777 "$MNT"
   if [ -e "$marker" ]; then
@@ -362,12 +411,20 @@ _d44d_drop_positive_control() {
 # negative control is non-functional ⇒ exit 4 (HARNESS, louder than INCONCLUSIVE).
 # Exit: 0 PASS · 1 FAIL · 2 INCONCLUSIVE · 3 ENV-UNAVAILABLE (`check`) · 4 HARNESS.
 cmd_dirfsync_negative() {
-  local fs="${1:-ext4}"
+  # Default to ext2 — the journal-less fs where the behavioral asymmetry is expected
+  # to reproduce. ext4/xfs/btrfs are INCONCLUSIVE-BY-DESIGN (journaling masks the
+  # missing dir-fsync); the deterministic guard for them is the Tier-1 strace
+  # presence check (scripts/m8/dirfsync-presence.sh, per-PR).
+  local fs="${1:-ext2}"
+  M8_FS="$fs"                     # consumed by _post_cut_fsck (journal-less fsck)
   setup "$fs"                     # cmd_check inside ⇒ loud OPEN + exit on a non-dm host
   trap cmd_teardown EXIT
-  [ "$fs" = "ext4" ] || log "FS-DEPENDENCE: §14.4d is validated on ext4; on '$fs' a non-failure of the inject build may reflect FS metadata-journaling differences, NOT a working dir-fsync (see docs/m8-runbook.md)."
+  case "$fs" in
+    ext2 | ext3) log "FS: '$fs' is journal-less ⇒ the §14.4d behavioral asymmetry is EXPECTED to reproduce here (verify — not self-certified)." ;;
+    *) log "FS-DEPENDENCE: '$fs' journals ⇒ §14.4d is INCONCLUSIVE-BY-DESIGN here (a file fsync transitively persists the new dir entry, masking the omission — AFSNCE OSDI '14). A non-failing inject build is NOT 'dir-fsync omission is harmless'. The deterministic guard is the Tier-1 strace presence check; the behavioral proof is ext2." ;;
+  esac
 
-  printf '\033[1;33m%s\033[0m\n' "[m8/dm-flakey] §14.4d is timing-sensitive: the cut must land shortly after a roll, before the FS lazily writes back the new directory entry. A bounded retry budget reproduces it; an exhausted budget is INCONCLUSIVE, never self-certified green. Interpret per the FS caveat." >&2
+  printf '\033[1;33m%s\033[0m\n' "[m8/dm-flakey] §14.4d behavioral control is timing-sensitive: the cut must land before the FS writes back the new directory entry. A bounded retry budget reproduces it; an exhausted budget is INCONCLUSIVE, never self-certified green. Interpret per the FS note above." >&2
 
   # POSITIVE CONTROL first: if drop_writes doesn't actually drop on this host, the
   # whole negative control is non-functional — that is a HARNESS/ENV problem (exit 4),
