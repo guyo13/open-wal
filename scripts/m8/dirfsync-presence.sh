@@ -7,11 +7,18 @@
 # which is FS-dependent and timing-flaky (journaling filesystems transitively
 # persist a new file's directory entry on the segment's own fsync, masking the
 # omission — the "All File Systems Are Not Created Equal", OSDI '14 result; see
-# §18). The behavioral power-loss proof lives in the ext2 Tier-2 control
-# (scripts/m8/dm-flakey.sh dirfsync-negative ext2); ext4/xfs/btrfs are
-# INCONCLUSIVE-by-design. This Tier-1 check is the dir-fsync analogue of the H4
-# F_FULLFSYNC presence assertion: prove the syscall is ISSUED, not that the
-# filesystem loses data without it.
+# §18). The behavioral power-loss form (scripts/m8/dm-flakey.sh dirfsync-negative)
+# is a CLOSED, documented negative result: it does not reproduce on any Linux config
+# tested (ext4/xfs/btrfs journal; journal-less ext4 incl. "ext2"-format via the ext4
+# driver; journaled ext4 data=writeback) — so THIS Tier-1 check is what carries the
+# §14.4d DoD row. It is the dir-fsync analogue of the H4 F_FULLFSYNC presence
+# assertion: prove the syscall is ISSUED, not that the filesystem loses data without it.
+#
+# SCOPE / BOUNDARY (same as H4's F_FULLFSYNC-presence check): this proves the
+# directory `fsync` is *issued on the directory fd* and that omitting fsync_dir is
+# detectable. It does NOT prove the fd was opened with correct semantics, nor that
+# the call's return value is checked, nor durability itself — that is issuance, not
+# durability. Don't over-trust it beyond catching a removed/misdirected dir-fsync.
 #
 # Method: strace the roll path of `power_pull_workload` (tiny segments ⇒ several
 # rolls) and assert, via strace -y fd→path annotation, that:
