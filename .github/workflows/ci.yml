@@ -64,3 +64,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: check
         run: cargo check --all-targets --locked
+
+  dirfsync-presence:
+    # M8 §14.4d Tier 1 (PRIMARY): the deterministic, FS-independent regression
+    # guard for the roll-time directory fsync (§7.4 step 5). It straces the roll
+    # path and asserts the correct build issues a directory `fsync` per roll while
+    # the `inject_no_dir_fsync` build does not — the syscall-presence analogue of
+    # H4's F_FULLFSYNC check. Unlike the behavioral power-loss control (FS-dependent,
+    # lives on ext2 in the dm-flakey gate), this fails immediately and every time
+    # someone deletes fsync_dir, so it belongs on every PR. Needs only strace — no
+    # dm-flakey, no privileges.
+    name: §14.4d dir-fsync presence (strace)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install strace
+        run: sudo apt-get update -y && sudo apt-get install -y strace
+      - name: dir-fsync presence (correct issues it per roll; inject does not)
+        run: scripts/m8/dirfsync-presence.sh
