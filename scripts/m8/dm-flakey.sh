@@ -536,7 +536,7 @@ cmd_dirfsync_negative() {
   setup "$fs"                     # cmd_check inside ⇒ loud OPEN + exit on a non-dm host
   trap cmd_teardown EXIT
   case "$fs" in
-    ext4-writeback) log "FS: journal-less ext4, mount data=writeback — the ext4 driver's WEAKEST ordering (kernel docs: 'can leave stale data exposed … on unclean shutdown'). §14.4d bounded attempt: reproduce ⇒ certifying; else finalize as a documented negative result (verify — not self-certified)." ;;
+    ext4-writeback) log "FS: journaled ext4 mounted data=writeback — the ext4 driver's WEAKEST ordering (data=writeback REQUIRES a journal; metadata still journaled). §14.4d's last bounded attempt; CLOSED as a documented negative result — it masks the omission like every other config (the dirent rides the metadata journal on the segment's own fsync). Tier-1 strace is the gate." ;;
     ext2 | ext3) log "FS: '$fs' is, on modern kernels, serviced by the EXT4 DRIVER journal-less (the standalone ext2 driver was removed in Linux 6.9) — NOT a real ext2 driver. The omission has so far been masked here by the ext4 driver's metadata/writeback, not by any ext2 mechanism. Prefer 'ext4-writeback'." ;;
     *) log "FS-DEPENDENCE: '$fs' journals ⇒ §14.4d is INCONCLUSIVE-BY-DESIGN here (a file fsync transitively persists the new dir entry, masking the omission — AFSNCE OSDI '14). A non-failing inject build is NOT 'dir-fsync omission is harmless'. The deterministic guard is the Tier-1 strace presence check." ;;
   esac
