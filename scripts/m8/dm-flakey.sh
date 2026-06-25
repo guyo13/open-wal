@@ -125,7 +125,14 @@ flakey_fault() {
 flakey_up() {
   local loop sectors
   loop="$(cat "$WORK/loop")"; sectors="$(cat "$WORK/sectors")"
-  as_root dmsetup suspend "$DM_NAME"
+  # CRITICAL: --noflush --nolockfs. flakey_up is called while the device is in a
+  # FAULT mode (error_writes/drop_writes). A plain `dmsetup suspend` flushes
+  # outstanding I/O and freezes the filesystem (an implicit sync) — both issue
+  # writes/flushes THROUGH the erroring target, so the suspend ioctl itself
+  # returns EIO ("suspend ioctl ... failed: Input/output error", observed on
+  # hosted CI). Skipping the flush + fs-freeze makes the table reload back to
+  # normal safe; any not-yet-written pages are written after resume (in up mode).
+  as_root dmsetup suspend --noflush --nolockfs "$DM_NAME"
   as_root dmsetup load "$DM_NAME" --table "0 $sectors flakey $loop 0 1 0"
   as_root dmsetup resume "$DM_NAME"
 }
@@ -193,9 +200,14 @@ _h3_attempt() {
   grep -q "handle poisoned" "$err" && fired=1
   [ "$dmesg_ok" -eq 1 ] && block_eio="$(_block_eio_since "$pre")"
 
-  flakey_up
+  # Record the verdict inputs BEFORE restoring the device, so a (now-unexpected)
+  # flakey_up hiccup cannot abort the function and be misread as a durability FAIL
+  # — the bug that made the first real run report a false §12 violation. flakey_up
+  # is best-effort here (teardown reclaims the device regardless); `|| log` keeps
+  # set -e from aborting on it.
   H3_LAST_RC="$rc"; H3_LAST_FIRED="$fired"
   H3_LAST_BLOCK_EIO="$block_eio"; H3_LAST_DMESG_OK="$dmesg_ok"
+  flakey_up || log "WARN: flakey_up did not restore the device (teardown will reclaim it); this attempt's verdict already recorded."
 
   # PASS requires BOTH halves ANDed: WAL poisoned AND a real block-layer EIO observed
   # in the window. Poison without an observed EIO ⇒ INCONCLUSIVE (misattribution
