@@ -55,15 +55,32 @@ EOF
 
 as_root() { if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo "$@"; fi; }
 
-# Emit a §5 evidence artifact for a gate (scripts/m8/evidence.sh). Best-effort:
-# a missing python3 must not mask the gate verdict — only the artifact.
+# Emit a §5 evidence artifact for a gate (scripts/m8/evidence.sh). A gate's PASS
+# MUST be backed by a ledger artifact (#15) — so this NEVER leaves a gate without
+# a file: if the emitter fails (e.g. transient python3 issue — the cause of the #16
+# evidence-h3.json gap in run 28193051238, which the H3 args reproduce green
+# locally), it surfaces the emitter's stderr loudly AND writes a minimal fallback
+# JSON so the ledger always has *something* for the gate. The verdict still stands
+# regardless — the artifact is downstream of it.
 emit_evidence() {  # emit_evidence <tag> KEY=VALUE ...
   local tag="$1"; shift
   mkdir -p "$EVIDENCE_DIR"
-  if "$REPO_ROOT/scripts/m8/evidence.sh" emit out="$EVIDENCE_DIR/evidence-${tag}.json" "$@"; then
-    log "evidence: $EVIDENCE_DIR/evidence-${tag}.json"
+  local out="$EVIDENCE_DIR/evidence-${tag}.json" err
+  if err="$("$REPO_ROOT/scripts/m8/evidence.sh" emit out="$out" "$@" 2>&1)"; then
+    log "evidence: $out"
   else
-    log "WARNING: evidence artifact for '$tag' could not be written (verdict stands)."
+    log "WARNING: evidence.sh FAILED for '$tag' (verdict stands). Emitter output:"
+    printf '%s\n' "$err" >&2
+    # Fallback so the gate is never artifact-less (#15). Pull a verdict=... arg if
+    # present so the fallback still records the outcome.
+    local v="UNKNOWN" kv
+    for kv in "$@"; do case "$kv" in verdict=*) v="${kv#verdict=}" ;; esac; done
+    if printf '{"gate":"%s","verdict":"%s","note":"evidence.sh emit failed; fallback artifact — see step log"}\n' \
+      "$tag" "$v" > "$out" 2>/dev/null; then
+      log "wrote fallback evidence: $out"
+    else
+      log "ERROR: could not even write the fallback artifact to $out"
+    fi
   fi
 }
 
@@ -324,48 +341,72 @@ cmd_h3() {
   return "$verdict_exit"
 }
 
-# §14.4d: the dir-fsync omission negative control. With tiny segments the workload
-# rolls frequently. We drop un-synced writes across a simulated power loss, then
-# recover. The CORRECT build's dir-fsync forced each new segment's filename to disk
-# before the drop window, so recovery keeps the post-roll records; the INJECT build
-# (--features inject_no_dir_fsync) skipped that dir-fsync, so the rolled segment's
-# filename can be lost and recovery MUST fail (or lose acked post-roll records).
+# §14.4d: the dir-fsync omission negative control, via a SYNCHRONIZED MID-RUN CUT.
+# The CORRECT build's roll-time dir-fsync forced the new segment's filename to disk;
+# the INJECT build (--features inject_no_dir_fsync) skipped it, so on a journal-less
+# fs that segment's directory entry can be lost ⇒ recovery's readdir misses it ⇒ the
+# acked post-roll records vanish (a D1 violation the verifier flags) ⇒ inject FAIL.
 #
-# FS-DEPENDENCE (corrected — see PR #20 discussion + design §14.4d): this behavioral
-# control is expected to reproduce on **ext2** ONLY, and is INCONCLUSIVE-BY-DESIGN on
-# ext4/xfs/btrfs. Those journaling filesystems transitively persist a newly-created
-# file's directory entry on the segment's OWN fsync (the running journal/log
-# transaction already contains the dir change), so the inject build's missing
-# fsync_dir is masked — the dirent reaches disk anyway ("All File Systems Are Not
-# Created Equal", OSDI '14; design §18). ext2 has no journal, so fdatasync(segment)
-# does NOT persist the parent dirent ⇒ the omission is observable. The DETERMINISTIC,
-# FS-independent regression guard is the Tier-1 strace presence check
+# WHY SYNCHRONIZED (not run-to-completion). A workload that runs to completion and is
+# cut afterwards CANNOT show the omission even on ext2: by the cut, every rolled
+# dirent has been written back (observed: PR #21 run 28193051238 — positive control
+# LIVE, asymmetry still absent). The `dirfsync_cut_workload` bin instead rolls ONCE,
+# puts an acked record in the brand-new (still-dirty-dirent) segment, signals ready
+# OFF-device, and BLOCKS — so we activate drop_writes and cut INSIDE the un-synced
+# window (default dirty_expire ⇒ ~30s slack; the cut is unhurried, not a sub-ms race).
+#
+# FS-DEPENDENCE: expected to reproduce on **ext2** (journal-less). ext4/xfs/btrfs are
+# INCONCLUSIVE-BY-DESIGN (journaling transitively persists the new dirent on the
+# segment's own fsync — "All File Systems Are Not Created Equal", OSDI '14; design
+# §18). The DETERMINISTIC, FS-independent guard is the Tier-1 strace presence check
 # (scripts/m8/dirfsync-presence.sh, per-PR); this is the Tier-2 behavioral proof.
-# Run one build of the workload through a roll + simulated power loss, then verify.
-# Echoes the verifier's exit code (0 PASS / 1 FAIL / 2 INCONCLUSIVE).
+# Echoes 0 PASS / 1 FAIL / 2 INCONCLUSIVE (incl. "the cut was missed").
 _d44d_run_one() {
   local tag="$1"; shift          # "correct" | "inject"
   local feat=("$@")              # extra cargo flags (e.g. --features inject_no_dir_fsync)
   local wal="$MNT/d44d_${tag}"
-  local cap="$WORK/cap_${tag}.txt"   # capture lives on $WORK (/tmp) — OFF the dm device
-  rm -rf "$wal" "$cap"; mkdir -p "$wal"; : > "$cap"
+  local cap="$WORK/cap_${tag}.txt"      # side channel — OFF the dm device (/tmp)
+  local ready="$WORK/ready_${tag}.txt"  # roll-ready signal — OFF the dm device (/tmp)
+  rm -rf "$wal" "$cap" "$ready"; mkdir -p "$wal"
 
-  ( cd "$REPO_ROOT" && cargo build --bin power_pull_workload "${feat[@]}" >/dev/null 2>&1 )
+  ( cd "$REPO_ROOT" && cargo build --bin dirfsync_cut_workload "${feat[@]}" >/dev/null 2>&1 )
+  ( cd "$REPO_ROOT" && cargo build --bin power_pull_verify >/dev/null 2>&1 )
 
-  # Tiny segments ⇒ frequent rolls. Bounded run so it finishes before the cut.
-  # The capture (file sink) is fsync'd to /tmp; the WAL is on the dm device.
+  # Launch the synchronized-cut workload (runs as the unprivileged user; writes the
+  # WAL on $MNT, the side channel + ready signal off-device). It rolls once, acks a
+  # record into the new segment, signals ready, and blocks holding the dirent dirty.
   WAL_SEGMENT_SIZE=4096 WAL_MAX_RECORD_SIZE=256 \
-    "$REPO_ROOT/target/debug/power_pull_workload" "$wal" "file:$cap" 2000 4 64 >/dev/null 2>&1 || true
+    "$REPO_ROOT/target/debug/dirfsync_cut_workload" "$wal" "$cap" "$ready" >/dev/null 2>&1 &
+  local wpid=$!
 
-  # Simulate power loss: drop any not-yet-written-back data, then drop the page
-  # cache by unmounting, then "reboot" by remounting in up mode and recover.
+  # Wait (bounded, 10s) for the ready signal: the roll has happened and the new
+  # segment's dirent is un-synced. If the workload exits first, no roll ⇒ INCONCLUSIVE.
+  local waited=0
+  while [ ! -s "$ready" ]; do
+    if ! kill -0 "$wpid" 2>/dev/null; then
+      wait "$wpid" 2>/dev/null || true
+      log "§14.4d/${tag}: workload exited before the roll signal — INCONCLUSIVE."
+      return 2
+    fi
+    sleep 0.1; waited=$((waited + 1))
+    if [ "$waited" -ge 100 ]; then
+      kill -9 "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
+      log "§14.4d/${tag}: no ready signal within 10s — INCONCLUSIVE."
+      return 2
+    fi
+  done
+
+  # THE CUT (ordering is load-bearing): activate drop_writes BEFORE reaping the
+  # process / unmounting, so no writeback of the dirty dirent can beat the cut. Then
+  # kill the blocked workload (releases the mount), umount (writeback dropped),
+  # flakey_up, fsck the journal-less fs, remount, and verify.
   flakey_fault drop_writes
-  as_root umount "$MNT" 2>/dev/null || true
+  kill -9 "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
+  as_root umount "$MNT" 2>/dev/null || as_root umount -l "$MNT" 2>/dev/null || true
   flakey_up
   _post_cut_fsck            # journal-less (ext2) needs an fsck before a clean mount
   as_root mount "$DM_DEV" "$MNT"
 
-  ( cd "$REPO_ROOT" && cargo build --bin power_pull_verify >/dev/null 2>&1 )
   WAL_SEGMENT_SIZE=4096 WAL_MAX_RECORD_SIZE=256 \
     "$REPO_ROOT/target/debug/power_pull_verify" "$wal" "$cap" >&2
   return $?
