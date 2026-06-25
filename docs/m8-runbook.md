@@ -180,16 +180,23 @@ parent dirent — the one substrate where the omission is behaviorally observabl
 sudo scripts/m8/dm-flakey.sh dirfsync-negative ext2
 ```
 
-The harness runs the correct and inject builds through frequent rolls + a `drop_writes`
-simulated power loss (with an `fsck.ext2 -y` before the remount, since ext2 has no
-journal), then verifies. **Expected:** correct → PASS, inject → FAIL ⇒ negative control
-demonstrated. **Phase-1 status: expected to reproduce — verify** (observe a first PASS
-before hard-gating; until then an INCONCLUSIVE is a warning, not red).
+The harness uses a **synchronized mid-run cut** (`src/bin/dirfsync_cut_workload.rs`):
+the workload rolls **once**, puts an acked record in the brand-new segment, signals
+ready off-device, and **blocks** holding that segment's directory entry un-synced. The
+harness then activates `drop_writes` *before* killing the workload / unmounting (so no
+writeback can beat the cut), runs `fsck.ext2 -y`, remounts, and verifies. **Expected:**
+correct → PASS, inject → FAIL ⇒ negative control demonstrated. **Phase-1 status:
+expected to reproduce — verify** (observe a first PASS before hard-gating; until then an
+INCONCLUSIVE is a warning, not red).
 
-> **Why fast matters (ext2 gotcha):** the kernel flusher writes back dirty
-> directory blocks once they age past `vm.dirty_expire_centisecs` (default 30 s). The
-> harness performs the run → `drop_writes` → umount in immediate sequence with no
-> sleeps so the dirents are still dirty at the cut. Keep it that way.
+> **Why a synchronized cut (the key fix):** a run-to-completion workload cut *afterward*
+> does **not** reproduce the omission even on ext2 — by the cut, every rolled dirent has
+> aged out and been written back (`vm.dirty_expire_centisecs` default 30 s; observed
+> empirically on PR #21 run 28193051238 with the positive control LIVE). Blocking the
+> workload right after the roll keeps the dirent dirty with ~30 s of slack, so the cut
+> lands *inside* the un-synced window at leisure — converting a sub-millisecond race
+> into a robust gate. If it still doesn't reproduce after this, **stop and report** —
+> that's a real finding, not something to tune blindly.
 
 ### Tier 3 — ext4/xfs/btrfs: INCONCLUSIVE-by-design
 ```bash
