@@ -9,11 +9,12 @@ name: M8 durability gates
 #     verified nothing, which must go red even though the job is otherwise about
 #     environment availability.
 #
-#   * The H3 PHYSICAL gate (dm-flakey), §14.4d, and H1 power-pull need device-mapper
-#     / a cuttable target that hosted runners lack. The `physical-availability` job
-#     only REPORTS whether the tooling is present (continue-on-error) and never
-#     fakes green — exactly like the LazyFS stopgap. The real runs are owner-driven
-#     (docs/m8-runbook.md).
+#   * The H3 PHYSICAL gate (dm-flakey) and §14.4d now run on their own nightly/manual
+#     workflow (.github/workflows/m8-dmflakey.yml) — hosted ubuntu VMs CAN reach
+#     dm-flakey, so those gates are real CI signal there (best-effort + loud skip if a
+#     given runner image lacks the target). H4 Half A runs on macOS CI
+#     (.github/workflows/m8-macos.yml). H1 power-pull still needs a cuttable target and
+#     stays OWNER-RUN (docs/m8-runbook.md). The note job below just points at these.
 
 on:
   push:
@@ -63,21 +64,17 @@ jobs:
       - name: H3 §12 poison gate (LD_PRELOAD EIO shim)
         run: scripts/m8/fsync-fault.sh run
 
-  # INFORMATIONAL — reports tooling availability for the owner-run physical gates.
-  # Never blocks the merge; never reports the gate itself as passed.
-  physical-availability:
-    name: H3-physical / §14.4d / H1 availability (informational)
+  # INFORMATIONAL pointer — where the other M8 gates live now. Does not gate.
+  physical-note:
+    name: M8 physical gates — where they run (informational)
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
-      - name: device-mapper / dm-flakey availability
-        continue-on-error: true
-        run: |
-          echo "Reporting whether the §14.8 physical fault tooling is present."
-          echo "Hosted runners typically LACK dm-flakey ⇒ expect the loud OPEN banner."
-          scripts/m8/dm-flakey.sh check
       - name: Note
         run: |
-          echo "H3-physical, §14.4d, and H1 power-pull are OWNER-RUN on real hardware."
-          echo "See docs/m8-runbook.md. This job is informational and does not gate."
+          echo "H3-physical (#16) and §14.4d (#17) run on dm-flakey via the"
+          echo "'M8 dm-flakey gates' workflow (.github/workflows/m8-dmflakey.yml),"
+          echo "nightly + manual (best-effort + loud skip if a runner lacks dm-flakey)."
+          echo "H4 Half A runs on macOS CI (.github/workflows/m8-macos.yml)."
+          echo "H1 power-pull (#18) is the only gate that still needs a cuttable target —"
+          echo "it stays OWNER-RUN on real hardware (docs/m8-runbook.md)."

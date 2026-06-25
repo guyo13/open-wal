@@ -1,0 +1,134 @@
+name: M8 dm-flakey gates (H3-physical + §14.4d)
+
+# Tier 1 (docs/m8-infra-plan.md §1): the §14.8 H3 PHYSICAL fsync-failure gate and the
+# §14.4d dir-fsync omission negative control, run on a hosted `ubuntu-latest` runner.
+# Those runners are full VMs with root, so `dm-flakey` is reachable there even though
+# the agent's build sandbox lacked it — converting the two scariest metadata/physical
+# gates into free CI signal (#16, #17).
+#
+# HONESTY (M8 ground rules):
+#   * BEST-EFFORT + LOUD SKIP. We `modprobe dm-flakey` and probe; if it is absent the
+#     job emits a loud ::warning:: and the gate does NOT run (stays OPEN). Never green-
+#     as-a-gate on a runner that cannot inject the fault.
+#   * The injection-fired (#16) and asymmetry (#17) checks live IN the script and are
+#     the anti-vacuous guards. A real durability FAIL (exit 1) reds the build; an
+#     INCONCLUSIVE (exit 2, timing) is loud-but-not-red — never a pass.
+#   * Not per-PR (timing-sensitive). Nightly + manual.
+#   * Evidence ledger (§5) uploaded every run; posted to the issue ONLY on a manual
+#     workflow_dispatch (the human sign-off), never on the nightly cron.
+
+on:
+  schedule:
+    - cron: "23 4 * * *" # nightly, off the :00 mark (§14.11)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # Evidence lands under the workspace so upload-artifact can collect it.
+  M8_EV: ${{ github.workspace }}/m8-evidence
+  # Headroom so a fast runner cannot hit ENOSPC before the error window (which would
+  # poison the handle for the WRONG reason — a vacuous pass). fdatasync throttles the
+  # workload, so a few seconds writes only single-digit MB; 1 GiB is ample.
+  WAL_M8_DM_IMG_MB: "1024"
+
+jobs:
+  dmflakey:
+    name: H3-physical / §14.4d (dm-flakey)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Provision dm-flakey + FS tools
+        run: |
+          sudo modprobe dm-flakey 2>/dev/null || true
+          sudo apt-get update -y
+          sudo apt-get install -y xfsprogs btrfs-progs
+
+      # Probe availability. `check` exits 3 when dm-flakey is absent ⇒ loud skip
+      # (gate not run, NOT a pass). Exit 0 ⇒ run the real gate below.
+      - name: dm-flakey availability
+        id: dmcheck
+        run: |
+          if scripts/m8/dm-flakey.sh check; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            rc=$?
+            echo "::warning title=dm-flakey unavailable::Tier-1 H3-physical/§14.4d did NOT run (dm-flakey absent on this runner, exit ${rc}). The gate stays OPEN-pending-owner-hardware — this is NOT a pass."
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ext4 is the certifying filesystem (#16/#17). HARD: FAIL (exit 1) reds the
+      # build; INCONCLUSIVE (exit 2, timing) is a loud warning, never a pass; PASS
+      # (0) is green. The anti-vacuous retries live inside the script.
+      - name: H3-physical — ext4 (HARD)
+        if: steps.dmcheck.outputs.available == 'true'
+        env:
+          WAL_M8_EVIDENCE_DIR: ${{ github.workspace }}/m8-evidence/ext4
+        run: |
+          set +e; scripts/m8/dm-flakey.sh h3 ext4; rc=$?; set -e
+          case "$rc" in
+            0) echo "H3-physical ext4: PASS (§12 poison on a real block-layer EIO)";;
+            2) echo "::warning title=H3-physical INCONCLUSIVE::ext4 could not land the error window on a commit; NOT a pass (see evidence artifact).";;
+            *) echo "::error title=H3-physical FAIL::ext4 H3 exited ${rc} — the WAL did not poison on a durability failure (§12 violation)."; exit 1;;
+          esac
+
+      - name: §14.4d negative control — ext4 (HARD)
+        if: steps.dmcheck.outputs.available == 'true'
+        env:
+          WAL_M8_EVIDENCE_DIR: ${{ github.workspace }}/m8-evidence/ext4
+        run: |
+          set +e; scripts/m8/dm-flakey.sh dirfsync-negative ext4; rc=$?; set -e
+          case "$rc" in
+            0) echo "§14.4d ext4: PASS (correct build survives, inject build loses the rolled segment)";;
+            2) echo "::warning title=§14.4d INCONCLUSIVE::ext4 asymmetry did not reproduce within the retry budget (timing/FS-sensitive); NOT a pass (see evidence artifact).";;
+            *) echo "::error title=§14.4d FAIL::ext4 exited ${rc} — the CORRECT build lost acked post-roll data (durability regression)."; exit 1;;
+          esac
+
+      # xfs / btrfs: INFORMATIONAL only (continue-on-error). Per the FS-dependence
+      # caveat, a non-failing inject build on these reflects FS metadata-journaling
+      # semantics, NOT a working dir-fsync — so they never gate. Evidence still emitted.
+      - name: H3-physical — xfs / btrfs (informational)
+        if: steps.dmcheck.outputs.available == 'true'
+        continue-on-error: true
+        env:
+          WAL_M8_EVIDENCE_DIR: ${{ github.workspace }}/m8-evidence/other
+        run: |
+          for fs in xfs btrfs; do
+            echo "::group::H3-physical ${fs} (informational)"
+            scripts/m8/dm-flakey.sh h3 "$fs" || echo "::notice::H3 ${fs} non-PASS (informational; ext4 is the gate)."
+            echo "::endgroup::"
+          done
+
+      - name: Upload evidence ledger
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m8-dmflakey-evidence-${{ github.run_id }}
+          path: ${{ github.workspace }}/m8-evidence/**
+          if-no-files-found: ignore
+
+      # SIGN-OFF TRAIL: post evidence to the gate's issue ONLY on a manual dispatch
+      # (a human asserted this result). Nightly stays quiet on the issue and loud as a
+      # red build. No verdict-diff logic — the trigger is the whole rule.
+      - name: Post evidence to issues (dispatch sign-off only)
+        if: always() && github.event_name == 'workflow_dispatch' && steps.dmcheck.outputs.available == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          post() { # post <issue> <evidence-file> <title>
+            local issue="$1" file="$2" title="$3"
+            [ -e "$file" ] || { echo "no evidence at $file; skipping #$issue"; return 0; }
+            { printf '**%s** — automated M8 evidence (workflow_dispatch sign-off run #%s).\n\n' "$title" "$GITHUB_RUN_ID"
+              printf '```json\n'; cat "$file"; printf '\n```\n'; } > body.md
+            gh issue comment "$issue" --repo "$GITHUB_REPOSITORY" --body-file body.md
+          }
+          post 16 "${{ github.workspace }}/m8-evidence/ext4/evidence-h3.json"    "H3-physical (ext4)"
+          post 17 "${{ github.workspace }}/m8-evidence/ext4/evidence-14.4d.json" "§14.4d negative control (ext4)"

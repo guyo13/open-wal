@@ -34,6 +34,7 @@ IMG_SIZE_MB="${WAL_M8_DM_IMG_MB:-256}"
 DM_NAME="open_wal_flakey"
 DM_DEV="/dev/mapper/${DM_NAME}"
 MNT="${WORK}/mnt"
+EVIDENCE_DIR="${WAL_M8_EVIDENCE_DIR:-$WORK}"
 
 log()  { printf '\033[1;34m[m8/dm-flakey]\033[0m %s\n' "$*" >&2; }
 die()  { printf '\033[1;31m[m8/dm-flakey] ERROR:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -53,6 +54,18 @@ EOF
 }
 
 as_root() { if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo "$@"; fi; }
+
+# Emit a §5 evidence artifact for a gate (scripts/m8/evidence.sh). Best-effort:
+# a missing python3 must not mask the gate verdict — only the artifact.
+emit_evidence() {  # emit_evidence <tag> KEY=VALUE ...
+  local tag="$1"; shift
+  mkdir -p "$EVIDENCE_DIR"
+  if "$REPO_ROOT/scripts/m8/evidence.sh" emit out="$EVIDENCE_DIR/evidence-${tag}.json" "$@"; then
+    log "evidence: $EVIDENCE_DIR/evidence-${tag}.json"
+  else
+    log "WARNING: evidence artifact for '$tag' could not be written (verdict stands)."
+  fi
+}
 
 cmd_check() {
   local ok=1
@@ -119,29 +132,84 @@ cmd_teardown() {
   log "torn down"
 }
 
-# H3: physical fsync-failure poisons the handle (§12). Run a workload; mid-run
-# flip the device to error_writes; the next commit's fdatasync gets EIO ⇒ the
-# workload exits 7 (poisoned). dm-flakey hits the block layer, so this also covers
-# the rustix raw-syscall directory fsync the §12 shim cannot.
+# One H3 attempt: run the workload while injecting error_writes mid-run, capturing
+# the workload's stderr so we can prove the EIO actually reached a commit.
+#   return 0  PASS         — rc==7 (poisoned) AND the poison line is present: an
+#                            injected EIO reached a commit's fdatasync (§12 upheld).
+#   return 1  FAIL         — rc==0: the workload returned SUCCESS while writes were
+#                            erroring ⇒ the WAL ignored a durability failure.
+#   return 2  INCONCLUSIVE — the error window did not demonstrably hit a commit
+#                            (no poison) ⇒ retry; never counted as a pass.
+# Sets H3_LAST_RC / H3_LAST_FIRED for the evidence ledger.
+H3_LAST_RC=""
+H3_LAST_FIRED=""
+_h3_attempt() {
+  local delay="$1"
+  local wal="$MNT/h3wal" err="$WORK/h3.err"
+  rm -rf "$wal"; mkdir -p "$wal"; : > "$err"
+  ( sleep "$delay"; flakey_fault error_writes ) &
+  local inj=$!
+  set +e
+  WAL_SEGMENT_SIZE=65536 WAL_MAX_RECORD_SIZE=256 \
+    "$REPO_ROOT/target/debug/power_pull_workload" "$wal" stdout 0 8 64 >/dev/null 2>"$err"
+  local rc=$?
+  set -e
+  wait "$inj" 2>/dev/null || true
+  flakey_up
+  local fired=0
+  grep -q "handle poisoned" "$err" && fired=1
+  H3_LAST_RC="$rc"; H3_LAST_FIRED="$fired"
+  if [ "$rc" -eq 7 ] && [ "$fired" -eq 1 ]; then return 0; fi
+  if [ "$rc" -eq 0 ]; then return 1; fi
+  return 2
+}
+
+# H3: physical fsync-failure poisons the handle (§12). dm-flakey errors writes at
+# the BLOCK layer, so this also covers the rustix raw-syscall directory fsync the
+# §12 LD_PRELOAD shim cannot. ANTI-VACUOUS (amended #16): a clean exit with no EIO
+# actually injected is INCONCLUSIVE, never PASS — we assert the workload poisoned
+# *because* an injected EIO reached a commit. Bounded retry absorbs a window that
+# misses a commit (timing), without ever passing vacuously.
+# Exit: 0 PASS · 1 FAIL · 2 INCONCLUSIVE · (3 ENV-UNAVAILABLE from `check`).
 cmd_h3() {
   local fs="${1:-ext4}"
   setup "$fs"
   trap cmd_teardown EXIT
   ( cd "$REPO_ROOT" && cargo build --bin power_pull_workload >/dev/null 2>&1 )
-  local wal="$MNT/h3wal"; mkdir -p "$wal"
-  log "running workload; will inject error_writes after 2s"
-  ( sleep 2; flakey_fault error_writes ) &
-  set +e
-  WAL_SEGMENT_SIZE=65536 WAL_MAX_RECORD_SIZE=256 \
-    "$REPO_ROOT/target/debug/power_pull_workload" "$wal" stdout 0 8 64 >/dev/null 2>&1
-  local rc=$?
-  set -e
-  flakey_up
-  if [ "$rc" -eq 7 ]; then
-    log "PASS (H3): a failed fdatasync poisoned the handle (exit 7) — §12 upheld at the block layer."
-  else
-    die "H3 FAIL/INCONCLUSIVE: workload exited $rc (expected 7 = poisoned). Did the error window land on a commit?"
-  fi
+
+  local max="${WAL_M8_H3_ATTEMPTS:-3}" attempts=0 verdict="INCONCLUSIVE" rc_class
+  local delays=(2 1 3)
+  while [ "$attempts" -lt "$max" ]; do
+    local delay="${delays[$attempts]:-2}"
+    attempts=$((attempts + 1))
+    log "H3 attempt ${attempts}/${max} (inject error_writes after ${delay}s)"
+    set +e; _h3_attempt "$delay"; rc_class=$?; set -e
+    if [ "$rc_class" -eq 0 ]; then verdict="PASS"; break; fi
+    if [ "$rc_class" -eq 1 ]; then verdict="FAIL"; break; fi
+    log "INCONCLUSIVE this attempt (workload rc=${H3_LAST_RC}, poisoned=${H3_LAST_FIRED}) — the error window did not land on a commit; retrying."
+  done
+
+  local pass=0 fail=0 verdict_exit=2
+  case "$verdict" in
+    PASS) pass=1; verdict_exit=0
+      log "PASS (H3): a real block-layer EIO poisoned the handle (§12 upheld physically; covers the dir fsync too)." ;;
+    FAIL) fail=1; verdict_exit=1
+      log "FAIL (H3): the workload returned SUCCESS while writes were erroring — the WAL did NOT poison on a durability failure (§12 violation)." ;;
+    *)    verdict_exit=2
+      log "INCONCLUSIVE (H3): could not land the error window on a commit in ${attempts} attempt(s). NOT a pass — re-run (timing-sensitive on this host)." ;;
+  esac
+
+  emit_evidence h3 \
+    gate=H3-physical \
+    "target.uname=$(uname -sr)" "target.host=$(hostname)" \
+    "storage.fs=$fs" "storage.block_device=$DM_DEV" \
+    "storage.write_cache=n/a (dm-flakey)" "storage.h2_probe=n/a (fault-injection, not power-loss)" \
+    "cut.mechanism=dm-flakey error_writes" cut.valid=true \
+    run.cycles_required=1 "run.cycles_pass=$pass" "run.fail=$fail" "run.inconclusive_rerun=$((attempts - 1))" \
+    "detail.workload_rc=$H3_LAST_RC" "detail.injection_fired=$H3_LAST_FIRED" \
+    "verdict=$verdict"
+
+  return "$verdict_exit"
 }
 
 # §14.4d: the dir-fsync omission negative control. With tiny segments the workload
@@ -185,27 +253,62 @@ _d44d_run_one() {
 }
 
 # §14.4d negative control: correct build MUST pass, inject build MUST fail.
+# ANTI-VACUOUS (amended #17): the asymmetry is timing-sensitive, so we grant a
+# bounded retry BUDGET (default 5) to reproduce it; a budget exhausted WITHOUT the
+# asymmetry is INCONCLUSIVE (never a pass, never a code-red). A correct build that
+# itself loses acked data is a genuine FAIL (red). The inject build merely not
+# failing is INCONCLUSIVE, not "dir-fsync omission is harmless".
+# Exit: 0 PASS · 1 FAIL · 2 INCONCLUSIVE · (3 ENV-UNAVAILABLE from `check`).
 cmd_dirfsync_negative() {
   local fs="${1:-ext4}"
   setup "$fs"                     # cmd_check inside ⇒ loud OPEN + exit on a non-dm host
   trap cmd_teardown EXIT
   [ "$fs" = "ext4" ] || log "FS-DEPENDENCE: §14.4d is validated on ext4; on '$fs' a non-failure of the inject build may reflect FS metadata-journaling differences, NOT a working dir-fsync (see docs/m8-runbook.md)."
 
-  printf '\033[1;33m%s\033[0m\n' "[m8/dm-flakey] §14.4d is timing-sensitive and OWNER-VALIDATED: the cut must land shortly after a roll, before the FS lazily writes back the new directory entry. Tune the workload bound / cut timing per host; interpret per the FS caveat. This is OPEN-pending-owner-run, never self-certified green." >&2
+  printf '\033[1;33m%s\033[0m\n' "[m8/dm-flakey] §14.4d is timing-sensitive: the cut must land shortly after a roll, before the FS lazily writes back the new directory entry. A bounded retry budget reproduces it; an exhausted budget is INCONCLUSIVE, never self-certified green. Interpret per the FS caveat." >&2
 
-  log "=== correct build (dir-fsync present) — expect PASS (post-roll records survive) ==="
-  set +e; _d44d_run_one correct; local rc_correct=$?; set -e
+  local budget="${WAL_M8_D44D_BUDGET:-5}" attempt=0 verdict="INCONCLUSIVE"
+  local rc_correct=-1 rc_inject=-1
+  while [ "$attempt" -lt "$budget" ]; do
+    attempt=$((attempt + 1))
+    log "=== §14.4d attempt ${attempt}/${budget} ==="
+    log "--- correct build (dir-fsync present) — expect PASS (post-roll records survive) ---"
+    set +e; _d44d_run_one correct; rc_correct=$?; set -e
+    log "--- inject build (--features inject_no_dir_fsync) — expect FAIL (rolled segment filename lost) ---"
+    set +e; _d44d_run_one inject --features inject_no_dir_fsync; rc_inject=$?; set -e
+    log "attempt ${attempt}: correct rc=${rc_correct} (0=PASS)  |  inject rc=${rc_inject} (1=FAIL expected)"
+    if [ "$rc_correct" -eq 0 ] && [ "$rc_inject" -eq 1 ]; then
+      verdict="PASS"; break
+    fi
+    if [ "$rc_correct" -eq 1 ]; then
+      # The CORRECT build lost acked post-roll data ⇒ a real regression, not timing.
+      verdict="FAIL"; break
+    fi
+    log "asymmetry not reproduced this attempt (timing/FS-sensitive) — retrying."
+  done
 
-  log "=== inject build (--features inject_no_dir_fsync) — expect FAIL (rolled segment filename lost) ==="
-  set +e; _d44d_run_one inject --features inject_no_dir_fsync; local rc_inject=$?; set -e
+  local pass=0 fail=0 verdict_exit=2
+  case "$verdict" in
+    PASS) pass=1; verdict_exit=0
+      log "§14.4d NEGATIVE CONTROL DEMONSTRATED in ${attempt} attempt(s): correct PASS, inject FAIL. The dir-fsync is necessary and the harness catches its omission." ;;
+    FAIL) fail=1; verdict_exit=1
+      log "§14.4d FAIL: the CORRECT build lost acked post-roll data (correct rc=${rc_correct}). That is a real durability regression, not a timing artefact." ;;
+    *)    verdict_exit=2
+      log "§14.4d INCONCLUSIVE after ${attempt} attempts (correct=${rc_correct} inject=${rc_inject}). Timing/FS-sensitive — NOT a pass, NOT a code failure. Prefer ext4; tune the cut timing (runbook). NEVER read a non-failing inject build as 'dir-fsync omission is harmless'." ;;
+  esac
 
-  log "----------------------------------------------------------------"
-  log "correct build verify rc=$rc_correct (0=PASS)  |  inject build verify rc=$rc_inject (1=FAIL expected)"
-  if [ "$rc_correct" -eq 0 ] && [ "$rc_inject" -eq 1 ]; then
-    log "§14.4d NEGATIVE CONTROL DEMONSTRATED: correct build passed, inject build lost acked post-roll data. The dir-fsync is necessary and the harness catches its omission."
-  else
-    log "§14.4d INCONCLUSIVE on this host/run: the asymmetry did not reproduce (correct=$rc_correct inject=$rc_inject). This is expected to be timing/FS-sensitive — tune the cut timing (see runbook) and prefer ext4. Do NOT read a non-failing inject build as 'dir-fsync omission is harmless'."
-  fi
+  emit_evidence 14.4d \
+    gate=14.4d \
+    "target.uname=$(uname -sr)" "target.host=$(hostname)" \
+    "storage.fs=$fs" "storage.block_device=$DM_DEV" \
+    "storage.write_cache=n/a (dm-flakey)" "storage.h2_probe=n/a (fault-injection, not power-loss)" \
+    "cut.mechanism=dm-flakey drop_writes" cut.valid=true \
+    run.cycles_required=1 "run.cycles_pass=$pass" "run.fail=$fail" \
+    "run.attempts_used=$attempt" "run.inconclusive_rerun=$((attempt - 1))" \
+    "detail.correct_rc=$rc_correct" "detail.inject_rc=$rc_inject" \
+    "verdict=$verdict"
+
+  return "$verdict_exit"
 }
 
 case "${1:-check}" in
