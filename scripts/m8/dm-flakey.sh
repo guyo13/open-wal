@@ -369,29 +369,40 @@ _d44d_run_one() {
   local ready="$WORK/ready_${tag}.txt"  # roll-ready signal — OFF the dm device (/tmp)
   rm -rf "$wal" "$cap" "$ready"; mkdir -p "$wal"
 
-  ( cd "$REPO_ROOT" && cargo build --bin dirfsync_cut_workload "${feat[@]}" >/dev/null 2>&1 )
-  ( cd "$REPO_ROOT" && cargo build --bin power_pull_verify >/dev/null 2>&1 )
+  # Build the workload + verifier CHECKED — a silent build failure would otherwise
+  # look identical to "workload exited before the roll signal" (missing binary ⇒
+  # immediate exec failure). Surface a build break loudly and distinctly.
+  local bl="$WORK/build_${tag}.log"
+  if ! ( cd "$REPO_ROOT" && cargo build --bin dirfsync_cut_workload "${feat[@]}" ) >"$bl" 2>&1; then
+    log "§14.4d/${tag}: BUILD FAILED for dirfsync_cut_workload ${feat[*]} — see below (HARNESS, not a gate result):"
+    cat "$bl" >&2
+    return 2
+  fi
+  ( cd "$REPO_ROOT" && cargo build --bin power_pull_verify ) >>"$bl" 2>&1 || { log "§14.4d/${tag}: BUILD FAILED for power_pull_verify:"; cat "$bl" >&2; return 2; }
 
-  # Launch the synchronized-cut workload (runs as the unprivileged user; writes the
-  # WAL on $MNT, the side channel + ready signal off-device). It rolls once, acks a
-  # record into the new segment, signals ready, and blocks holding the dirent dirty.
+  # Launch the synchronized-cut workload. Its stderr is CAPTURED (not /dev/null'd) so
+  # that if it dies before signalling we can show exactly why (a panic, a config
+  # rejection, an ext2-specific error) instead of a blind INCONCLUSIVE.
+  local werr="$WORK/workload_${tag}.err"; : > "$werr"
   WAL_SEGMENT_SIZE=4096 WAL_MAX_RECORD_SIZE=256 \
-    "$REPO_ROOT/target/debug/dirfsync_cut_workload" "$wal" "$cap" "$ready" >/dev/null 2>&1 &
+    "$REPO_ROOT/target/debug/dirfsync_cut_workload" "$wal" "$cap" "$ready" >/dev/null 2>"$werr" &
   local wpid=$!
 
   # Wait (bounded, 10s) for the ready signal: the roll has happened and the new
-  # segment's dirent is un-synced. If the workload exits first, no roll ⇒ INCONCLUSIVE.
+  # segment's dirent is un-synced. If the workload exits first, show its stderr.
   local waited=0
   while [ ! -s "$ready" ]; do
     if ! kill -0 "$wpid" 2>/dev/null; then
-      wait "$wpid" 2>/dev/null || true
-      log "§14.4d/${tag}: workload exited before the roll signal — INCONCLUSIVE."
+      wait "$wpid" 2>/dev/null; local wrc=$?
+      log "§14.4d/${tag}: workload exited (rc=${wrc}) before the roll signal — INCONCLUSIVE. Workload stderr:"
+      cat "$werr" >&2
       return 2
     fi
     sleep 0.1; waited=$((waited + 1))
     if [ "$waited" -ge 100 ]; then
       kill -9 "$wpid" 2>/dev/null || true; wait "$wpid" 2>/dev/null || true
-      log "§14.4d/${tag}: no ready signal within 10s — INCONCLUSIVE."
+      log "§14.4d/${tag}: no ready signal within 10s — INCONCLUSIVE. Workload stderr so far:"
+      cat "$werr" >&2
       return 2
     fi
   done
