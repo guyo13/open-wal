@@ -8,9 +8,28 @@ name: M8 macOS gate (H4 F_FULLFSYNC, Half A)
 # Evidence ledger (§5) uploaded every run; posted to #19 ONLY on a manual
 # workflow_dispatch (human sign-off), never on the nightly cron.
 
+# TRIGGERS: Half A is fast and deterministic, and it is the ONLY place a macOS-only
+# F_FULLFSYNC-routing regression is catchable — the cfg(target_os="macos") path does
+# not compile on Linux, so the Linux PR CI cannot see it break. We therefore run it
+# per-PR (paths-filtered to the durable-path sources + the test + this workflow) and
+# on push to main. Nightly is redundant for a deterministic test and is dropped;
+# workflow_dispatch stays for the sign-off run.
 on:
-  schedule:
-    - cron: "41 4 * * *" # nightly, off the :00 mark (§14.11)
+  pull_request:
+    paths:
+      - "src/segment.rs"
+      - "src/wal.rs"
+      - "tests/macos_fullfsync.rs"
+      - "Cargo.toml"
+      - ".github/workflows/m8-macos.yml"
+  push:
+    branches: [main]
+    paths:
+      - "src/segment.rs"
+      - "src/wal.rs"
+      - "tests/macos_fullfsync.rs"
+      - "Cargo.toml"
+      - ".github/workflows/m8-macos.yml"
   workflow_dispatch:
 
 permissions:

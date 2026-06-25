@@ -182,17 +182,24 @@ filesystem-dependence caveat.
 
 ### CI automation (Tier 1 / Tier 3)
 
-- **Tier 1 — `.github/workflows/m8-dmflakey.yml`** (nightly + `workflow_dispatch`):
-  `modprobe dm-flakey` then runs `dm-flakey.sh h3 ext4` and `dirfsync-negative ext4`
-  as **hard** gates (FAIL reds the build; INCONCLUSIVE is a loud warning, never a
-  pass), with xfs/btrfs informational. **Best-effort + loud skip:** if a runner lacks
-  dm-flakey it emits a `::warning::` and the gate stays OPEN — never faked green.
-- **Tier 3 — `.github/workflows/m8-macos.yml`** (`macos-latest`, nightly +
-  `workflow_dispatch`): `cargo test --test macos_fullfsync` (H4 **Half A** — the
-  no-privilege routing/smoke; the `dtruss` Half B stays owner-run per #19).
+- **Tier 1 — `.github/workflows/m8-dmflakey.yml`** (push-to-main paths-filtered +
+  nightly + `workflow_dispatch`; not per-PR): `modprobe dm-flakey` then runs
+  `dm-flakey.sh h3 ext4` and `dirfsync-negative ext4` as **hard** gates (FAIL reds the
+  build; INCONCLUSIVE is a loud warning, never a pass), with xfs/btrfs informational.
+  #16 PASS requires a **source-confirmed block-layer EIO** (`dmesg`) ANDed with WAL
+  poison; #17 runs a **`drop_writes` positive control** first (if drop_writes is inert,
+  exit 4 HARNESS — louder than INCONCLUSIVE). **Best-effort + loud skip:** if a runner
+  lacks dm-flakey it emits a `::warning::` and the gate stays OPEN — **a green run
+  carrying that warning is NOT a passed gate**, never faked green.
+- **Tier 3 — `.github/workflows/m8-macos.yml`** (`macos-latest`; per-PR paths-filtered
+  + push-to-main + `workflow_dispatch`): `cargo test --test macos_fullfsync` (H4
+  **Half A** — the no-privilege routing/smoke; the `dtruss` Half B stays owner-run per
+  #19). Per-PR because a macOS-only `F_FULLFSYNC`-routing regression is invisible to
+  the Linux PR CI (the `cfg(macos)` path does not compile there).
 - Both upload the `evidence.sh` §5 JSON as a workflow artifact **every run**, and post
   it to the gate's tracking issue (#16/#17/#19) **only on a manual `workflow_dispatch`**
-  (the human sign-off) — never on the nightly cron, which stays loud as a red build.
+  (the human sign-off) — never on the per-PR/push/cron runs, which stay loud as a red
+  build.
 
 `m8/evidence.sh emit [out=PATH] KEY=VALUE …` builds the §5 JSON (dotted keys nest;
 bare ints/bools unquoted; `@`-prefixed values are JSON literals; `timestamp` defaults
