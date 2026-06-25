@@ -72,7 +72,13 @@ cmd_check() {
   command -v dmsetup >/dev/null 2>&1 || { log "missing: dmsetup"; ok=0; }
   [ -e /dev/mapper/control ] || { log "missing: /dev/mapper/control (device-mapper not in kernel)"; ok=0; }
   if command -v dmsetup >/dev/null 2>&1; then
-    dmsetup targets 2>/dev/null | grep -q '^flakey' || { log "missing: dm-flakey target"; ok=0; }
+    # MUST be `as_root`: `dmsetup targets` opens /dev/mapper/control, which needs
+    # root. As an unprivileged user it fails with "Failure to communicate with
+    # kernel device-mapper driver" and prints nothing — which would FALSELY look
+    # like "flakey absent" even when the module is loaded (the hosted-CI footgun
+    # that made the first dm-flakey run loud-skip while `sudo dmsetup targets` in
+    # the provisioning step plainly showed `flakey`).
+    as_root dmsetup targets 2>/dev/null | grep -q '^flakey' || { log "missing: dm-flakey target"; ok=0; }
   fi
   if [ "$ok" -ne 1 ]; then
     open_banner
@@ -109,7 +115,18 @@ setup() {
 flakey_fault() {
   local mode="$1" loop sectors
   loop="$(cat "$WORK/loop")"; sectors="$(cat "$WORK/sectors")"
-  as_root dmsetup suspend "$DM_NAME"
+  # CRITICAL: --noflush --nolockfs when ENTERING the fault mode. The table is
+  # still in UP mode at suspend time (the fault table loads on the next line), so
+  # a default `dmsetup suspend` would FLUSH in-flight I/O and FREEZE the
+  # filesystem (lockfs ⇒ a full sync) — persisting the very un-synced data we are
+  # about to drop, to the backing store, BEFORE drop_writes is active. That is
+  # exactly why the §14.4d positive control failed ("un-synced marker SURVIVED a
+  # drop_writes cut") on hosted CI AND on real hardware: the freeze-sync wrote the
+  # dirty marker out before the cut. It also silently defeats the negative control
+  # (the inject build's un-synced dir entry gets persisted too ⇒ no asymmetry).
+  # Skipping the flush + freeze leaves the un-synced data dirty so the subsequent
+  # umount writeback hits the drop_writes target and is genuinely lost.
+  as_root dmsetup suspend --noflush --nolockfs "$DM_NAME"
   # up 0 / down 60 ⇒ immediately and continuously in the down state for 60s.
   as_root dmsetup load "$DM_NAME" --table "0 $sectors flakey $loop 0 0 60 1 $mode"
   as_root dmsetup resume "$DM_NAME"
@@ -119,7 +136,14 @@ flakey_fault() {
 flakey_up() {
   local loop sectors
   loop="$(cat "$WORK/loop")"; sectors="$(cat "$WORK/sectors")"
-  as_root dmsetup suspend "$DM_NAME"
+  # CRITICAL: --noflush --nolockfs. flakey_up is called while the device is in a
+  # FAULT mode (error_writes/drop_writes). A plain `dmsetup suspend` flushes
+  # outstanding I/O and freezes the filesystem (an implicit sync) — both issue
+  # writes/flushes THROUGH the erroring target, so the suspend ioctl itself
+  # returns EIO ("suspend ioctl ... failed: Input/output error", observed on
+  # hosted CI). Skipping the flush + fs-freeze makes the table reload back to
+  # normal safe; any not-yet-written pages are written after resume (in up mode).
+  as_root dmsetup suspend --noflush --nolockfs "$DM_NAME"
   as_root dmsetup load "$DM_NAME" --table "0 $sectors flakey $loop 0 1 0"
   as_root dmsetup resume "$DM_NAME"
 }
@@ -127,7 +151,9 @@ flakey_up() {
 cmd_teardown() {
   as_root umount "$MNT" 2>/dev/null || true
   as_root dmsetup remove "$DM_NAME" 2>/dev/null || true
-  [ -f "$WORK/loop" ] && as_root losetup -d "$(cat "$WORK/loop")" 2>/dev/null || true
+  if [ -f "$WORK/loop" ]; then
+    as_root losetup -d "$(cat "$WORK/loop")" 2>/dev/null || true
+  fi
   rm -f "$WORK/loop" "$WORK/sectors"
   log "torn down"
 }
@@ -185,9 +211,14 @@ _h3_attempt() {
   grep -q "handle poisoned" "$err" && fired=1
   [ "$dmesg_ok" -eq 1 ] && block_eio="$(_block_eio_since "$pre")"
 
-  flakey_up
+  # Record the verdict inputs BEFORE restoring the device, so a (now-unexpected)
+  # flakey_up hiccup cannot abort the function and be misread as a durability FAIL
+  # — the bug that made the first real run report a false §12 violation. flakey_up
+  # is best-effort here (teardown reclaims the device regardless); `|| log` keeps
+  # set -e from aborting on it.
   H3_LAST_RC="$rc"; H3_LAST_FIRED="$fired"
   H3_LAST_BLOCK_EIO="$block_eio"; H3_LAST_DMESG_OK="$dmesg_ok"
+  flakey_up || log "WARN: flakey_up did not restore the device (teardown will reclaim it); this attempt's verdict already recorded."
 
   # PASS requires BOTH halves ANDed: WAL poisoned AND a real block-layer EIO observed
   # in the window. Poison without an observed EIO ⇒ INCONCLUSIVE (misattribution
@@ -297,8 +328,11 @@ _d44d_run_one() {
 # negative control relies on. Without it, an exhausted retry budget cannot tell
 # "timing didn't land" (benign INCONCLUSIVE) from "drop_writes never dropped anything"
 # (a structurally dead negative control that certifies nothing while looking like
-# flakiness). Write a marker but DO NOT sync it (it stays a dirty page, not yet a
-# bio — dm suspend's flush touches in-flight bios, not page cache), enter drop_writes,
+# flakiness). Write a marker but DO NOT sync it (it stays a dirty page). Entering
+# drop_writes via `flakey_fault` now suspends with --noflush --nolockfs, so the
+# transition neither flushes nor freeze-syncs the fs — the dirty marker stays
+# un-persisted (an earlier default suspend's lockfs freeze synced it out, which is
+# what made this very control fail on CI and on real hardware), enter drop_writes,
 # then umount (forces writeback ⇒ bios ⇒ dropped); remount and check it is gone.
 #   return 0  drop is functional (the un-synced marker vanished across the cut)
 #   return 1  drop did NOT take effect (marker survived) ⇒ harness/env problem
