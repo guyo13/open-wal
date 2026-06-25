@@ -58,23 +58,26 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      # DIAGNOSTIC (temporary): the linux-modules-extra install matched the running
-      # Azure kernel yet `modprobe dm-flakey` still didn't surface the `flakey` target
-      # — and the error was swallowed. Surface it: depmod, modinfo (is the .ko there?),
-      # modprobe -v (the real load error), dmesg (e.g. "Key was rejected by service" ⇒
-      # secure-boot/lockdown). `|| echo` keeps `set -e` from aborting before `check`
-      # gates. Revert to a clean provision once we know whether hosted is salvageable.
-      - name: Provision dm-flakey + FS tools (verbose diagnostic)
+      # PROVISION dm-flakey on the hosted Azure runner. CONFIRMED REACHABLE (run
+      # 28185769923): `linux-modules-extra-$(uname -r)` ships the matching
+      # `dm-flakey.ko`, `modprobe dm_flakey` loads it, and `dmsetup targets` then
+      # lists `flakey v1.5.0`. So Tier-1 H3-physical + §14.4d are REAL free CI signal,
+      # not OPEN-pending-hardware — no self-hosted runner needed.
+      #   * modules-extra is keyed to the EXACT running kernel; on a rare image/kernel
+      #     skew the install can miss — we tolerate that and let `check` loud-skip
+      #     (never green-as-a-gate on a runner that cannot inject the fault).
+      #   * `modprobe` + the concise `dmsetup targets` echo stay as a one-glance
+      #     provisioning record (the verbose modinfo/dmesg diagnostic was only needed
+      #     while we were establishing reachability).
+      - name: Provision dm-flakey + FS tools
         run: |
           sudo apt-get update -y
           sudo apt-get install -y "linux-modules-extra-$(uname -r)" \
-            || echo "modules-extra: install failed (kernel/image skew?)"
+            || echo "modules-extra: install failed (kernel/image skew?) — check will loud-skip"
           sudo depmod -a || true
-          echo "::group::dm-flakey load diagnostics"
+          sudo modprobe dm_flakey || echo "modprobe dm_flakey failed — check will loud-skip"
+          echo "::group::dm-flakey provisioning"
           uname -r
-          modinfo dm_flakey 2>&1 || echo "modinfo: dm_flakey .ko NOT in module tree"
-          sudo modprobe -v dm_flakey 2>&1 || echo "modprobe dm_flakey FAILED rc=$?"
-          sudo dmesg 2>&1 | tail -n 25 || echo "dmesg unreadable"
           sudo dmsetup targets 2>&1 || true
           echo "::endgroup::"
           sudo apt-get install -y xfsprogs btrfs-progs

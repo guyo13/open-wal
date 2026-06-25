@@ -72,7 +72,13 @@ cmd_check() {
   command -v dmsetup >/dev/null 2>&1 || { log "missing: dmsetup"; ok=0; }
   [ -e /dev/mapper/control ] || { log "missing: /dev/mapper/control (device-mapper not in kernel)"; ok=0; }
   if command -v dmsetup >/dev/null 2>&1; then
-    dmsetup targets 2>/dev/null | grep -q '^flakey' || { log "missing: dm-flakey target"; ok=0; }
+    # MUST be `as_root`: `dmsetup targets` opens /dev/mapper/control, which needs
+    # root. As an unprivileged user it fails with "Failure to communicate with
+    # kernel device-mapper driver" and prints nothing — which would FALSELY look
+    # like "flakey absent" even when the module is loaded (the hosted-CI footgun
+    # that made the first dm-flakey run loud-skip while `sudo dmsetup targets` in
+    # the provisioning step plainly showed `flakey`).
+    as_root dmsetup targets 2>/dev/null | grep -q '^flakey' || { log "missing: dm-flakey target"; ok=0; }
   fi
   if [ "$ok" -ne 1 ]; then
     open_banner
@@ -127,7 +133,9 @@ flakey_up() {
 cmd_teardown() {
   as_root umount "$MNT" 2>/dev/null || true
   as_root dmsetup remove "$DM_NAME" 2>/dev/null || true
-  [ -f "$WORK/loop" ] && as_root losetup -d "$(cat "$WORK/loop")" 2>/dev/null || true
+  if [ -f "$WORK/loop" ]; then
+    as_root losetup -d "$(cat "$WORK/loop")" 2>/dev/null || true
+  fi
   rm -f "$WORK/loop" "$WORK/sectors"
   log "torn down"
 }
