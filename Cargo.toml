@@ -16,11 +16,15 @@ readme = "README.md"
 exclude = ["src/bin"]
 
 [features]
-# Test-only NEGATIVE CONTROL for §14.4d: build the writer to deliberately OMIT
-# the directory fsync after a segment roll, so the rolled segment's filename is
-# not made durable. The `tests/lazyfs_gate.rs` dir-fsync-omission detector is run
-# both without this feature (must pass) and with it (must FAIL under LazyFS
-# `clear-cache` after a roll). NEVER enable in a real build.
+# Test-only NEGATIVE CONTROL for §14.4d (M8): build the writer to deliberately
+# OMIT the directory fsync after a segment roll, so the rolled segment's filename
+# is not made durable. The detector lives in the M8 metadata-fault harness
+# (`scripts/m8/dm-flakey.sh dirfsync-negative`): the correct build (without this
+# feature) must PASS recovery after a roll + simulated power loss, and the inject
+# build (with it) must FAIL (the filename was never durable). LazyFS cannot model
+# this (data-only faults; it persists a `create` immediately), which is why §14.4d
+# was deferred from M4 to M8's dm-flakey/power-pull tooling. NEVER enable in a real
+# build. See docs/m8-runbook.md §14.4d.
 inject_no_dir_fsync = []
 
 [dependencies]
