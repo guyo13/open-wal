@@ -147,8 +147,9 @@ fakes green — the owner-run gates print loud "NOT EXERCISED"/OPEN banners.
 |---|---|---|
 | `m8/storage-check.sh` | **H2** vacuous-pass guard (deny-by-default FS/cache classification + empirical loss probe) | static part **yes** |
 | `m8/fsync-fault.sh` | **H3 §12 poison state machine** (LD_PRELOAD EIO shim) | **yes — green** |
-| `m8/dm-flakey.sh` | **H3 physical** + **§14.4d** dir-fsync negative control | no (needs device-mapper) |
+| `m8/dm-flakey.sh` | **H3 physical** + **§14.4d** dir-fsync negative control | **nightly CI** (hosted ubuntu VMs reach dm-flakey; `m8-dmflakey.yml`); the build sandbox lacked it |
 | `m8/power-pull.sh` | **H1** power-pull (≥50 cycles, zero acked loss) | no (needs a cuttable target) |
+| `m8/evidence.sh` | shared **§5 evidence-ledger** JSON emitter (reused by the gates above) | n/a (helper) |
 
 ### Runs here (CI-safe)
 
@@ -178,3 +179,21 @@ scripts/m8/power-pull.sh cycle             # prints the ≥50-cycle power-pull p
 See `docs/m8-runbook.md` for cut mechanisms (and why `sysrq-b`/`reboot` are **not**
 valid cuts), the network side-channel topology, the FS matrix, and the §14.4d
 filesystem-dependence caveat.
+
+### CI automation (Tier 1 / Tier 3)
+
+- **Tier 1 — `.github/workflows/m8-dmflakey.yml`** (nightly + `workflow_dispatch`):
+  `modprobe dm-flakey` then runs `dm-flakey.sh h3 ext4` and `dirfsync-negative ext4`
+  as **hard** gates (FAIL reds the build; INCONCLUSIVE is a loud warning, never a
+  pass), with xfs/btrfs informational. **Best-effort + loud skip:** if a runner lacks
+  dm-flakey it emits a `::warning::` and the gate stays OPEN — never faked green.
+- **Tier 3 — `.github/workflows/m8-macos.yml`** (`macos-latest`, nightly +
+  `workflow_dispatch`): `cargo test --test macos_fullfsync` (H4 **Half A** — the
+  no-privilege routing/smoke; the `dtruss` Half B stays owner-run per #19).
+- Both upload the `evidence.sh` §5 JSON as a workflow artifact **every run**, and post
+  it to the gate's tracking issue (#16/#17/#19) **only on a manual `workflow_dispatch`**
+  (the human sign-off) — never on the nightly cron, which stays loud as a red build.
+
+`m8/evidence.sh emit [out=PATH] KEY=VALUE …` builds the §5 JSON (dotted keys nest;
+bare ints/bools unquoted; `@`-prefixed values are JSON literals; `timestamp` defaults
+to UTC-now). The gates write `evidence-<gate>.json` under `$WAL_M8_EVIDENCE_DIR`.

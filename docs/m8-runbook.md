@@ -27,6 +27,26 @@ The §12 state-machine shim and the H2 static guard **run green in CI/sandbox**
 (`scripts/m8/fsync-fault.sh`, `scripts/m8/storage-check.sh`). Everything else is
 your hardware run.
 
+### CI automation (what now runs without your hardware)
+
+Two gates that the build sandbox could not run are now **automated on hosted CI**
+(nightly + manual), so you no longer drive them by hand for the common case:
+
+| Workflow | Gate | Runner | Notes |
+|---|---|---|---|
+| `.github/workflows/m8-dmflakey.yml` | **H3-physical (#16)** + **§14.4d (#17)** | `ubuntu-latest` | hosted VMs reach `dm-flakey`; ext4 is the hard gate, xfs/btrfs informational. **Best-effort + loud skip** if a runner image lacks dm-flakey (gate stays OPEN, never faked). |
+| `.github/workflows/m8-macos.yml` | **H4 Half A (#19)** | `macos-latest` | `cargo test --test macos_fullfsync` (routing/smoke). **Half B** (the `dtruss` trace, root + SIP) stays owner-run below. |
+
+Both emit the §5 evidence ledger as a workflow artifact on **every** run, and post it
+to the gate's issue **only on a manual `workflow_dispatch`** — the human sign-off
+trail. A nightly regression is surfaced by the **red build**, not an issue comment
+(quiet on the issue, loud as a build). To produce a durable sign-off comment for a
+DoD flip, trigger the workflow manually (`workflow_dispatch`) and point to that run.
+
+**Still owner-run (this runbook):** **H1** power-pull (needs a cuttable target), the
+**H2 empirical loss-probe**, and **H4 Half B** (`dtruss`). The dm-flakey gates can
+also still be run by hand here (e.g. on xfs/btrfs, or to certify on your own kernel).
+
 ---
 
 ## H2 — storage durability guard (precondition for H1)

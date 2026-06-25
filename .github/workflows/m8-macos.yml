@@ -1,0 +1,76 @@
+name: M8 macOS gate (H4 F_FULLFSYNC, Half A)
+
+# Tier 3 (docs/m8-infra-plan.md §2): the §14.8 H4 "macOS durable path issues
+# F_FULLFSYNC" gate, Half A — the no-privilege cfg-routing + smoke test on a hosted
+# `macos-latest` runner. This is the half that closes in CI; the dtruss syscall-trace
+# (Half B) needs root + SIP and stays owner-run/self-hosted per #19.
+#
+# Evidence ledger (§5) uploaded every run; posted to #19 ONLY on a manual
+# workflow_dispatch (human sign-off), never on the nightly cron.
+
+on:
+  schedule:
+    - cron: "41 4 * * *" # nightly, off the :00 mark (§14.11)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  CARGO_TERM_COLOR: always
+  M8_EV: ${{ github.workspace }}/m8-evidence
+
+jobs:
+  macos-fullfsync:
+    name: H4 Half A (macOS F_FULLFSYNC routing/smoke)
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Half A: the smoke test (`commit_is_durable_on_macos`) exercises the macOS
+      # durable path with no privileges; the dtruss proof (`..._under_dtruss`) is
+      # `#[ignore]`d here and run by the owner. A test failure reds the build.
+      - name: H4 Half A — F_FULLFSYNC routing/smoke
+        run: |
+          set +e
+          cargo test --test macos_fullfsync -- --nocapture
+          rc=$?
+          set -e
+          if [ "$rc" -eq 0 ]; then verdict=PASS; pass=1; else verdict=FAIL; pass=0; fi
+          mkdir -p "$M8_EV"
+          WAL_M8_EVIDENCE="$M8_EV/evidence-h4.json" scripts/m8/evidence.sh emit \
+            gate=H4 \
+            "target.uname=$(uname -sr)" "target.sw_vers=$(sw_vers -productVersion)" \
+            "target.host=$(hostname)" \
+            "storage.fs=apfs" "storage.h2_probe=n/a (routing assertion, not power-loss)" \
+            "cut.mechanism=n/a" cut.valid=false \
+            run.cycles_required=1 "run.cycles_pass=${pass}" \
+            "detail.half=A (cfg-routing + smoke); Half B (dtruss trace) owner-run per #19" \
+            "verdict=${verdict}"
+          exit "$rc"
+
+      - name: Upload evidence ledger
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m8-macos-evidence-${{ github.run_id }}
+          path: ${{ github.workspace }}/m8-evidence/**
+          if-no-files-found: ignore
+
+      # SIGN-OFF TRAIL: post to #19 only on a manual dispatch (any verdict). Nightly
+      # stays quiet on the issue and loud as a red build. No verdict-diff logic.
+      - name: Post evidence to #19 (dispatch sign-off only)
+        if: github.event_name == 'workflow_dispatch' && always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          file="${{ github.workspace }}/m8-evidence/evidence-h4.json"
+          [ -e "$file" ] || { echo "no evidence file; skipping"; exit 0; }
+          { printf '**H4 Half A (macOS F_FULLFSYNC)** — automated M8 evidence (workflow_dispatch sign-off run #%s).\n\n' "$GITHUB_RUN_ID"
+            printf '```json\n'; cat "$file"; printf '\n```\n'; } > body.md
+          gh issue comment 19 --repo "$GITHUB_REPOSITORY" --body-file body.md
