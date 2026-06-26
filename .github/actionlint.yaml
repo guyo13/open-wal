@@ -1,0 +1,7 @@
+# actionlint config — declare custom self-hosted runner labels so the H1 power-pull
+# gate (.github/workflows/m8-h1.yml, runs-on: [self-hosted, h1-rig]) lints clean.
+# The owner's CONTROLLER laptop (never cut) registers a self-hosted runner with the
+# "h1-rig" label; see docs/m8-runbook.md → controller setup.
+self-hosted-runner:
+  labels:
+    - h1-rig
