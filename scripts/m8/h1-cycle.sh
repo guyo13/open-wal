@@ -62,7 +62,25 @@ WAL_M8_EVIDENCE="${WAL_M8_EVIDENCE:-${REPO_ROOT}/m8-evidence/evidence-h1.json}"
 log()  { printf '\033[1;34m[m8/h1]\033[0m %s\n' "$*" >&2; }
 warn() { printf '\033[1;33m[m8/h1] WARN:\033[0m %s\n' "$*" >&2; }
 pass() { printf '\033[1;32m[m8/h1] PASS:\033[0m %s\n' "$*" >&2; }
-die()  { printf '\033[1;31m[m8/h1] ERROR:\033[0m %s\n' "$*" >&2; exit 1; }
+# die_code <exit-code> <msg…>: distinct exit codes make each terminal cause
+# unmistakable in CI. 1 = D1 FAIL (acked loss), 2 = INCONCLUSIVE/infra, 3 = VACUOUS
+# calibration (the loudest — storage did not lose un-synced data). die() = generic 1.
+die_code() { local c="$1"; shift; printf '\033[1;31m[m8/h1] ERROR:\033[0m %s\n' "$*" >&2; exit "$c"; }
+die()      { die_code 1 "$@"; }
+
+# --- §5 verdict (one ledger per run, on EVERY terminal path) -----------------
+# The §5 schema verdict is PASS | FAIL | INCONCLUSIVE | OPEN. We set VERDICT at each
+# terminal path and emit exactly once via finish(); the EXIT trap (cmd_run) is only a
+# safety net that emits the current VERDICT (default OPEN ⇒ "gate did not complete").
+VERDICT="OPEN"
+EVIDENCE_EMITTED=0
+finish() {                       # finish <verdict>: emit the §5 ledger exactly once
+  VERDICT="$1"
+  [ "$EVIDENCE_EMITTED" = 1 ] && return 0
+  EVIDENCE_EMITTED=1
+  emit_evidence "$VERDICT"
+}
+on_exit() { finish "$VERDICT"; } # safety net for any unhandled exit ⇒ OPEN
 
 # Loud OPEN banner — H1 is owner-run; this never fakes green.
 banner_open() {
@@ -168,14 +186,15 @@ cmd_deploy() {
   require H1_TARGET_SSH
   local wbin="${H1_LOCAL_BIN_DIR}/power_pull_workload"
   local vbin="${H1_LOCAL_BIN_DIR}/power_pull_verify"
-  if [ ! -x "$wbin" ] || [ ! -x "$vbin" ]; then
-    die "cross-built bins not found in $H1_LOCAL_BIN_DIR (build for aarch64 first; see the runbook)."
+  local pbin="${H1_LOCAL_BIN_DIR}/storage_probe"
+  if [ ! -x "$wbin" ] || [ ! -x "$vbin" ] || [ ! -x "$pbin" ]; then
+    die "cross-built bins not found in $H1_LOCAL_BIN_DIR (build power_pull_workload/power_pull_verify/storage_probe for aarch64 first; see the runbook)."
   fi
   log "deploying bins + storage-check.sh to ${H1_TARGET_SSH}:${H1_BIN_DIR}"
   ssh_target "mkdir -p '$H1_BIN_DIR'"
-  scp -q "$wbin" "$vbin" "${REPO_ROOT}/scripts/m8/storage-check.sh" \
+  scp -q "$wbin" "$vbin" "$pbin" "${REPO_ROOT}/scripts/m8/storage-check.sh" \
     "${H1_TARGET_SSH}:${H1_BIN_DIR}/"
-  ssh_target "chmod +x '$H1_BIN_DIR/power_pull_workload' '$H1_BIN_DIR/power_pull_verify' '$H1_BIN_DIR/storage-check.sh'"
+  ssh_target "chmod +x '$H1_BIN_DIR/power_pull_workload' '$H1_BIN_DIR/power_pull_verify' '$H1_BIN_DIR/storage_probe' '$H1_BIN_DIR/storage-check.sh'"
   pass "deployed to ${H1_BIN_DIR}"
 }
 
@@ -186,27 +205,39 @@ cmd_deploy() {
 H2_PROBE="not-run"
 cmd_calibrate() {
   require H1_TARGET_SSH; require H1_WAL_DIR
+  # Static deny-by-default FS/cache check (storage-check.sh). A non-durable FS is a
+  # vacuous-class abort (exit 3) just like a surviving marker.
   log "§3.4 calibration: static H2 classification of the DUT…"
-  ssh_target "'$H1_BIN_DIR/storage-check.sh' classify '$H1_WAL_DIR'" \
-    || die "H2 static guard FAILED — the DUT is not a recognised durable block FS. Refusing a vacuous H1."
+  if ! ssh_target "'$H1_BIN_DIR/storage-check.sh' classify '$H1_WAL_DIR'"; then
+    H2_PROBE="FAIL(non-durable FS)"
+    finish "OPEN"
+    die_code 3 "H2 static guard FAILED — the DUT is not a recognised durable block FS. Refusing a vacuous H1."
+  fi
 
-  log "§3.4 calibration: writing an UN-SYNCED marker, then a REAL cut…"
-  ssh_target "mkdir -p '$H1_WAL_DIR' && '$H1_BIN_DIR/storage-check.sh' probe-write '$H1_WAL_DIR'"
-  # Give the marker no chance to be flushed by an unrelated sync, then cut hard.
+  # Empirical loss probe via storage_probe — shares the WAL write(2) path (the reason
+  # it's a binary, not the shell echo): un-synced data that is lost here predicts an
+  # un-acked WAL record lost here.
+  log "§3.4 calibration: writing an UN-SYNCED marker (WAL write path), then a REAL cut…"
+  ssh_target "mkdir -p '$H1_WAL_DIR' && '$H1_BIN_DIR/storage_probe' write-unsynced-marker '$H1_WAL_DIR'"
+  # Cut immediately (no chance for an unrelated writeback to flush the marker).
   plug_off
   sleep "$H1_OFF_SECS"
   plug_on
   if ! wait_ssh; then
     H2_PROBE="FAIL(target did not return after calibration cut)"
-    die "calibration cut: target did not come back — fix the rig before running cycles."
+    finish "INCONCLUSIVE"
+    die_code 2 "calibration cut: target did not come back — fix the rig before running cycles."
   fi
-  # Marker MUST be gone. probe-verify exits 0 (gone => real cut) / 1 (survived => vacuous).
-  if ssh_target "'$H1_BIN_DIR/storage-check.sh' probe-verify '$H1_WAL_DIR'"; then
+  # Marker MUST be gone. storage_probe exits 0 (gone ⇒ honest cut) / 1 (survived ⇒ vacuous).
+  if ssh_target "'$H1_BIN_DIR/storage_probe' verify-marker-gone '$H1_WAL_DIR'"; then
     H2_PROBE="PASS(marker gone)"
     pass "§3.4 calibration PASSED — the DUT genuinely loses un-synced data. Cycles are meaningful."
   else
+    # HARD abort — the single most important thing this gate can discover. Distinct
+    # exit 3, evidence emitted with h2_probe=FAIL(survived) and verdict=OPEN.
     H2_PROBE="FAIL(survived)"
-    die "§3.4 calibration FAILED — the un-synced marker SURVIVED the cut. Storage did NOT lose un-synced data ⇒ any H1 here is VACUOUS. Do NOT run cycles. (Check mount opts / cut fidelity.)"
+    finish "OPEN"
+    die_code 3 "§3.4 calibration FAILED (VACUOUS) — the un-synced marker SURVIVED the cut. Storage did NOT lose un-synced data ⇒ any H1 here tests nothing. NO cycles run. (Check mount opts / cut fidelity.)"
   fi
 }
 
@@ -268,7 +299,8 @@ cmd_cycle() {
       1)
         FAIL_COUNT=$(( FAIL_COUNT + 1 )); infra_fail=0
         append_per_cycle 1
-        die "cycle #${n}: FAIL — an ACKED LSN was absent after the cut (D1 violation). STOPPING the run. Investigate per §3.6 (most likely a lying device on medium '${H1_DUT_MEDIUM}'; the evidence records which LSN and medium)." ;;
+        finish "FAIL"
+        die_code 1 "cycle #${n}: FAIL — an ACKED LSN was absent after the cut (D1 violation). STOPPING the run. Investigate per §3.6 (most likely a lying device on medium '${H1_DUT_MEDIUM}'; the evidence records which LSN and medium)." ;;
       2)
         # INCONCLUSIVE / infra — never counts toward 50; reset the consecutive streak.
         INCONCLUSIVE_RERUN=$(( INCONCLUSIVE_RERUN + 1 ))
@@ -276,10 +308,13 @@ cmd_cycle() {
         CYCLES_PASS=0
         infra_fail=$(( infra_fail + 1 ))
         warn "cycle #${n}: INCONCLUSIVE/infra (side-channel gap or target didn't return) — not counted; consecutive streak reset."
-        [ "$infra_fail" -lt "$H1_INFRA_FAIL_MAX" ] \
-          || die "${H1_INFRA_FAIL_MAX} consecutive infra failures — aborting (likely SD/OS corruption; re-flash, check the read-only overlay & wiring)." ;;
+        if [ "$infra_fail" -ge "$H1_INFRA_FAIL_MAX" ]; then
+          finish "INCONCLUSIVE"
+          die_code 2 "${H1_INFRA_FAIL_MAX} consecutive infra failures — aborting (likely SD/OS corruption; re-flash, check the read-only overlay & wiring)."
+        fi ;;
       *)
-        die "cycle #${n}: power_pull_verify exited ${rc} (unexpected) — aborting." ;;
+        finish "INCONCLUSIVE"
+        die_code 2 "cycle #${n}: power_pull_verify exited ${rc} (unexpected) — aborting." ;;
     esac
   done
   rm -rf "$capdir"
@@ -337,21 +372,18 @@ EOF
 }
 
 # --- run (default): calibrate -> cycle -> evidence --------------------------
-# Emit an ABORTED/OPEN ledger on ANY early exit (calibration vacuous, FAIL stop,
-# infra abort) — die() uses exit, so this is an EXIT trap, not ERR. A clean PASS
-# clears the guard so the trap is a no-op.
-H1_DONE=0
-on_exit() { [ "$H1_DONE" = 1 ] && return 0; emit_evidence "ABORTED" || true; }
+# finish() emits the §5 ledger exactly once on every terminal path; the EXIT trap is
+# only a safety net (emits the current VERDICT, default OPEN, on an unhandled exit).
+# The terminal failures inside calibrate/cycle already set the right verdict + exit code.
 cmd_run() {
   require H1_TARGET_SSH; require H1_WAL_DIR; require H1_CONTROLLER_IP
   banner_open "Starting an OWNER-RUN H1 campaign now."
   trap on_exit EXIT
   # The §3.4 calibration GATE is the FIRST step of every run; a vacuous DUT aborts
-  # before any cycle counts.
+  # (exit 3) before any cycle counts.
   cmd_calibrate
   cmd_cycle
-  emit_evidence "PASS"
-  H1_DONE=1
+  finish "PASS"
   pass "H1 PASSED locally for medium '${H1_DUT_MEDIUM}': ${CYCLES_PASS} consecutive cycles, H2 probe ${H2_PROBE}. The OWNER signs off on #18 — the agent never self-certifies H1."
 }
 

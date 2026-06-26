@@ -97,7 +97,7 @@ jobs:
           fi
           echo "available=true" >> "$GITHUB_OUTPUT"
 
-      - name: Cross-compile ARM workload/verify bins
+      - name: Cross-compile ARM bins (workload / verify / storage_probe)
         if: steps.rig.outputs.available == 'true'
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
@@ -107,23 +107,30 @@ jobs:
             exit 1
           fi
           cargo build --release --target aarch64-unknown-linux-gnu \
-            --bin power_pull_workload --bin power_pull_verify
+            --bin power_pull_workload --bin power_pull_verify --bin storage_probe
 
       - name: Deploy bins + storage-check.sh to the target
         if: steps.rig.outputs.available == 'true'
         run: scripts/m8/h1-cycle.sh deploy
 
       # The FULL campaign: §3.4 calibration GATE (abort if vacuous) → the ≥N-consecutive
-      # PASS cycle loop → emit the §5 ledger. h1-cycle.sh enforces every honesty rail.
-      # rc 0 = N consecutive PASS with H2 proven; anything else = vacuous calibration,
-      # a D1 FAIL, or an infra abort → red build (NOT a pass).
+      # PASS cycle loop → emit the §5 ledger. h1-cycle.sh enforces every honesty rail and
+      # uses DISTINCT exit codes so the cause is unmistakable in CI:
+      #   0 = N consecutive PASS with H2 proven (verdict=PASS, green)
+      #   1 = D1 FAIL — an acked LSN was lost (verdict=FAIL; most likely a lying device, §3.6)
+      #   2 = INCONCLUSIVE / infra abort (verdict=INCONCLUSIVE)
+      #   3 = VACUOUS calibration — storage didn't lose un-synced data (verdict=OPEN; HARD abort)
+      # Anything non-zero reds the build (NOT a pass). The verdict is in the ledger.
       - name: H1 calibration + cycle loop
         if: steps.rig.outputs.available == 'true'
         run: |
           set +e; scripts/m8/h1-cycle.sh run; rc=$?; set -e
           case "$rc" in
             0) echo "H1: ${H1_CYCLES} consecutive PASS with the §3.4 H2 probe proven (medium: ${H1_DUT_MEDIUM}).";;
-            *) echo "::error title=H1 FAIL/ABORT::h1-cycle.sh run exited ${rc} — read the evidence ledger: vacuous calibration (marker survived), a D1 FAIL (acked LSN lost — most likely a lying device, §3.6), or an infra abort. NOT a pass."; exit 1;;
+            1) echo "::error title=H1 D1 FAIL::an ACKED LSN was absent after the cut (verdict=FAIL). Per §3.6 the most likely cause is a lying device on medium '${H1_DUT_MEDIUM}' — the ledger records which LSN. NOT a pass."; exit 1;;
+            2) echo "::error title=H1 INCONCLUSIVE::infra abort (target didn't return / side-channel gap, verdict=INCONCLUSIVE). NOT a pass — re-run after fixing the rig."; exit 1;;
+            3) echo "::error title=H1 VACUOUS::§3.4 calibration FAILED — storage did NOT lose un-synced data (verdict=OPEN). Any H1 here tests nothing; no cycles ran. Fix the DUT/mount/cut before retrying. NOT a pass."; exit 1;;
+            *) echo "::error title=H1 unexpected::h1-cycle.sh run exited ${rc} — read the evidence ledger. NOT a pass."; exit 1;;
           esac
 
       - name: Upload evidence ledger

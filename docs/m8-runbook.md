@@ -101,6 +101,12 @@ If the marker **survives**, the storage does not lose un-synced data — **STOP*
 H1 result on it would be vacuous. Label such targets "PLP-cache only" and do not
 make a durability claim for honest power loss on them.
 
+> The **automated** H1 rig runs this same probe as `storage_probe write-unsynced-marker`
+> / `verify-marker-gone` (a test-only binary that writes via the **WAL's own `write(2)`
+> path**, minus the sync — see "Automated rig" under H1). That is the authoritative
+> calibration instrument; the shell `storage-check.sh probe-*` above is the quick manual
+> equivalent. `storage-check.sh classify` remains the static FS/cache deny-by-default check.
+
 ---
 
 ## H3 — fsync-failure → poison (§12)
@@ -279,18 +285,39 @@ device, cache mode, and cut mechanism.
 
 The manual loop above is fully automated by **`scripts/m8/h1-cycle.sh`** (orchestration
 on the controller) and **`.github/workflows/m8-h1.yml`** (`workflow_dispatch`-only, on a
-`[self-hosted, h1-rig]` runner). The script reuses the same binaries/scripts — it adds no
-`src/` code — and bakes in every honesty rail: the **§3.4 calibration gate runs first**,
-INCONCLUSIVE never counts, a FAIL stops the run, and `verdict=PASS` is emitted only when the
-H2 probe proved loss **and** `fail==0`.
+`[self-hosted, h1-rig]` runner). It reuses the proven `power_pull_*` binaries and adds one
+test-only bin (`storage_probe`, below); it touches **no durability `src/` code**. Every
+honesty rail is baked in: the **§3.4 calibration gate runs first**, INCONCLUSIVE never counts,
+a FAIL stops the run, and `verdict=PASS` is emitted only when the H2 probe proved loss **and**
+`fail==0`.
 
 ```bash
 scripts/m8/h1-cycle.sh config       # print the resolved config (touches no hardware)
-scripts/m8/h1-cycle.sh deploy       # scp the aarch64 bins + storage-check.sh to the target
+scripts/m8/h1-cycle.sh deploy       # scp the aarch64 bins (incl. storage_probe) + storage-check.sh
 scripts/m8/h1-cycle.sh calibrate    # §3.4 vacuous-pass GATE (real cut; marker MUST be gone)
 scripts/m8/h1-cycle.sh cycle        # the ≥N-consecutive-PASS loop
 scripts/m8/h1-cycle.sh run          # (default) calibrate → cycle → emit §5 evidence
 ```
+
+**The calibration instrument is the `storage_probe` binary, not a shell `echo`.** §3.4 must
+prove the DUT loses un-synced data **on the same kernel write path the WAL uses**, so the
+marker is written by `storage_probe write-unsynced-marker` — a plain `write(2)` with **no
+`fdatasync`** (the WAL's data path minus the durability step). "Un-synced data lost here" then
+predicts "un-acked WAL record lost here." `storage-check.sh classify` still runs first as the
+deny-by-default FS/cache check, but the loss-probe is the binary. `verify-marker-gone` exits
+0 = gone (honest cut) / 1 = survived (vacuous). A surviving marker is a **HARD abort** (exit 3,
+`verdict=OPEN`, `h2_probe=FAIL(survived)`) — no cycle counts.
+
+**Distinct exit codes / verdicts** (each terminal cause is unmistakable, and the §5 ledger is
+written on **every** path): `0`=PASS, `1`=D1 FAIL (`verdict=FAIL`), `2`=INCONCLUSIVE/infra
+abort (`verdict=INCONCLUSIVE`), `3`=vacuous calibration (`verdict=OPEN`).
+
+**Loop guarantees (pin-downs).** `power_pull_verify` runs **on the target over ssh** against the
+recovered WAL; the controller `scp`s **that cycle's fresh capture** to the target first, after the
+post-reboot ssh-readiness wait. The collector capture is **per-cycle** (a fresh file), so a stale
+capture can't bleed into a later cycle. Each cycle resolves to exactly one of PASS (counts) /
+INCONCLUSIVE-or-infra (re-run, never counted; `H1_INFRA_FAIL_MAX` consecutive infra fails abort
+loudly — likely SD/OS corruption) / FAIL (stops the run).
 
 Config is via env (see `config` for the full list): `H1_TARGET_SSH`, `H1_WAL_DIR` (the DUT
 partition), `H1_DUT_MEDIUM`, `H1_CONTROLLER_IP`, `H1_PORT` (9099), `H1_PLUG_TYPE`/`H1_PLUG_IP`,
