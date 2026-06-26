@@ -148,7 +148,8 @@ fakes green — the owner-run gates print loud "NOT EXERCISED"/OPEN banners.
 | `m8/storage-check.sh` | **H2** vacuous-pass guard (deny-by-default FS/cache classification + empirical loss probe) | static part **yes** |
 | `m8/fsync-fault.sh` | **H3 §12 poison state machine** (LD_PRELOAD EIO shim) | **yes — green** |
 | `m8/dm-flakey.sh` | **H3 physical** + **§14.4d** dir-fsync negative control | **nightly CI** (hosted ubuntu VMs reach dm-flakey; `m8-dmflakey.yml`); the build sandbox lacked it |
-| `m8/power-pull.sh` | **H1** power-pull (≥50 cycles, zero acked loss) | no (needs a cuttable target) |
+| `m8/power-pull.sh` | **H1** power-pull primitives (workload/receiver/verify; manual cut) | no (needs a cuttable target) |
+| `m8/h1-cycle.sh` | **H1** power-pull AUTOMATION (deploy → §3.4 calibrate → ≥50-PASS cycle loop → §5 evidence; pluggable smart-plug cut) | no (needs a wired rig + smart plug) |
 | `m8/evidence.sh` | shared **§5 evidence-ledger** JSON emitter (reused by the gates above) | n/a (helper) |
 
 ### Runs here (CI-safe)
@@ -173,8 +174,17 @@ rustix directory fsync needs the block-layer gate).
 scripts/m8/dm-flakey.sh check              # detect device-mapper; loud OPEN banner if absent
 sudo scripts/m8/dm-flakey.sh h3 ext4       # physical fsync-failure → poison
 sudo scripts/m8/dm-flakey.sh dirfsync-negative ext4   # §14.4d (certify on ext4; FS-/timing-sensitive)
-scripts/m8/power-pull.sh cycle             # prints the ≥50-cycle power-pull procedure
+scripts/m8/power-pull.sh cycle             # prints the ≥50-cycle power-pull procedure (manual cut)
+scripts/m8/h1-cycle.sh config              # H1 automation: show resolved rig config (no hardware)
+scripts/m8/h1-cycle.sh run                 # H1 automation: calibrate + ≥50-PASS loop + §5 evidence
 ```
+
+The H1 automation (`h1-cycle.sh`, driven in CI by `.github/workflows/m8-h1.yml`,
+`workflow_dispatch`-only on a `[self-hosted, h1-rig]` runner) cuts via a pluggable
+smart-plug local API (`H1_PLUG_TYPE`: `shelly` = Gen2/Gen3/Plus RPC, `shelly-gen1`,
+`tasmota`) and runs the §3.4 calibration vacuous-pass gate first. **H1 is owner-run and
+never self-certified** — see `docs/m8-runbook.md` → "H1 — power-pull" for the rig setup,
+config vars, and the #18 sign-off flow.
 
 See `docs/m8-runbook.md` for cut mechanisms (and why `sysrq-b`/`reboot` are **not**
 valid cuts), the network side-channel topology, the FS matrix, and the §14.4d

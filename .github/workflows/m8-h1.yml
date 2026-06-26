@@ -1,0 +1,149 @@
+name: M8 H1 power-pull (owner-run hardware gate)
+
+# §14.8 H1 — the ONLY true durability gate (D1): committed records survive a REAL
+# mains power cut, ≥50 consecutive cycles with zero acked-LSN loss. It cannot be
+# self-certified in a sandbox — it needs a wired rig with a cuttable target and a
+# smart-plug mains interrupt. This workflow drives the owner's rig end-to-end and
+# emits the §5 evidence ledger; the OWNER signs off and closes #18.
+#
+# HONESTY (M8 ground rules):
+#   * workflow_dispatch ONLY (human-initiated; a power-cut campaign is never automatic).
+#   * Runs on the owner's CONTROLLER laptop (self-hosted, never cut) — labelled
+#     [self-hosted, h1-rig]. The target (Raspberry Pi 3 / BeagleBone / USB-SSD DUT) is
+#     cut via the smart plug; the controller is not.
+#   * BEST-EFFORT + LOUD SKIP: if the rig isn't configured/reachable, the job emits a
+#     loud ::warning:: and stays OPEN-pending-owner-run — it never fakes green.
+#   * The §3.4 calibration is the FIRST step of every campaign (inside h1-cycle.sh run):
+#     a vacuous DUT (un-synced marker survives the cut) ABORTS before any cycle counts.
+#   * A D1 FAIL or an aborted calibration REDS the build. INCONCLUSIVE never counts
+#     toward the 50 (h1-cycle.sh enforces all of this).
+#   * Evidence ledger (§5) uploaded every run; posted to #18 only on this manual
+#     dispatch (the human sign-off trail).
+
+on:
+  workflow_dispatch:
+    inputs:
+      dut_medium:
+        description: "DUT medium under test (recorded in the evidence ledger)"
+        type: choice
+        options:
+          - microSD
+          - USB-SSD
+          - eMMC(BeagleBone)
+        default: microSD
+      plug_type:
+        description: "Smart-plug local API (shelly = Gen2/Gen3/Plus RPC)"
+        type: choice
+        options:
+          - shelly
+          - shelly-gen1
+          - tasmota
+        default: shelly
+      cycles:
+        description: "Required CONSECUTIVE PASS cycles"
+        type: string
+        default: "50"
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  CARGO_TERM_COLOR: always
+  M8_EV: ${{ github.workspace }}/m8-evidence
+  # Rig config comes from repo Variables (Settings → Secrets and variables → Actions →
+  # Variables). Empty ⇒ the rig isn't wired ⇒ loud-skip. The runner host must have
+  # passwordless ssh (key auth) to H1_TARGET_SSH and reachability to the smart plug.
+  H1_TARGET_SSH: ${{ vars.H1_TARGET_SSH }}
+  H1_WAL_DIR: ${{ vars.H1_WAL_DIR }}
+  H1_CONTROLLER_IP: ${{ vars.H1_CONTROLLER_IP }}
+  H1_BIN_DIR: ${{ vars.H1_BIN_DIR }}
+  H1_PLUG_IP: ${{ vars.H1_PLUG_IP }}
+  H1_PLUG_ID: ${{ vars.H1_PLUG_ID }}
+  H1_PLUG_TYPE: ${{ inputs.plug_type }}
+  H1_DUT_MEDIUM: ${{ inputs.dut_medium }}
+  H1_CYCLES: ${{ inputs.cycles }}
+  WAL_M8_EVIDENCE: ${{ github.workspace }}/m8-evidence/evidence-h1.json
+
+jobs:
+  h1:
+    name: H1 power-pull (≥50 cycles, zero acked loss — D1)
+    runs-on: [self-hosted, h1-rig]
+    # 50 cycles × (~commit window + off + boot + verify) plus INCONCLUSIVE re-runs.
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain (+ aarch64 target)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      # Rig availability: required config present AND the target reachable over ssh.
+      # Absent ⇒ loud OPEN skip (NOT a pass), mirroring the dm-flakey loud-skip.
+      - name: H1 rig availability
+        id: rig
+        run: |
+          missing=
+          for v in H1_TARGET_SSH H1_WAL_DIR H1_CONTROLLER_IP H1_PLUG_IP; do
+            [ -n "${!v:-}" ] || missing="$missing $v"
+          done
+          if [ -n "$missing" ]; then
+            echo "::warning title=H1 rig not configured::missing repo Variables:$missing — H1 stays OPEN-pending-owner-run (NOT a pass). Set them under Actions → Variables and wire the rig (docs/m8-runbook.md)."
+            echo "available=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if ! ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new "$H1_TARGET_SSH" true 2>/dev/null; then
+            echo "::warning title=H1 target unreachable::$H1_TARGET_SSH did not answer ssh — H1 stays OPEN (NOT a pass). Check wiring / passwordless key auth on the runner host."
+            echo "available=false" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          echo "available=true" >> "$GITHUB_OUTPUT"
+
+      - name: Cross-compile ARM workload/verify bins
+        if: steps.rig.outputs.available == 'true'
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: |
+          if ! command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
+            echo "::error title=cross linker missing::aarch64-linux-gnu-gcc not on the runner. Provision it (Debian/Ubuntu: 'sudo apt-get install -y gcc-aarch64-linux-gnu') or use 'cross'. See docs/m8-runbook.md → controller setup."
+            exit 1
+          fi
+          cargo build --release --target aarch64-unknown-linux-gnu \
+            --bin power_pull_workload --bin power_pull_verify
+
+      - name: Deploy bins + storage-check.sh to the target
+        if: steps.rig.outputs.available == 'true'
+        run: scripts/m8/h1-cycle.sh deploy
+
+      # The FULL campaign: §3.4 calibration GATE (abort if vacuous) → the ≥N-consecutive
+      # PASS cycle loop → emit the §5 ledger. h1-cycle.sh enforces every honesty rail.
+      # rc 0 = N consecutive PASS with H2 proven; anything else = vacuous calibration,
+      # a D1 FAIL, or an infra abort → red build (NOT a pass).
+      - name: H1 calibration + cycle loop
+        if: steps.rig.outputs.available == 'true'
+        run: |
+          set +e; scripts/m8/h1-cycle.sh run; rc=$?; set -e
+          case "$rc" in
+            0) echo "H1: ${H1_CYCLES} consecutive PASS with the §3.4 H2 probe proven (medium: ${H1_DUT_MEDIUM}).";;
+            *) echo "::error title=H1 FAIL/ABORT::h1-cycle.sh run exited ${rc} — read the evidence ledger: vacuous calibration (marker survived), a D1 FAIL (acked LSN lost — most likely a lying device, §3.6), or an infra abort. NOT a pass."; exit 1;;
+          esac
+
+      - name: Upload evidence ledger
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: m8-h1-evidence-${{ github.run_id }}
+          path: ${{ github.workspace }}/m8-evidence/**
+          if-no-files-found: ignore
+
+      # SIGN-OFF TRAIL: post the §5 ledger to #18 on this manual dispatch. The agent
+      # never self-certifies H1 — this is the OWNER's evidence; the OWNER closes #18.
+      - name: Post evidence to #18 (dispatch sign-off only)
+        if: always() && github.event_name == 'workflow_dispatch' && steps.rig.outputs.available == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          file="${{ github.workspace }}/m8-evidence/evidence-h1.json"
+          [ -e "$file" ] || { echo "no evidence at $file; skipping #18"; exit 0; }
+          { printf '**H1 power-pull** — automated M8 evidence (workflow_dispatch sign-off run #%s).\n\n' "$GITHUB_RUN_ID"
+            printf 'The agent never self-certifies H1; this is the OWNER sign-off trail. A PASS verdict is legitimate only when h2_probe is "PASS(marker gone)" and fail is 0. The OWNER reviews and closes #18.\n\n'
+            printf '```json\n'; cat "$file"; printf '\n```\n'; } > body.md
+          gh issue comment 18 --repo "$GITHUB_REPOSITORY" --body-file body.md

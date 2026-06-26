@@ -275,6 +275,80 @@ Each cycle (≥50×):
 **PASS the gate** only after **≥50 consecutive cycles with zero FAIL.** Record the
 device, cache mode, and cut mechanism.
 
+### Automated rig (`h1-cycle.sh` + `m8-h1.yml`)
+
+The manual loop above is fully automated by **`scripts/m8/h1-cycle.sh`** (orchestration
+on the controller) and **`.github/workflows/m8-h1.yml`** (`workflow_dispatch`-only, on a
+`[self-hosted, h1-rig]` runner). The script reuses the same binaries/scripts — it adds no
+`src/` code — and bakes in every honesty rail: the **§3.4 calibration gate runs first**,
+INCONCLUSIVE never counts, a FAIL stops the run, and `verdict=PASS` is emitted only when the
+H2 probe proved loss **and** `fail==0`.
+
+```bash
+scripts/m8/h1-cycle.sh config       # print the resolved config (touches no hardware)
+scripts/m8/h1-cycle.sh deploy       # scp the aarch64 bins + storage-check.sh to the target
+scripts/m8/h1-cycle.sh calibrate    # §3.4 vacuous-pass GATE (real cut; marker MUST be gone)
+scripts/m8/h1-cycle.sh cycle        # the ≥N-consecutive-PASS loop
+scripts/m8/h1-cycle.sh run          # (default) calibrate → cycle → emit §5 evidence
+```
+
+Config is via env (see `config` for the full list): `H1_TARGET_SSH`, `H1_WAL_DIR` (the DUT
+partition), `H1_DUT_MEDIUM`, `H1_CONTROLLER_IP`, `H1_PORT` (9099), `H1_PLUG_TYPE`/`H1_PLUG_IP`,
+`H1_CYCLES` (50), `H1_WORKLOAD_SECS`, `H1_OFF_SECS`, `H1_BOOT_TIMEOUT`, `H1_INFRA_FAIL_MAX`.
+`H1_PLUG_DRY_RUN=1` echoes the cut URL instead of curling it (for a no-hardware dry run).
+
+**Smart-plug driver (pluggable).** The cut is a real mains interrupt via a plug with a
+**local** HTTP API (cloud-only plugs are unusable):
+
+| `H1_PLUG_TYPE` | OFF / ON request |
+|---|---|
+| `shelly` (Gen2/Gen3/Plus RPC — **default; the Shelly Plug S Gen3**; aliases `shelly-gen2`/`shelly-gen3`) | `GET /rpc/Switch.Set?id=<id>&on=false` / `on=true` |
+| `shelly-gen1` (legacy) | `GET /relay/0?turn=off` / `turn=on` |
+| `tasmota` | `GET /cm?cmnd=Power%20Off` / `Power%20On` |
+
+A toggle that silently no-ops is caught downstream: after a cut the target **must** go away
+and come back, so the post-cut boot-wait fails the cycle (INCONCLUSIVE) rather than passing
+vacuously.
+
+**CI usage.** Trigger **`m8-h1.yml`** manually (`workflow_dispatch`); it cross-compiles the
+ARM bins, `deploy`s, runs the calibration + cycle loop, uploads the §5 evidence artifact, and
+posts the ledger to **#18**. Rig config comes from repo **Variables** (`H1_TARGET_SSH`,
+`H1_WAL_DIR`, `H1_CONTROLLER_IP`, `H1_PLUG_IP`, …); if they're unset or the target is
+unreachable the job **loud-skips** (OPEN, not a pass). Green = the configured `cycles`
+consecutive PASS with the H2 probe proven; red = a D1 FAIL or an aborted (vacuous) calibration.
+**The agent never self-certifies H1 — the OWNER reviews the evidence and closes #18.**
+
+### Rig setup (target + controller)
+
+**Target — the thing that gets cut** (Raspberry Pi 3 by default; BeagleBone Black and a
+USB-SSD are the other two DUT media):
+- 64-bit Pi OS, **wired Ethernet** (Wi-Fi reassociation adds side-channel/ssh latency).
+- **Read-only rootfs (overlayfs)** via `raspi-config` → Performance → Overlay FS. Essential:
+  repeatedly power-cutting a *writable* rootfs corrupts the OS within a handful of cycles;
+  the overlay lets the OS survive indefinitely.
+- A **dedicated writable ext4 partition** is the DUT (`H1_WAL_DIR` lives here) — the only
+  thing exposed to the cut's writes. Pass the **H2 empirical probe** on it once (the
+  `calibrate` step does this automatically each run).
+- For the **BeagleBone** target: boot its rootfs from a microSD with the same read-only
+  overlay and put the WAL on a **dedicated eMMC partition** (the eMMC is the DUT, not the OS).
+- For the **USB-SSD** target: a cheap USB 3.0 SSD on the Pi; note in the evidence that
+  consumer USB-SSDs without PLP may lie about flushes (that's a §3.6 *finding*, not a WAL bug).
+- Passwordless ssh (key auth) from the controller. DUT media are consumables — keep spares
+  and a pre-imaged boot card (a mid-write cut can brick a card; treat that as a device-honesty
+  finding).
+
+**Controller — the laptop that is NEVER cut:**
+- Hosts the GitHub **self-hosted runner** labelled `h1-rig`, the **off-box collector**
+  (`h1-cycle.sh` starts socat/ncat/nc on `H1_PORT`), and the **smart-plug driver**.
+- Cross-compiles the ARM bins: `rustup target add aarch64-unknown-linux-gnu` + a linker
+  (`gcc-aarch64-linux-gnu`, env `CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc`),
+  or use `cross`. Do **not** build on the Pi (slow; the runner must control versions).
+
+**Power wiring.** A small **power strip** feeds dedicated 5 V supplies for each board (Pi 3:
+5.1 V/3 A micro-USB; BeagleBone: 5 V/2 A barrel, center-positive); plug the strip into the
+**smart plug**. One toggle cuts both boards. **Cut at mains, never the laptop** — the laptop's
+battery means a "cut" isn't one.
+
 ### Cut mechanisms and their fidelity
 
 | Mechanism | Fidelity | Notes |
@@ -285,7 +359,9 @@ device, cache mode, and cut mechanism.
 | `reboot` / `shutdown` | **NOT VALID** | graceful; flushes caches. |
 
 **Status: OPEN-pending-owner-run** on real (or properly cache-configured virtual)
-hardware.
+hardware. The automated rig (`scripts/m8/h1-cycle.sh` + `.github/workflows/m8-h1.yml`)
+is **built and lint-clean**; it stays OPEN until the owner triggers it on a wired rig,
+observes ≥50 PASS with the H2 probe proven, and closes #18. The agent never self-certifies H1.
 
 ---
 
