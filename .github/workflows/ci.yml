@@ -65,6 +65,33 @@ jobs:
       - name: check
         run: cargo check --all-targets --locked
 
+  fuzz-smoke:
+    # M9 F1 (§14.5): a SHORT per-PR smoke of the recovery-parser fuzz target.
+    # This lane is real and BLOCKING — a reproducible crash here is a genuine D11
+    # bug and must red the PR (not advisory). It is distinct from the time-boxed
+    # nightly fuzz lane (fuzz.yml) and from any H1 sign-off: M9 fuzz findings gate
+    # M9-relevant PRs; they never red an H1 dispatch run. The full N-CPU-hour
+    # §14.13 release gate runs on a dedicated runner, not here.
+    name: F1 fuzz smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            fuzz
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: Build F1
+        run: cargo +nightly fuzz build recovery
+      - name: Smoke run (bounded; a crash reds the PR)
+        run: cargo +nightly fuzz run recovery -- -runs=20000 -rss_limit_mb=4096
+
   dirfsync-presence:
     # M8 §14.4d Tier 1 (PRIMARY): the deterministic, FS-independent regression
     # guard for the roll-time directory fsync (§7.4 step 5). It straces the roll

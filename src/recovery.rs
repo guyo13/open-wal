@@ -182,13 +182,33 @@ fn forward_scan_finds_valid(
     expected: Lsn,
     buf: &mut Vec<u8>,
 ) -> Result<bool> {
-    let bound = u64::from(ctx.max_record_size) + 28;
+    let bound = scan_bound(ctx.max_record_size);
     // Inclusive: candidate start offsets are `X+8 .. X+8+bound`, i.e. distance
     // ≤ `max_record_size + 28` from `X+8` — the largest a single record's frame
     // can be, so the next genuine record (if any) starts within this window.
-    let end = x.saturating_add(8).saturating_add(bound);
-    let mut p = x.saturating_add(8);
+    let start = x.saturating_add(8);
+    let end = start.saturating_add(bound);
+    let mut p = start;
     while p <= end {
+        // M9 F1 / D11 — bounded-scan instrumentation. The §14.13 release gate is
+        // "the bounded-scan counter never exceeds the bound". The probe and the
+        // tripwire run on the REAL production loop (not a harness copy) and are
+        // asserted against `scan_bound(..)` — the SAME symbol that bounds `end`
+        // above — so a future change that let the loop scan past the bound trips
+        // the `assert!` here even if the local `bound`/`end` were edited. Compiled
+        // out of a normal build by the `fuzzing` feature gate (zero release cost).
+        #[cfg(feature = "fuzzing")]
+        {
+            let distance = p - start;
+            scan_probe::record(distance);
+            assert!(
+                distance <= scan_bound(ctx.max_record_size),
+                "forward scan exceeded its bound: distance {distance} > {} \
+                 (max_record_size {})",
+                scan_bound(ctx.max_record_size),
+                ctx.max_record_size,
+            );
+        }
         if let ScanOutcome::Record { lsn, .. } =
             segment::read_record_at(file, p, ctx.segment_size, ctx.max_record_size, buf)?
         {
@@ -199,6 +219,53 @@ fn forward_scan_finds_valid(
         p += 8;
     }
     Ok(false)
+}
+
+/// The bounded forward-scan distance limit (§8.2 step 5): the largest frame a
+/// single record can occupy — `max_record_size` payload + the 20-byte record
+/// header + up to 7 padding bytes + 1 — so the next genuine record after a gap
+/// must begin within this many bytes of `X+8`. Hoisted into one symbol so the
+/// scan loop's window (`end`) and the M9 fuzz instrumentation's assertion share
+/// a **single source of truth** and cannot drift under a future bound change
+/// (M9 F1 / D11).
+#[inline]
+pub(crate) fn scan_bound(max_record_size: u32) -> u64 {
+    u64::from(max_record_size) + 28
+}
+
+/// Thread-local instrumentation of the bounded forward scan, compiled in only
+/// under the `fuzzing` feature for the M9 F1 cargo-fuzz target (§14.5). Records
+/// the peak scan distance (bytes from `X+8`) so a fuzz harness can assert it
+/// never exceeds [`scan_bound`] after driving the real recovery path. The
+/// in-loop `assert!` in [`forward_scan_finds_valid`] is the primary tripwire;
+/// this peak is the harness-readable corroboration. Single-writer recovery is
+/// single-threaded, so a thread-local is sufficient and lock-free.
+#[cfg(feature = "fuzzing")]
+pub(crate) mod scan_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static PEAK: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// Reset the peak before a recovery run the harness wants to bound-check.
+    pub(crate) fn reset() {
+        PEAK.with(|p| p.set(0));
+    }
+
+    /// The largest scan distance observed since the last [`reset`].
+    pub(crate) fn peak() -> u64 {
+        PEAK.with(Cell::get)
+    }
+
+    /// Record one observed scan distance, keeping the running maximum.
+    pub(crate) fn record(distance: u64) {
+        PEAK.with(|p| {
+            if distance > p.get() {
+                p.set(distance);
+            }
+        });
+    }
 }
 
 #[cfg(test)]

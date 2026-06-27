@@ -1,0 +1,41 @@
+# cargo-fuzz crate for the M9 fuzz targets (§14.5). This is a SEPARATE package
+# from `open-wal`, not a workspace member of it and never published — it exists
+# only to host the libFuzzer targets. It depends on `open-wal` via a path
+# dependency with the `fuzzing` feature, which exposes the internal parse entry
+# points and compiles in the bounded-forward-scan instrumentation.
+#
+# Build/run with the nightly toolchain: `cargo +nightly fuzz run recovery`.
+[package]
+name = "open-wal-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Detach from the parent directory: this crate is its own (single-package)
+# workspace, so it does not get pulled into — or pull in — the `open-wal` build
+# graph except through the explicit path dependency below.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+tempfile = "3"
+
+[dependencies.open-wal]
+path = ".."
+features = ["fuzzing"]
+
+# Keep enough debug info for symbolized crash stacks without a fully unoptimized
+# (slow) fuzzer, per the cargo-fuzz default.
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "recovery"
+path = "fuzz_targets/recovery.rs"
+test = false
+doc = false
+bench = false

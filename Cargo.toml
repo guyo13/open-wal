@@ -27,6 +27,14 @@ exclude = ["src/bin"]
 # build. See docs/m8-runbook.md §14.4d.
 inject_no_dir_fsync = []
 
+# M9 (§14.5): expose the internal parse entry points (the `fuzzing` module in
+# `src/lib.rs`) and compile in the bounded-forward-scan instrumentation (the
+# thread-local scan probe + in-loop `assert!` in `src/recovery.rs`) for the
+# cargo-fuzz targets in `fuzz/`. Test/fuzz-only and zero-cost when off — the
+# probe and the `#[doc(hidden)]` module compile out of a normal build. NEVER
+# enable in a real build.
+fuzzing = []
+
 [dependencies]
 # Castagnoli CRC-32C (hardware-accelerated, software fallback). NOT crc32fast,
 # which uses the ISO-HDLC/zlib polynomial (§5, §16 of docs/wal_design_v6.md).
