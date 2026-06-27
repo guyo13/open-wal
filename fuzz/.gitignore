@@ -1,0 +1,7 @@
+# cargo-fuzz build + coverage artifacts (regenerated locally / in CI).
+/target
+/coverage
+/Cargo.lock
+
+# Keep the seed corpus (corpus/<target>/) and crash regression seeds
+# (artifacts/<target>/) tracked — they are the §14.13 release-gate evidence.

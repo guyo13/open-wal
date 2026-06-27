@@ -1,0 +1,54 @@
+# open-wal fuzz targets (M9, §14.5)
+
+cargo-fuzz / libFuzzer targets that drive the recovery parser and codec with
+adversarial input to prove **D11** (bounded recovery: terminate, never panic /
+OOB / unbounded-alloc / unbounded-scan for *any* input bytes) and the
+tail-vs-corruption classifier (D4/D5/D10).
+
+## Targets
+
+| Target | Slice | What it fuzzes |
+|---|---|---|
+| `recovery` | F1 | A whole **directory of segment files** (adversarial filenames + `base_lsn`s) driven through the real public `Wal::open`, plus a secondary single-file `recover_segment` probe. Asserts the bounded forward scan never exceeds `scan_bound(max_record_size)`. |
+
+F2 (decoder), F3 (structure-aware), and F4 (op-script oracle) land in later
+slices.
+
+## Running
+
+Requires the nightly toolchain and `cargo-fuzz` (`cargo install cargo-fuzz`).
+
+```bash
+# Build all targets (link-checks the libFuzzer harness).
+cargo +nightly fuzz build
+
+# Short smoke run.
+cargo +nightly fuzz run recovery -- -runs=100000
+
+# Long run (the §14.13 release gate: N CPU-hours, zero crashes, bounded-scan
+# counter never exceeded since the last parser/format change).
+cargo +nightly fuzz run recovery
+```
+
+The crate depends on `open-wal` with the `fuzzing` feature, which exposes the
+internal parse entry points (the `open_wal::fuzzing` module) and compiles in the
+bounded-scan instrumentation. **The public `Wal::open` is the primary surface
+under test**; the re-exported helpers are for the secondary direct-probe mode and
+for generating valid input bytes.
+
+## Corpus
+
+`corpus/<target>/` holds the seed corpus. The committed seeds are small varied
+byte strings — because inputs are `arbitrary`-decoded into a scenario, *any*
+bytes are a valid (total) input, so these are just starting points; real coverage
+accretes from running. **A reproducible crash input is gold**: minimize it
+(`cargo +nightly fuzz cmin` / `tmin`) and commit it into `corpus/<target>/` (or
+`artifacts/<target>/`) as a regression seed, then fix the underlying bug — never
+tune the test to hide it.
+
+## CI
+
+`.github/workflows/fuzz.yml` runs the targets time-boxed on a schedule / manual
+dispatch (informational until the N-CPU-hour gate is met on a dedicated runner —
+the same honest stopgap as the LazyFS/dm-flakey gates). A short per-PR smoke in
+`ci.yml` reds a PR on any reproducible crash (a real D11 bug).

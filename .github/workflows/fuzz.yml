@@ -1,0 +1,71 @@
+name: Fuzz (M9)
+
+# §14.5 fuzz targets (F1–F4). Time-boxed on a schedule + manual dispatch — NOT
+# per-PR (the per-PR lane runs a short smoke in ci.yml). This is the same honest
+# stopgap as the LazyFS / dm-flakey gates: the §14.13 release gate is "N CPU-hours
+# since the last parser/format change, zero outstanding crashes, bounded-scan
+# counter never exceeded", which a hosted runner's short nightly slice does NOT
+# meet — so a green run here is CONTINGENT, not the gate. A crash, however, is a
+# real D11/D4/D5 bug and reds this run loudly.
+on:
+  schedule:
+    # Nightly at 04:17 UTC (offset from other nightly jobs).
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+    inputs:
+      max_total_time:
+        description: "Seconds to run each fuzz target"
+        required: false
+        default: "300"
+
+concurrency:
+  group: fuzz-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: fuzz ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # F2–F4 are appended here as their slices land.
+        target: [recovery]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            fuzz
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      - name: Build target
+        run: cargo +nightly fuzz build ${{ matrix.target }}
+      - name: Run target (time-boxed)
+        env:
+          MAX_TOTAL_TIME: ${{ github.event.inputs.max_total_time || '300' }}
+        run: |
+          echo "::notice::Fuzzing '${{ matrix.target }}' for ${MAX_TOTAL_TIME}s."
+          echo "::warning::Time-boxed CONTINGENT run, NOT the §14.13 release gate (N CPU-hours since last parser/format change). Green here does not satisfy the gate; a crash is a real bug."
+          cargo +nightly fuzz run "${{ matrix.target }}" -- -max_total_time="${MAX_TOTAL_TIME}" -rss_limit_mb=4096
+      - name: Upload corpus + crash artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-${{ matrix.target }}-${{ github.run_id }}
+          path: |
+            fuzz/corpus/${{ matrix.target }}
+            fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore
+          retention-days: 14
