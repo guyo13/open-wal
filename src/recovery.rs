@@ -612,6 +612,57 @@ mod tests {
     }
 
     #[test]
+    fn rec_type_zeroed_interior_is_fatal_tornmidlog() {
+        // issue #26 (D3/D5): a single-bit corruption of an INTERIOR record's
+        // `rec_type` byte (1→0) must NOT be mistaken for the end-of-records
+        // sentinel. The CRC covers `rec_type`, so the record fails the CRC check;
+        // with a valid record still after it, recovery is fatal `TornMidLog` —
+        // never a silent truncation that would drop the following acked records.
+        // (The sentinel is recognized only by an all-zero header, not `rec_type==0`
+        // alone — that short-circuit was the D3/D5 hole F3 found.)
+        let dir = tempfile::tempdir().unwrap();
+        let file = fresh_segment(dir.path(), Lsn(1));
+        write_dense(&file, Lsn(1), &[b"one", b"two", b"three"]);
+        // Offset of the SECOND record (LSN 2); record 3 stays valid after it.
+        let x = HEADER_SIZE + record::framed_size(3) as u64;
+        // Zero the rec_type byte WITHOUT recomputing the CRC ⇒ crc ≠ 0 (models the
+        // single-bit flip; the header is NOT all-zero, so it is not a sentinel).
+        file.write_all_at(&[0u8], x + 16).unwrap();
+        file.sync_data().unwrap();
+
+        let err = recover_segment(&file, Lsn(1), true, SEGMENT_SIZE, MAX_RECORD_SIZE).unwrap_err();
+        assert!(
+            matches!(err, WalError::TornMidLog { segment, offset } if segment == Lsn(1) && offset == x),
+            "interior rec_type→0 corruption must be fatal TornMidLog at {x}, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rec_type_zeroed_at_tail_is_torn_tail_and_zeroed() {
+        // issue #26 (D4/D10): the same `rec_type`→0 corruption on the LAST record
+        // is a torn tail — truncate at its offset, durable LSN at the prior record,
+        // and the region is durably zeroed so a reopen is clean and idempotent.
+        let dir = tempfile::tempdir().unwrap();
+        let file = fresh_segment(dir.path(), Lsn(1));
+        write_dense(&file, Lsn(1), &[b"first", b"second"]);
+        // Offset of the SECOND (last) record (LSN 2).
+        let x = HEADER_SIZE + record::framed_size(5) as u64;
+        file.write_all_at(&[0u8], x + 16).unwrap();
+        file.sync_data().unwrap();
+
+        let rec = recover_segment(&file, Lsn(1), true, SEGMENT_SIZE, MAX_RECORD_SIZE).unwrap();
+        assert_eq!(rec.max_lsn, Lsn(1));
+        assert_eq!(rec.write_offset, x);
+        assert!(matches!(rec.tail_state, TailState::TruncatedAt { offset, .. } if offset == x));
+
+        // D10: the tail was durably zeroed ⇒ a second recovery is clean and stable.
+        let again = recover_segment(&file, Lsn(1), true, SEGMENT_SIZE, MAX_RECORD_SIZE).unwrap();
+        assert_eq!(again.max_lsn, Lsn(1));
+        assert_eq!(again.write_offset, x);
+        assert_eq!(again.tail_state, TailState::Clean);
+    }
+
+    #[test]
     fn arbitrary_bytes_never_panic_and_terminate() {
         // Interim D11 coverage (the libFuzzer F1 target is M9): overwrite the
         // record region with deterministic pseudo-random bytes and assert

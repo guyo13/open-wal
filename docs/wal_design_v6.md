@@ -11,6 +11,7 @@
 
 Normative corrections surfaced while implementing M3 (intra-segment recovery) and M4 (multi-segment), plus M6/M7 testing-status annotations; no contract section changes.
 
+- **§8.2 step 1 / §5.3 / §5.4 / §4 D5 — the end-of-records sentinel is now recognized by an ALL-ZERO header, not `rec_type == 0` alone (closes a D3/D5 silent-truncation hole).** `record::decode` returned `Sentinel` on `rec_type == 0` *before* the CRC check, so a single-bit corruption of an **interior** record's `rec_type` byte (`1`→`0`) was mistaken for the sentinel and **silently dropped every acked record after it** (`durable_lsn` rewound) — violating **D3** (no loss ≤ a returned `durable_lsn`) and **D5** (mid-log corruption must be fatal). The fix recognizes a sentinel only on a full all-zero 20-byte header; a `rec_type == 0` record with a non-zero CRC now fails the CRC check and is classified as mid-log corruption (fatal `TornMidLog`) or, at the tail, a torn tail (D4). A genuine sentinel (pre-allocated zero region / §8.2.1 post-truncation zeroing) is always all-zero, so nothing legitimate is lost. **Found by the M9 F3 structure-aware fuzzer** (issue #26); regression-tested at interior (D5) and tail (D4/D10) positions. (Found and fixed during M9.)
 - **§6.2 — added an integrator note on transient `Locked` after a writer crash (additive clarification, no contract change).** A dead writer's `flock` is released during process teardown, which can lag the process's exit, so a crash-recovery reopen may briefly see a spurious `Locked`. The note tells integrators to tolerate a bounded transient `Locked` on the recovery reopen (short retry) and treat only a persistent `Locked` as a real concurrent-writer error — observable POSIX semantics, exercised by the §14.4a process-crash tests' bounded-retry reopen. (Surfaced while fixing an M7 CI flake; integrator guidance, not a behavior change.)
 
 - **§14.7 (performance & regression) — IMPLEMENTED in M7; the regression-gate CI *enforcement* is OPEN-pending-controlled-runner.** Added the M7 status block to §14.7, the per-PR/nightly split to §14.11, and the M7 note to the §14.13 zero-alloc DoD row. `benches/wal.rs` implements the four criterion groups (throughput / commit-latency / recovery / split-batch) over the public API against a real `fdatasync`; since criterion reports no arbitrary percentiles, the commit-latency tail (p50/p99/p999) comes from an `hdrhistogram` persisted to `target/perf/`. `tests/zero_alloc.rs` is hardened (proves no-roll in the measured window via segment-file count + `durable_lsn` advance; adds a `max_record_size` variant). `scripts/perf-gate.sh` implements the >10% throughput/median-time and >20% p999 thresholds (median, not the outlier-sensitive mean, from criterion `estimates.json`; p999 from the histogram JSON) and was shown to flag an injected regression. Per the line's own "pin CPU governor", enforcement is real on a controlled runner; on hosted CI the gate runs **informational** (`bench.yml`, `continue-on-error`) like the LazyFS gate — a stopgap, not a downgrade. No `src/` change; testing-status annotations only. (Added during M7 implementation.)
@@ -140,7 +141,7 @@ Each invariant maps to tests in §14. All MUST hold on honest hardware (§8.3, �
 - **D2 — Dense, gap-free surviving suffix.** At all times the durable content is a contiguous run of LSNs `P..=k`, where `P` is the `base_lsn` of the *oldest surviving segment* (`P = 1` until the first checkpoint). Recovery MUST never produce an *internal* gap (a missing LSN between `P` and `k`). Recovery does **not**, and by design **cannot**, distinguish an authorized prefix deletion (`P > 1` via checkpoint) from an unauthorized one; preventing unauthorized deletion is the integrator's responsibility, anchored by its durable snapshot.
 - **D3 — At-most-tail loss on crash.** A crash MAY lose only records appended but not yet covered by a returned `commit()`. It MUST NOT lose any record `≤` the last returned `durable_lsn`.
 - **D4 — Torn-tail truncation.** A partial/torn write at the physical tail MUST be detected (length bounds + CRC) and cleanly truncated; the truncated region MUST be invalidated per §8.2. A torn record MUST NOT be surfaced as valid.
-- **D5 — Mid-log corruption is fatal, not silent.** A corrupt record that is *not* the tail (a structurally valid record with the correct next LSN exists after it, within the bounded scan window) MUST cause recovery to halt with a distinct, loud error. It MUST NOT be silently truncated (that would discard acknowledged data).
+- **D5 — Mid-log corruption is fatal, not silent.** A corrupt record that is *not* the tail (a structurally valid record with the correct next LSN exists after it, within the bounded scan window) MUST cause recovery to halt with a distinct, loud error. It MUST NOT be silently truncated (that would discard acknowledged data). This is why the end-of-records sentinel is recognized only by an **all-zero header**, not `rec_type == 0` alone (§8.2 step 1): the CRC covers `rec_type`, so a corruption that zeroes an interior record's `rec_type` byte must fail the CRC and be classified as mid-log corruption, not mistaken for the sentinel.
 - **D6 — Read-back fidelity.** Replay MUST return exactly the records appended, in LSN order, byte-identical payloads.
 - **D7 — Idempotent recovery.** open→use→close→open→… converges; recovery is deterministic and repeated cycles do not change recovered content or tail state.
 - **D8 — Checkpoint safety.** `checkpoint(up_to)` MUST NOT remove any record with `lsn > up_to`, MUST NOT make any retained record unreadable, and MUST preserve D2 over the retained suffix.
@@ -200,7 +201,7 @@ Records follow the segment header, contiguously.
 | 0 | 4 | `crc` | CRC-32C over bytes `[4, 4 + 16 + length + pad)` — i.e. the rest of the header, the payload, **and** the alignment padding |
 | 4 | 4 | `length` | `u32`, payload length |
 | 8 | 8 | `lsn` | `u64` |
-| 16 | 1 | `rec_type` | `1 = Full`; `0` = zero/sentinel (never a real record); `2..` reserved for future fragmentation |
+| 16 | 1 | `rec_type` | `1 = Full`; `0` = zero (never a real record; the end-of-records sentinel is an **all-zero header**, not `rec_type == 0` alone — §8.2 step 1, §5.4); `2..` reserved for future fragmentation |
 | 17 | 1 | `rflags` | reserved, MUST be 0 |
 | 18 | 2 | `reserved` | MUST be 0 |
 | 20 | `length` | `payload` | opaque caller bytes |
@@ -219,7 +220,7 @@ Records follow the segment header, contiguously.
 ### 5.4 Pre-allocation and the zero region
 
 - On creation a segment is pre-allocated to `segment_size` (`fallocate` / `F_PREALLOCATE`), so the unwritten remainder is zero-filled.
-- A `rec_type == 0` / all-zero record header during scan is the **end-of-records sentinel** for a partially-filled or cleanly-rolled segment.
+- An **all-zero 20-byte record header** during scan is the **end-of-records sentinel** for a partially-filled or cleanly-rolled segment. It is recognized by the *whole* header being zero, **not** by `rec_type == 0` alone (a `rec_type == 0` header with a non-zero CRC is a corrupt record, classified per §8.2 step 5 — see §8.2 step 1).
 
 ---
 
@@ -373,7 +374,7 @@ Runs in `open`, single-threaded, before any append.
 Scan each segment from offset 64, tracking `expected_next_lsn`.
 
 For each record:
-1. If `< 20` bytes remain or `rec_type == 0` / all-zero header ⇒ **end of this segment's records.**
+1. If `< 20` bytes remain ⇒ **end of this segment's records.** Otherwise the end-of-records **sentinel** is an **all-zero 20-byte header** (`rec_type == 0` **and** the remaining header bytes — CRC, `length`, `lsn`, reserved — all zero); a header that matches the sentinel ⇒ **end of this segment's records.** A record with `rec_type == 0` but a **non-zero CRC** is **not** a sentinel: it is an `Invalid` record subject to the step-5 tail-vs-corruption classification. (Rationale: the CRC covers `rec_type`, so a corruption of an interior record's `rec_type` to `0` MUST surface as fatal mid-log corruption — D5; recognizing the sentinel by `rec_type == 0` alone bypasses the CRC and is a D3/D5 silent-truncation hole. A genuine sentinel only ever arises from the pre-allocated zero region or the §8.2.1 post-truncation zeroing, both all-zero.)
 2. Bound `length`: if `length > max_record_size` **or** `20 + length + pad > remaining_segment_bytes` ⇒ record invalid at this offset (candidate boundary; step 5).
 3. Read payload + padding. Short read ⇒ invalid (step 5).
 4. Compute CRC-32C over `[4, 4+16+length+pad)`; compare to `crc`. Check `lsn == expected_next_lsn`. Either mismatch ⇒ invalid (step 5).

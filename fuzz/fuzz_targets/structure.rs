@@ -39,7 +39,8 @@ enum Mutation {
     FlipCrc,
     /// Flip a CRC-covered body byte ⇒ invalid record.
     FlipBody,
-    /// Zero the `rec_type` byte ⇒ a sentinel (clean end of records), NOT invalid.
+    /// Zero the `rec_type` byte ⇒ a corruption the CRC catches (no longer a
+    /// sentinel; a genuine sentinel is an all-zero header — issue #26). Invalid.
     ZeroRecType,
     /// Enlarge the `length` field ⇒ CRC mismatch / overrun ⇒ invalid record.
     ExtendLength,
@@ -51,10 +52,14 @@ enum Mutation {
 }
 
 impl Mutation {
-    /// Whether this mutation makes the record *invalid* (a corruption boundary)
-    /// as opposed to turning it into a *sentinel* (clean end).
+    /// Whether this mutation makes the record *invalid* (a corruption boundary).
+    /// After the issue #26 fix the sentinel is recognized only by an all-zero
+    /// header, so `ZeroRecType` (zeroing only the `rec_type` byte) leaves a CRC
+    /// mismatch the classifier catches — i.e. **every** mutation here now
+    /// invalidates the record. Kept as a method for the oracle's structure and any
+    /// future non-invalidating mutation.
     fn invalidates(self) -> bool {
-        !matches!(self, Mutation::ZeroRecType)
+        true
     }
 }
 
@@ -165,32 +170,27 @@ fuzz_target!(|s: Scenario| {
             assert_eq!(report2.tail_state, TailState::Clean, "D7/D10: reopen tail not clean");
 
             // ---- sharp classifier oracle ----
+            // Every mutation in the menu invalidates the target record (post
+            // issue #26, `ZeroRecType` is a CRC-caught corruption too — see
+            // `Mutation::invalidates`). An invalid record that nonetheless returned
+            // Ok can ONLY be the LAST record (interior corruption is fatal and is
+            // handled in the Err arm); it must be a torn-tail truncation at its
+            // offset (D4/D5).
             if let Some(m) = mutated_index {
                 let (off_m, _, _) = recs[m];
-                if s.mutation.invalidates() {
-                    // An invalid record that returned Ok can ONLY be the last
-                    // record (interior corruption is fatal — handled in Err arm).
-                    assert_eq!(m, n - 1, "D5: interior corruption returned Ok (silent truncation!)");
-                    assert_eq!(
-                        report.durable_lsn.0,
-                        base + m as u64 - 1,
-                        "D4: torn-tail durable_lsn wrong"
-                    );
-                    match report.tail_state {
-                        TailState::TruncatedAt { segment_base, offset } => {
-                            assert_eq!(segment_base, Lsn(base));
-                            assert_eq!(offset, off_m as u64, "D4: truncation offset wrong");
-                        }
-                        TailState::Clean => panic!("D4: corrupt last record not reported as truncated"),
+                assert!(s.mutation.invalidates());
+                assert_eq!(m, n - 1, "D5: interior corruption returned Ok (silent truncation!)");
+                assert_eq!(
+                    report.durable_lsn.0,
+                    base + m as u64 - 1,
+                    "D4: torn-tail durable_lsn wrong"
+                );
+                match report.tail_state {
+                    TailState::TruncatedAt { segment_base, offset } => {
+                        assert_eq!(segment_base, Lsn(base));
+                        assert_eq!(offset, off_m as u64, "D4: truncation offset wrong");
                     }
-                } else {
-                    // ZeroRecType ⇒ sentinel at m ⇒ clean end there.
-                    assert_eq!(
-                        report.durable_lsn.0,
-                        base + m as u64 - 1,
-                        "sentinel at record {m}: durable_lsn wrong"
-                    );
-                    assert_eq!(report.tail_state, TailState::Clean, "sentinel ⇒ clean tail");
+                    TailState::Clean => panic!("D4: corrupt last record not reported as truncated"),
                 }
             }
         }

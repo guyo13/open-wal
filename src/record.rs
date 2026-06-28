@@ -11,7 +11,7 @@
 //! | 0 | 4 | `crc` | CRC-32C over `[4, 4 + 16 + length + pad)` — header tail, payload, **and** padding |
 //! | 4 | 4 | `length` | `u32` payload length |
 //! | 8 | 8 | `lsn` | `u64` |
-//! | 16 | 1 | `rec_type` | `1` = Full; `0` = sentinel (never a real record); `2..` reserved |
+//! | 16 | 1 | `rec_type` | `1` = Full; `0` = zero (never a real record; the sentinel is an **all-zero header**, not `rec_type == 0` alone — §8.2 step 1); `2..` reserved |
 //! | 17 | 1 | `rflags` | reserved, 0 |
 //! | 18 | 2 | `reserved` | 0 |
 //! | 20 | `length` | `payload` | opaque caller bytes |
@@ -101,8 +101,10 @@ pub(crate) enum Decoded<'a> {
         /// advances its scan offset by this amount.
         framed_len: usize,
     },
-    /// A `rec_type == 0` header: the end-of-records sentinel / pre-allocated zero
-    /// region (§5.4). Not a record.
+    /// An **all-zero 20-byte header**: the end-of-records sentinel / pre-allocated
+    /// zero region (§5.4 / §8.2 step 1). Recognized by the *whole* header being
+    /// zero, not `rec_type == 0` alone (a `rec_type == 0` header with a non-zero
+    /// CRC is a corrupt record — `Invalid`, issue #26). Not a record.
     Sentinel,
     /// Fewer bytes than a full header, or the framed record would overrun the
     /// slice. At a physical tail this is a short/torn write; the codec does not
@@ -202,10 +204,17 @@ pub(crate) fn decode(buf: &[u8], max_record_size: u32) -> Decoded<'_> {
         return Decoded::Incomplete;
     }
 
-    // rec_type == 0 is the end-of-records sentinel regardless of the other
-    // (zeroed) header bytes (§8.2 step 1).
+    // The end-of-records sentinel is an ALL-ZERO 20-byte header (§8.2 step 1),
+    // not `rec_type == 0` alone. The CRC covers `rec_type`, so a corruption of an
+    // interior record's `rec_type` to 0 MUST fail the CRC and be classified as
+    // mid-log corruption (fatal `TornMidLog`, D5) — never mistaken for the
+    // sentinel, which would silently drop the following acked records (a D3/D5
+    // hole; issue #26). A genuine sentinel only ever arises from the pre-allocated
+    // zero region or the §8.2.1 post-truncation zeroing, both all-zero, so this
+    // loses nothing legitimate. The `rec_type == 0` test short-circuits first, so
+    // the common Full-record path (`rec_type == 1`) stays a single byte compare.
     let rec_type = buf[REC_TYPE_OFF];
-    if rec_type == REC_TYPE_SENTINEL {
+    if rec_type == REC_TYPE_SENTINEL && buf[..RECORD_HEADER_SIZE].iter().all(|&b| b == 0) {
         return Decoded::Sentinel;
     }
 
@@ -397,12 +406,29 @@ mod tests {
 
     #[test]
     fn sentinel_header_detected() {
-        // rec_type == 0 ⇒ Sentinel, even with otherwise garbage bytes.
-        let mut buf = vec![0xFFu8; RECORD_HEADER_SIZE];
-        buf[REC_TYPE_OFF] = REC_TYPE_SENTINEL;
-        assert!(matches!(decode(&buf, MAX), Decoded::Sentinel));
+        // The sentinel is recognized only by an ALL-ZERO 20-byte header (§8.2 step
+        // 1 / issue #26), NOT `rec_type == 0` alone. The CRC covers `rec_type`, so
+        // a real record whose `rec_type` byte is zeroed (single-bit flip, CRC not
+        // recomputed) must decode as `Invalid(BadCrc)`, never a `Sentinel` — this
+        // is what keeps a `rec_type`→0 corruption of an interior record fatal (D5)
+        // instead of a silent truncation (D3).
+        let mut buf = Vec::new();
+        encode_into(&mut buf, Lsn(1), &[0xAB, 0xCD]);
+        buf[REC_TYPE_OFF] = REC_TYPE_SENTINEL; // 1 → 0, leaving the stale (non-zero) CRC
+        assert!(matches!(
+            decode(&buf, MAX),
+            Decoded::Invalid(DecodeError::BadCrc)
+        ));
 
-        // The all-zero pre-allocated region is also a sentinel.
+        // An arbitrary non-all-zero header with `rec_type == 0` is likewise NOT a
+        // sentinel (here the `0xFF` length trips the length bound first — still
+        // `Invalid`, never `Sentinel`).
+        let mut garbage = vec![0xFFu8; RECORD_HEADER_SIZE];
+        garbage[REC_TYPE_OFF] = REC_TYPE_SENTINEL;
+        assert!(matches!(decode(&garbage, MAX), Decoded::Invalid(_)));
+
+        // A genuine all-zero header (the pre-allocated zero region / post-truncation
+        // zeroing) is the sentinel.
         assert!(matches!(
             decode(&[0u8; RECORD_HEADER_SIZE], MAX),
             Decoded::Sentinel
