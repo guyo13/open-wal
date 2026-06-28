@@ -38,10 +38,12 @@ for generating valid input bytes.
 
 ## Corpus
 
-`corpus/<target>/` holds the seed corpus. The committed seeds are small varied
-byte strings — because inputs are `arbitrary`-decoded into a scenario, *any*
-bytes are a valid (total) input, so these are just starting points; real coverage
-accretes from running. **A reproducible crash input is gold**: minimize it
+`corpus/<target>/` holds the seed corpus. For `recovery` it is the
+fuzzer-grown, `cargo fuzz cmin`-minimized coverage-preserving set (so it includes
+inputs that reach the deeper multi-segment-continuity states a cold-start fuzzer
+takes longest to discover — and which a hand-authored byte seed cannot easily
+encode for a typed-`Arbitrary` target). Regrow + re-minimize after any
+parser/format change. **A reproducible crash input is gold**: minimize it
 (`cargo +nightly fuzz cmin` / `tmin`) and commit it into `corpus/<target>/` (or
 `artifacts/<target>/`) as a regression seed, then fix the underlying bug — never
 tune the test to hide it.
