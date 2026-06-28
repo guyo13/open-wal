@@ -41,6 +41,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install nightly toolchain
         uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: x86_64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
@@ -50,15 +52,18 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
+      # Pin the gnu target explicitly: some cargo-fuzz builds default to the musl
+      # target on Linux, where the static libc is incompatible with the sanitizer
+      # (and musl std is not installed) — gnu has full ASan support.
       - name: Build target
-        run: cargo +nightly fuzz build ${{ matrix.target }}
+        run: cargo +nightly fuzz build ${{ matrix.target }} --target x86_64-unknown-linux-gnu
       - name: Run target (time-boxed)
         env:
           MAX_TOTAL_TIME: ${{ github.event.inputs.max_total_time || '300' }}
         run: |
           echo "::notice::Fuzzing '${{ matrix.target }}' for ${MAX_TOTAL_TIME}s."
           echo "::warning::Time-boxed CONTINGENT run, NOT the §14.13 release gate (N CPU-hours since last parser/format change). Green here does not satisfy the gate; a crash is a real bug."
-          cargo +nightly fuzz run "${{ matrix.target }}" -- -max_total_time="${MAX_TOTAL_TIME}" -rss_limit_mb=4096
+          cargo +nightly fuzz run "${{ matrix.target }}" --target x86_64-unknown-linux-gnu -- -max_total_time="${MAX_TOTAL_TIME}" -rss_limit_mb=4096
       - name: Upload corpus + crash artifacts
         if: always()
         uses: actions/upload-artifact@v4
