@@ -67,12 +67,13 @@ jobs:
 
   fuzz-smoke:
     # M9 (§14.5): a SHORT per-PR smoke of the fuzz targets (F1 recovery, F2
-    # decoder). This lane is real and BLOCKING — a reproducible crash here is a
-    # genuine D11 bug and must red the PR (not advisory). It is distinct from the
-    # time-boxed nightly fuzz lane (fuzz.yml) and from any H1 sign-off: M9 fuzz
-    # findings gate M9-relevant PRs; they never red an H1 dispatch run. The full
-    # N-CPU-hour §14.13 release gate runs on a dedicated runner, not here.
-    name: fuzz smoke (F1/F2)
+    # decoder, F3 structure-aware classifier). This lane is real and BLOCKING — a
+    # reproducible crash here is a genuine D4/D5/D10/D11 bug and must red the PR
+    # (not advisory). It is distinct from the time-boxed nightly fuzz lane
+    # (fuzz.yml) and from any H1 sign-off: M9 fuzz findings gate M9-relevant PRs;
+    # they never red an H1 dispatch run. The full N-CPU-hour §14.13 release gate
+    # runs on a dedicated runner, not here.
+    name: fuzz smoke (F1/F2/F3)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -98,6 +99,8 @@ jobs:
         run: cargo +nightly fuzz run recovery --target x86_64-unknown-linux-gnu -- -runs=20000 -rss_limit_mb=4096
       - name: F2 decode smoke (bounded; a crash reds the PR)
         run: cargo +nightly fuzz run decode --target x86_64-unknown-linux-gnu -- -runs=40000 -rss_limit_mb=4096
+      - name: F3 structure smoke (bounded; a crash reds the PR)
+        run: cargo +nightly fuzz run structure --target x86_64-unknown-linux-gnu -- -runs=8000 -rss_limit_mb=4096
 
   dirfsync-presence:
     # M8 §14.4d Tier 1 (PRIMARY): the deterministic, FS-independent regression
