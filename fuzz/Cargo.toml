@@ -46,3 +46,10 @@ path = "fuzz_targets/decode.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "structure"
+path = "fuzz_targets/structure.rs"
+test = false
+doc = false
+bench = false

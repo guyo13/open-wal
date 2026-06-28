@@ -35,8 +35,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # F3–F4 are appended here as their slices land.
-        target: [recovery, decode]
+        # F4 is appended here as its slice lands.
+        target: [recovery, decode, structure]
     steps:
       - uses: actions/checkout@v4
       - name: Install nightly toolchain
