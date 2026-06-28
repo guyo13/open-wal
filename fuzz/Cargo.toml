@@ -53,3 +53,10 @@ path = "fuzz_targets/structure.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "model"
+path = "fuzz_targets/model.rs"
+test = false
+doc = false
+bench = false
