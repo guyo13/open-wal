@@ -12,8 +12,7 @@ tail-vs-corruption classifier (D4/D5/D10).
 | `recovery` | F1 | A whole **directory of segment files** (adversarial filenames + `base_lsn`s) driven through the real public `Wal::open`, plus a secondary single-file `recover_segment` probe. Asserts the bounded forward scan never exceeds `scan_bound(max_record_size)`. |
 | `decode` | F2 | The **single-record decoder** in isolation: raw bytes as the decode buffer × a boundary-biased `max_record_size` set. Asserts bounds-soundness of any returned record (payload ≤ max, framed ≤ buf, ≥ 20, 8-aligned, header+payload ≤ framed). Corpus seeded with genuine CRC-valid frames so the Record path is reached. |
 | `structure` | F3 | **Structure-aware classifier**: a valid dense segment + one localized mutation (flip CRC/body, zero `rec_type`, extend length, tamper padding, reserved type) driving the real `Wal::open`. Sharp oracle: interior corruption fatal (D5), last corruption truncates (D4), surviving suffix dense + byte-identical (D6/D10), idempotent reopen (D7). |
-
-F4 (op-script oracle) lands in a later slice.
+| `model` | F4 | **Op-script oracle**: decodes fuzzer bytes into a `WalConfig` + `Vec<Op>` and drives the M6 stateful executor (`tests/model/mod.rs::run`, reused verbatim) against an independent oracle — panics on any D1/D2/D3/D6/D7/D8 breach. Process-crash model only (page cache survives), not power loss. Slowest target (real `fdatasync` per `Commit`). |
 
 ## Running
 
