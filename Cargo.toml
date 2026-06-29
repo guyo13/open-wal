@@ -67,6 +67,13 @@ criterion = { version = "0.5", default-features = false, features = ["cargo_benc
 # so the commit-latency group records per-iteration timings here and emits the
 # tails itself.
 hdrhistogram = "7"
+# §14.6 `!Sync` compile-fail proof (`tests/ui.rs` + `tests/ui/*.rs`): asserts that
+# sharing the single-writer `Wal` handle across threads does not compile. The
+# pinned `.stderr` is toolchain-sensitive — regenerate with
+# `TRYBUILD=overwrite cargo test --test ui` after a rustc bump that changes the
+# diagnostic wording (the test only runs in the per-PR `test` job on stable; the
+# MSRV job is `cargo check`, which does not execute it).
+trybuild = "1"
 
 # §14.7 perf benches. `harness = false` ⇒ criterion provides `main`. NIGHTLY/manual
 # tier (§14.11); per-PR CI only compile-checks them (`cargo bench --no-run`).
