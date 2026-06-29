@@ -204,3 +204,31 @@ filesystem-dependence caveat.
 `m8/evidence.sh emit [out=PATH] KEY=VALUE …` builds the §5 JSON (dotted keys nest;
 bare ints/bools unquoted; `@`-prefixed values are JSON literals; `timestamp` defaults
 to UTC-now). The gates write `evidence-<gate>.json` under `$WAL_M8_EVIDENCE_DIR`.
+
+## `m9/soak.sh` — run the §14.10 soak / endurance test
+
+Drives `tests/soak.rs` (`#[ignore]`d): a single long-lived `Wal` through a sustained
+randomized append/commit/`checkpoint(durable)`/crash-recover workload, re-checking the
+§14.3 durability envelope (D1/D2/D3/D6/D8) against an independent oracle after every
+recover, with bounded-growth gates on **fd count** / **segment-dir disk** /
+**RSS** / **commit-latency p999**. Deterministic (seeded LCG ⇒ a failure reproduces
+from `WAL_SOAK_SEED`).
+
+```bash
+scripts/m9/soak.sh 5            # 5-second smoke
+scripts/m9/soak.sh 14400 123    # 4-hour run, seed 123
+WAL_M9_EVIDENCE=soak.json scripts/m9/soak.sh 5   # also write a §5 evidence ledger
+```
+
+| Arg / env | Default | Meaning |
+|---|---|---|
+| `$1` / `WAL_SOAK_SECONDS` | `5` (script) | Wall-clock duration. **< 600 s = smoke** (not the gate); ≥ 600 s accrues gate evidence. |
+| `$2` / `WAL_SOAK_SEED` | test's fixed seed | LCG seed. |
+| `WAL_M9_EVIDENCE` | unset | Path for the assembled §5 evidence JSON (reuses `m8/evidence.sh`). |
+
+**Honest framing (same stopgap as LazyFS/bench):** a short run proves the
+driver/monitors/oracle work but is **NOT** the §14.13 gate — that is a **multi-hour**
+run on a dedicated runner with zero resource regression and zero oracle violation. A
+failure (a resource leak or an invariant breach) is a real bug and reds the run.
+`.github/workflows/soak.yml` runs this nightly + on dispatch (informational/contingent),
+uploading the evidence artifact; it is **not** a per-PR gate.

@@ -1,0 +1,69 @@
+name: Soak (M9)
+
+# §14.10 soak / endurance test (`tests/soak.rs`, driven by `scripts/m9/soak.sh`).
+# NIGHTLY/manual tier (§14.11): a sustained randomized append/commit/checkpoint/
+# crash-recover workload against one long-lived WAL, watching fd count, segment-dir
+# disk usage, RSS, and commit-latency tails, plus the §14.3 oracle on every recover.
+#
+# HONEST FRAMING (same stopgap as LazyFS / dm-flakey / bench): the per-PR lane does
+# NOT run this — it is too slow and the long gate needs hours. The §14.13 soak gate
+# is a MULTI-HOUR run with zero resource regression and zero oracle violation; a
+# hosted nightly slice (default 300s here) is a CONTINGENT smoke that proves the
+# driver/monitors work, NOT the gate. A failure here (resource leak or invariant
+# breach) is a real bug and reds the run. Dispatch with a larger `seconds` (and a
+# dedicated runner) to accumulate real gate evidence; the artifact is uploaded each
+# run.
+on:
+  schedule:
+    # 05:17 UTC daily — offset from the fuzz (04:17) and bench (03:17) jobs.
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: "Soak duration in wall-clock seconds"
+        required: false
+        default: "300"
+      seed:
+        description: "LCG seed (decimal; blank = the test's fixed default)"
+        required: false
+        default: ""
+
+concurrency:
+  group: soak-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  soak:
+    name: soak / endurance (contingent until multi-hour)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Run soak
+        env:
+          WAL_M9_EVIDENCE: soak-evidence.json
+        run: |
+          SECS="${{ github.event.inputs.seconds || '300' }}"
+          SEED="${{ github.event.inputs.seed || '' }}"
+          echo "::notice::Soak for ${SECS}s (seed='${SEED:-default}')."
+          echo "::warning::CONTINGENT smoke, NOT the §14.13 multi-hour soak gate. Green here does not satisfy the gate; a failure is a real bug."
+          scripts/m9/soak.sh "${SECS}" "${SEED}"
+
+      - name: Upload soak evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-${{ github.run_id }}
+          path: soak-evidence.json
+          retention-days: 30
+          if-no-files-found: warn
