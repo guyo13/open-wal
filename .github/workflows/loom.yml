@@ -1,0 +1,49 @@
+name: loom (M9)
+
+# §14.6 loom publish-barrier model (`tests/loom_publish.rs`). Unlike the fuzz
+# lane this is DETERMINISTIC and exhaustive over thread interleavings — a real
+# pass/fail gate, not a time-boxed contingent run. It is integrator-facing
+# (models the §15.3 Release/Acquire publish barrier, not WAL internals), so per
+# §14.6 it is kept off the per-PR hot path: it runs only on PRs/pushes that touch
+# the model itself (paths-filtered), plus nightly + manual dispatch. loom is a
+# `cfg(loom)`-only dev-dependency, so it never touches normal / release / MSRV
+# builds.
+on:
+  pull_request:
+    paths:
+      - "tests/loom_publish.rs"
+      - "Cargo.toml"
+      - ".github/workflows/loom.yml"
+  push:
+    branches: [main]
+    paths:
+      - "tests/loom_publish.rs"
+      - "Cargo.toml"
+      - ".github/workflows/loom.yml"
+  schedule:
+    - cron: "37 4 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: loom-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  loom:
+    name: loom publish-barrier
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: loom model (publish barrier, §14.6 / §15.3)
+        env:
+          RUSTFLAGS: --cfg loom
+        run: cargo test --test loom_publish
