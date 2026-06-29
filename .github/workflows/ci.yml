@@ -119,6 +119,11 @@ jobs:
     # software path trips that worst-case-alignment assumption while being
     # alignment-correct at runtime (the default checker passes), and this crate has
     # no pointer alignment of its own to verify.
+    # REVISIT IF `unsafe` IS EVER INTRODUCED into this crate: at that point Miri
+    # becomes a genuine bug hunt, not just a regression guard — widen the suite
+    # beyond the codec subset, run `-Zmiri-symbolic-alignment-check` (and fix or
+    # justify any zero-copy alignment it flags), and drop the "no current bug hunt"
+    # framing in §14.6 / §14.13.
     name: Miri (codec subset)
     runs-on: ubuntu-latest
     steps:
