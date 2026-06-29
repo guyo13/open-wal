@@ -264,6 +264,11 @@ pub(crate) fn decode(buf: &[u8], max_record_size: u32) -> Decoded<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // proptest is impractical under Miri (its RNG + the interpreter's ~100× slowdown)
+    // and these properties cover the SAME in-memory decode/encode paths the
+    // deterministic unit tests already exercise — so the Miri subset runs the units,
+    // not the properties (normal `cargo test` runs both). See §14.6.
+    #[cfg(not(miri))]
     use proptest::prelude::*;
 
     /// A generous `max_record_size` for tests that are not exercising the bound.
@@ -304,7 +309,15 @@ mod tests {
 
     #[test]
     fn roundtrip_spread_and_max() {
-        for len in [16usize, 100, 1000, MAX as usize] {
+        // The 1 MiB `MAX` case is skipped under Miri — a 1 MiB CRC in the
+        // interpreter is minutes-slow and adds no UB coverage over the smaller
+        // sizes (same code path, larger buffer). Normal `cargo test` runs it.
+        let sizes: &[usize] = if cfg!(miri) {
+            &[16, 100, 1000]
+        } else {
+            &[16, 100, 1000, MAX as usize]
+        };
+        for &len in sizes {
             let payload: Vec<u8> = (0..len).map(|i| (i * 31 + 7) as u8).collect();
             assert_roundtrip(Lsn(42), &payload);
         }
@@ -492,6 +505,7 @@ mod tests {
         assert_eq!(f % 8, 0, "framed size is always 8-aligned");
     }
 
+    #[cfg(not(miri))]
     proptest! {
         /// Round-trip fidelity for arbitrary payloads (D6 at the codec level).
         #[test]

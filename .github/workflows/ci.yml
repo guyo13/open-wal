@@ -107,6 +107,33 @@ jobs:
       - name: F4 model smoke (bounded; a crash reds the PR)
         run: cargo +nightly fuzz run model --target x86_64-unknown-linux-gnu -- -runs=3000 -rss_limit_mb=4096
 
+  miri:
+    # M9 §14.6: Miri on the FS-free codec/value subset (record/crc/lsn/config) —
+    # UB / uninitialized-read / provenance checking. The crate has zero `unsafe`
+    # and no zero-copy pointer casts, so this is a REGRESSION GUARD against future
+    # UB, not a current bug hunt. The file-backed recovery/segment/wal paths call
+    # foreign syscalls (fallocate, fsync, flock) Miri cannot execute, so they are
+    # out of Miri scope — their bounded-parsing/D11 surface is covered by the ASan
+    # fuzz targets (§14.5) instead. We run `-Zmiri-strict-provenance` but NOT
+    # `-Zmiri-symbolic-alignment-check`: the `crc32c` dependency's word-at-a-time
+    # software path trips that worst-case-alignment assumption while being
+    # alignment-correct at runtime (the default checker passes), and this crate has
+    # no pointer alignment of its own to verify.
+    name: Miri (codec subset)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly toolchain + miri
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      - name: miri test (in-memory codec/value subset)
+        env:
+          MIRIFLAGS: -Zmiri-strict-provenance
+        run: |
+          cargo +nightly miri test --lib -- record:: crc:: lsn:: config::
+
   dirfsync-presence:
     # M8 §14.4d Tier 1 (PRIMARY): the deterministic, FS-independent regression
     # guard for the roll-time directory fsync (§7.4 step 5). It straces the roll
