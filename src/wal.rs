@@ -1120,6 +1120,16 @@ mod tests {
     }
 
     #[test]
+    fn handle_is_send() {
+        // §6.2: the write handle is `Send` (it may be moved to another thread) but
+        // **not** `Sync` (it cannot be shared). This asserts the `Send` half at
+        // compile time; the `!Sync` half is the `tests/ui/wal_not_sync.rs`
+        // trybuild compile-fail proof (§14.6). Together they pin "Send but !Sync".
+        fn assert_send<T: Send>() {}
+        assert_send::<Wal<NullObserver>>();
+    }
+
+    #[test]
     fn reader_from_skips_earlier_records() {
         let dir = tmp();
         let (mut wal, _) = Wal::open(dir.path(), cfg()).unwrap();
