@@ -7,7 +7,10 @@
 //! - **fd count** (`/proc/self/fd`) — a handle not closed on roll/checkpoint/
 //!   reopen leaks file descriptors;
 //! - **disk usage** (segment-dir bytes) — a checkpoint that fails to reclaim
-//!   sealed segments leaks disk;
+//!   sealed segments leaks disk. Caught by a deterministic **per-checkpoint floor**
+//!   (right after `checkpoint(durable)`, exactly the active segment must remain, so
+//!   a leak reds on the first bad cycle), backstopped by a peak-bytes ceiling for
+//!   gross runaway between checkpoints;
 //! - **RSS** (`/proc/self/statm`) — recovery never materializes payloads (§8.5),
 //!   so steady-state memory must stay flat;
 //! - **commit latency** (p50/p99/p999 via `hdrhistogram`) — must not run away;
@@ -91,6 +94,18 @@ fn dir_wal_bytes(dir: &Path) -> u64 {
         }
     }
     total
+}
+
+/// Count of segment files (`*.wal`) currently on disk.
+fn dir_wal_count(dir: &Path) -> usize {
+    std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".wal"))
+                .count()
+        })
+        .unwrap_or(0)
 }
 
 fn env_u64(key: &str, default: u64) -> u64 {
@@ -256,9 +271,33 @@ fn soak() {
             }
             // ~7% checkpoint to the durable watermark (reclaim sealed segments).
             86..=92 => {
+                // We checkpoint to exactly `durable_lsn` (== the committed
+                // watermark; intervening appends only stage, never advancing
+                // durability). Every record physically in a segment is therefore
+                // <= up_to, so *every* sealed segment is fully superseded and must
+                // be reclaimed — the correct post-checkpoint floor is exactly ONE
+                // `*.wal` file, the never-deleted active segment (§9).
                 let up = oracle.watermark;
+                assert_eq!(
+                    up,
+                    wal.durable_lsn().0,
+                    "checkpoint up_to must == durable_lsn"
+                );
                 wal.checkpoint(Lsn(up)).expect("checkpoint");
                 oracle.max_ckpt = oracle.max_ckpt.max(up);
+                // POST-CHECKPOINT FLOOR (D8): the disk-leak gate that fires on the
+                // *first* leaked segment, deterministically — a checkpoint that
+                // reclaims N-1 of N sealed segments leaves >= 2 files here on cycle
+                // 1, instead of slowly accreting toward the 16x peak ceiling below.
+                // This is what makes "no unreclaimed-segment leak" a real guarantee;
+                // the peak ceiling is only the gross-runaway backstop.
+                let live = dir_wal_count(path);
+                assert_eq!(
+                    live, 1,
+                    "D8 disk floor: checkpoint(durable {up}) must reclaim all sealed \
+                     segments, leaving exactly the active segment; found {live} *.wal \
+                     files (unreclaimed-segment leak?) [{checkpoints} checkpoints]"
+                );
                 // Records at or below max_ckpt may now be reclaimed from disk;
                 // prune them so the oracle's own memory stays bounded (else the
                 // oracle would grow RSS and trip the watch).
@@ -312,13 +351,16 @@ fn soak() {
         peak_fd <= fd0 + 32,
         "fd leak: peak {peak_fd} > baseline {fd0} + 32 ({ops} ops, {recoveries} recoveries)"
     );
-    // disk: checkpoint(durable) reclaims all sealed segments, so the live set is
-    // ~1-2 segments. 16 segments is generous headroom; a reclamation leak blows
-    // past it over a long run.
+    // disk: the *primary* leak detector is the per-checkpoint FLOOR assertion in
+    // the checkpoint arm (live == 1 right after checkpoint(durable) — fires on the
+    // first leaked segment, cycle 1). This peak ceiling is only the gross-runaway
+    // BACKSTOP: it catches unbounded growth between checkpoints (e.g. rolls with no
+    // checkpoint firing). 16 segments is generous headroom over the legitimate
+    // working set; a runaway blows past it.
     let disk_bound = 16 * cfg.segment_size;
     assert!(
         peak_disk <= disk_bound,
-        "disk leak: peak {peak_disk} > {disk_bound} ({checkpoints} checkpoints)"
+        "disk runaway: peak {peak_disk} > {disk_bound} ({checkpoints} checkpoints)"
     );
     // RSS: steady-state recovery materializes no payloads (§8.5). Generous 64 MiB
     // slack absorbs allocator/arena noise; a real leak exceeds it on a long run.
