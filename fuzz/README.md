@@ -25,8 +25,9 @@ cargo +nightly fuzz build
 # Short smoke run.
 cargo +nightly fuzz run recovery -- -runs=100000
 
-# Long run (the §14.13 release gate: N CPU-hours, zero crashes, bounded-scan
-# counter never exceeded since the last parser/format change).
+# Long run (the §14.13 release gate: >= 24 CPU-hours PER TARGET, zero crashes,
+# bounded-scan counter never exceeded, accumulated SINCE the last parser/format
+# change — currently 2b198e7, the all-zero-header sentinel fix).
 cargo +nightly fuzz run recovery
 ```
 
@@ -47,6 +48,20 @@ parser/format change. **A reproducible crash input is gold**: minimize it
 (`cargo +nightly fuzz cmin` / `tmin`) and commit it into `corpus/<target>/` (or
 `artifacts/<target>/`) as a regression seed, then fix the underlying bug — never
 tune the test to hide it.
+
+### Regrow log (the "since the last format change" clock in §14.13)
+
+A format change resets the §14.13 CPU-hour clock and mandates a regrow so the
+committed corpus reflects the *current* classification. Record each regrow here
+so the next format change has a precedent:
+
+- **`2b198e7` (all-zero-header sentinel fix, issue #26)** — regrown + `cargo fuzz
+  cmin`'d for all four targets on the post-fix format (the fix changed how
+  `rec_type==0, crc≠0` is classified: sentinel → `Invalid` → `TornMidLog`/torn-tail,
+  a path the pre-fix corpus never exercised). Minimized entries: recovery
+  174→316, structure 130→129, decode 17→40, model 321→348; per-target coverage
+  rose (recovery 780→892, structure 561→592, model 798→839); zero crashes. The
+  24-CPU-hour/target gate clock therefore starts at `2b198e7`.
 
 ## CI
 
