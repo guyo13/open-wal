@@ -63,6 +63,41 @@ so the next format change has a precedent:
   rose (recovery 780→892, structure 561→592, model 798→839); zero crashes. The
   24-CPU-hour/target gate clock therefore starts at `2b198e7`.
 
+## Coverage & regression trust model
+
+**How the committed corpus is consumed (be explicit, so this is documented rather
+than assumed):** the corpus is used **as-is** — no CI job re-derives `cargo fuzz
+coverage`. The per-target coverage numbers in the regrow log above (e.g. recovery
+780→892) are a **one-time provenance record** of the `2b198e7` regrow, not a
+self-correcting metric. Re-deriving coverage in CI would need the nightly
+sanitizer/coverage toolchain and would be informational-only (same contingent
+posture as the rest of `fuzz.yml`); we deliberately do **not** add that job — its
+value would be marginal because the **durable** regression proof does not live in a
+coverage number at all (see below).
+
+**The durable, churn-proof anchors** for the recovery classifier — in particular the
+issue-#26 interior `rec_type→0 ⇒ TornMidLog` path this whole hardening arc exists to
+catch — are two **deterministic** tests, independent of what `cmin` keeps:
+
+- `tests/differential.rs` — its scenario matrix contains the interior `rec_type→0`
+  case (and the tail case) as explicit, named, exact-match assertions (variant +
+  offset + `max_lsn`), run against an independent reference parser (§14.9).
+- `recovery::rec_type_zeroed_interior_is_fatal_tornmidlog` (+ the tail companion
+  `…_at_tail_is_torn_tail_and_zeroed`) in `src/recovery.rs` — the unit-level
+  fail-before/pass-after regression tests for the fix.
+
+Those are the proof. The **fuzzer** additionally starts from that shape: the
+`structure` corpus already carries an interior-`ZeroRecType` entry (verified by
+replaying the target's `arbitrary` decode + record-build + mutation-selection logic
+over the committed corpus — 1 interior-`ZeroRecType` and 11 total-`ZeroRecType`
+entries as of the `2b198e7` regrow). It survives `cmin` because the
+`rec_type→0 → CRC-fail → classify → TornMidLog` path is a **distinct coverage arm**,
+so a coverage-preserving minimization keeps at least one entry reaching it. We
+therefore do **not** commit a redundant hand-authored seed; if a future regrow's
+`cmin` ever drops the shape (re-run the presence check), the two deterministic tests
+above still hold the line, and a fresh interior-`ZeroRecType` seed can be re-added
+then.
+
 ## CI
 
 `.github/workflows/fuzz.yml` runs the targets time-boxed on a schedule / manual
