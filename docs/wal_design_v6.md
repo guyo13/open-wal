@@ -648,8 +648,37 @@ Multi-hour randomized workload with periodic injected crashes+recoveries and che
 | D11 Bounded recovery parsing | §14.5 F1/F2/F3/F4, §14.4f, §14.6 Miri, §14.9 differential, bounded-scan counter (structural drift guard) |
 | D12 Sealed-segment immutability | §14.4h sealed-segment-immutability, concurrent-tailer, backup round-trip |
 
+#### 14.12.1 Reconciliation audit (M9 close-out, 2026-07-02)
+
+A truthfulness pass over the matrix against the actual tree at M9 close-out — each covering test **grep-verified to exist**, each row marked *passing* or *contingent on a named unmet gate*. Every invariant has ≥1 currently-passing software test; the physical-durability layer is the only *contingent* part, and every contingent gate names its condition.
+
+| Inv | Currently-passing test (grep-verified symbol/file) | Contingent physical-layer gate (unmet condition) |
+|---|---|---|
+| D1 | `tests/model/mod.rs::run` (§14.3 refinement), `process_crash::sigkill_at_varied_points_recovers_dense_suffix` | §14.4b/c LazyFS `#[ignore]` (needs FUSE), §14.8 **H1** (owner hardware) |
+| D2 | `single_segment::p2_density`, `multi_segment_property::split_and_roll_roundtrip_is_dense`, `tests/model/mod.rs::run` | — |
+| D3 | `tests/model/mod.rs::run`, `process_crash::sigkill_*` | §14.4b/c LazyFS, **H1** |
+| D4 | `recovery::corrupt_last_record_is_a_torn_tail_and_is_zeroed`, `…::rec_type_zeroed_at_tail_is_torn_tail_and_zeroed`, `…::unknown_rec_type_at_tail_is_treated_as_torn_tail`, **§14.9 `differential_scenario_matrix`** | — |
+| D5 | `recovery::corrupt_middle_acked_record_is_fatal_tornmidlog`, **`…::rec_type_zeroed_interior_is_fatal_tornmidlog`** (issue #26), `…::sealed_segment_invalid_record_is_fatal_corruption`, **§14.9 differential** | — |
+| D6 | `single_segment::p1_fidelity`, `tests/model/mod.rs::run` | — |
+| D7 | `single_segment::p6_idempotent_recovery`, `recovery::recovery_is_idempotent_after_torn_tail` | — |
+| D8 | `wal::deletable_prefix_len_boundary_math` (+ checkpoint unit tests), `checkpoint_property::checkpoint_preserves_records_above_up_to`, `tests/model/mod.rs::run` | §14.4c LazyFS checkpoint cases (`#[ignore]`) |
+| D9 | `process_crash::sigkill_during_checkpoint_recovers_contiguous_suffix` | §14.4c LazyFS (split-batch/roll), **H1** |
+| D10 | `recovery::zeroing_prevents_resurrection_of_stale_valid_record`, **§14.9 differential** (beyond-bound continuation ⇒ torn tail) | §14.4g durability-of-zeroing under power loss (LazyFS `#[ignore]`) |
+| D11 | `recovery::truncated_file_below_segment_size_recovers_without_panic`, `…::arbitrary_bytes_never_panic_and_terminate`, §14.6 Miri subset, **§14.9 differential**, F1–F4 smoke | Fuzz **≥24 CPU-h/target since `2b198e7`** (dedicated runner) |
+| D12 | `sealed_immutability::sealed_segments_are_immutable_across_activity_and_recovery` | — |
+
+**Rows changed this milestone — reconciled:**
+- **D5** traces to the sentinel-fix tests (`rec_type_zeroed_interior_is_fatal_tornmidlog` + the tail companion `rec_type_zeroed_at_tail_is_torn_tail_and_zeroed`) **and** the §14.9 differential — not to anything stale.
+- **D4 / D10 / D11** cite the §14.9 differential; those edits **landed on `main`** (PR #35) and name real `differential_*` tests, grep-confirmed above.
+- **loom** is **absent** from the matrix and the DoD — removed as not-applicable (§14.6 note), not marked done; `grep -i loom` over `src/ tests/ .github/ Cargo.toml` finds **nothing** (only the docs "why not" note).
+- **§14.9 differential** is present and marked implemented (per-PR job).
+
+**Contingent gates, each with its named unmet condition:** fuzz — *≥24 CPU-h/target since `2b198e7`* on a dedicated runner; soak — *a multi-hour run* (`soak.yml`); §14.8 **H1** — *owner power-pull hardware*; §14.4b/c/g LazyFS — *a FUSE runner* (`#[ignore]` by default, green when run); §14.4d behavioral — *closed as a documented negative result* (Tier-1 strace carries the DoD).
+
+**Structural-vs-substantive caveat (flagged, not implied):** the D11 "bounded-scan counter never exceeded" clause is satisfied **structurally** — the production loop's window *is* `scan_bound(max_record_size)`, so the counter is a **drift/regression guard**, not an input-bug finder. The substantive D11 proof is the crash-free / no-OOB / termination surface of F1–F4 over adversarial inputs plus the §14.9 differential's exact-match classification — not the counter.
+
 ### 14.13 Definition of Done (release gate)
-- Every row of §14.12 has ≥ 1 passing test.
+- Every row of §14.12 has ≥ 1 passing test. *(**Reconciled at M9 close-out — see §14.12.1.** Every D1–D12 row has a currently-passing, grep-verified software test; the physical-durability layer (LazyFS/H1) is the only *contingent* part, and each contingent gate names its unmet condition there.)*
 - Every enumerated crash point in §14.4c (including split-batch and roll sub-cases) has a test.
 - §14.4d negative control catches the injected bug **and** the correct build passes. *(M8 — **satisfied by Tier-1.** **Tier-1 (primary) PASSES, deterministic + per-PR:** `scripts/m8/dirfsync-presence.sh` (in `ci.yml`) straces the roll path and asserts the correct build issues the roll-time directory `fsync` while `--features inject_no_dir_fsync` does not — verified green (`correct=5` dir-fsyncs vs `inject=1`). FS-independent syscall-presence regression guard; the row's satisfier. **Tier-2 (behavioral power-loss) — CLOSED as a documented negative result (PR #21, owner Fedora 43):** the synchronized mid-run cut (`dirfsync_cut_workload`, `dirfsync-negative <fs>`) blocks the workload with the new segment's dirent un-synced and cuts inside the window, yet the inject build recovers fully on **every** config tested — ext4/xfs/btrfs, journal-less ext4 (incl. `ext2`-format, serviced by the ext4 driver on modern kernels — standalone ext2 driver removed in Linux 6.9), and journaled ext4 `data=writeback` (the driver's weakest ordering). The dirent reaches disk via the file's own `fdatasync` everywhere; the earlier "ext2 block-adjacency" claim is **retracted** and the mechanism was not isolated. No readily-available Linux FS exposes it behaviorally ⇒ honest negative result, not a gap. **Tier-3 — ext4/xfs/btrfs (+ journal-less "ext2") INCONCLUSIVE-by-design**, never red on a masked miss. `fsync_dir` retained unconditionally as a POSIX-portability safeguard. Earlier "certified on ext4" was wrong; the harness loud-skips where dm-flakey is absent rather than fake green; the positive split+roll power-loss case passes under LazyFS in M4.)*
 - §14.4g resurrection test passes **and** is demonstrated to fail both (a) if zeroing-on-truncate is disabled and (b) if the invalidation is not durably synced (the power-loss-of-zeroing assertion).
