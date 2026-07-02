@@ -9,11 +9,27 @@ description = "An embedded Write-Ahead Log (WAL) library for Rust."
 license = "BSD-3-Clause"
 repository = "https://github.com/guyo13/open-wal"
 readme = "README.md"
-# `src/bin/crash_child.rs` is a test-only helper spawned by
-# `tests/process_crash.rs` (§14.4a). It is built locally/in CI for the tests but
-# MUST NOT ship to crates.io consumers, so exclude it from the published package.
-# (Excluding only affects packaging; local `cargo test` still builds the bin.)
-exclude = ["src/bin"]
+# Keep the published package to the library a consumer actually needs. Excluding
+# only affects packaging — local `cargo test`/CI still build everything.
+#   - src/bin        : test-only helpers spawned by tests/process_crash.rs et al.
+#                      (§14.4a, power-pull, dirfsync-cut). Not library code.
+#   - CLAUDE.md      : internal build-agent operating guide, not for consumers.
+#   - docs/          : design contract + M8 infra plan/runbook (internal, ~180K).
+#   - scripts/       : LazyFS / dm-flakey / power-pull / perf fault-injection and
+#                      CI harnesses (shell + a C LD_PRELOAD shim). Dev/CI only.
+#   - .github/       : CI/nightly workflows. Not needed off the repo.
+#   - fuzz/          : a separate cargo-fuzz crate; already skipped as it has its
+#                      own Cargo.toml, listed here for intent.
+# Tests and benches are intentionally kept (standard package contents; they do
+# not build for downstream consumers and add no runtime deps).
+exclude = [
+    "src/bin",
+    "CLAUDE.md",
+    "docs",
+    "scripts",
+    ".github",
+    "fuzz",
+]
 
 [features]
 # Test-only NEGATIVE CONTROL for §14.4d (M8): build the writer to deliberately
