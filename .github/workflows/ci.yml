@@ -139,6 +139,25 @@ jobs:
         run: |
           cargo +nightly miri test --lib -- record:: crc:: lsn:: config::
 
+  differential:
+    # §14.9 — differential / reference-parser tester. An independent, spec-derived
+    # reference segment parser (`tests/differential.rs`) is run alongside the
+    # production `recover_segment` classifier over a deterministic scenario matrix
+    # AND the committed fuzz corpora; any divergence in classification is a real
+    # recovery-classifier bug and reds the PR (same posture as the fuzz smoke,
+    # never gates an H1 dispatch). Fast (~6 s over the minimized corpus), so it
+    # runs per-PR. Needs `--features fuzzing` for the `recover_segment_classify`
+    # accessor (test-only, zero release impact).
+    name: differential (§14.9)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: differential reference-parser check
+        run: cargo test --features fuzzing --test differential
+
   dirfsync-presence:
     # M8 §14.4d Tier 1 (PRIMARY): the deterministic, FS-independent regression
     # guard for the roll-time directory fsync (§7.4 step 5). It straces the roll
