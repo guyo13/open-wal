@@ -148,4 +148,67 @@ pub mod fuzzing {
     pub fn encode_record_into(buf: &mut Vec<u8>, lsn: u64, payload: &[u8]) -> usize {
         crate::record::encode_into(buf, Lsn(lsn), payload)
     }
+
+    /// The production per-segment recovery **classification** (§8.2), flattened to
+    /// a plain value for the §14.9 differential tester (`tests/differential.rs`).
+    /// This is the exact classification surface an independent reference parser
+    /// must reproduce byte-for-byte; a divergence is a recovery-classifier bug.
+    ///
+    /// `Truncated`/`Clean` carry `max_lsn` and the truncation `offset`; the two
+    /// fatal arms carry the failing `offset`. `OtherErr` catches any error the
+    /// single-segment `recover_segment` is not expected to produce here (e.g. an
+    /// I/O error) so the differential can flag it rather than silently coerce it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum SegClass {
+        /// Clean end of records; `max_lsn` is the highest valid LSN (`base-1` if
+        /// the segment is empty).
+        Clean { max_lsn: u64 },
+        /// Active-segment torn tail truncated at `offset`; `max_lsn` is the last
+        /// valid record before it.
+        Truncated { offset: u64, max_lsn: u64 },
+        /// Mid-log corruption: an invalid record with a valid record still ahead
+        /// within the bounded forward scan (active segment) — fatal (D5).
+        TornMidLog { offset: u64 },
+        /// Any invalid record in a sealed segment — fatal, no forward scan (D5).
+        Corruption { offset: u64 },
+        /// An error outside the classification surface (e.g. I/O). The differential
+        /// treats this as its own class so it is never silently equated.
+        OtherErr,
+    }
+
+    /// Run the **real** production `recover_segment` (§8.2) over one open segment
+    /// `file` and return its classification. Used only by the §14.9 differential
+    /// tester to compare production against an independent reference parser.
+    ///
+    /// NOTE: on a torn tail this performs the production durable zeroing of
+    /// `[offset, EOF)` (§8.2.1) as a side effect — so the differential must pass
+    /// production its **own** copy of the segment file and read the classification
+    /// from this return value, never re-derive it from the mutated file.
+    #[must_use]
+    pub fn recover_segment_classify(
+        file: &File,
+        base_lsn: u64,
+        is_active: bool,
+        segment_size: u64,
+        max_record_size: u32,
+    ) -> SegClass {
+        use crate::error::WalError;
+        use crate::wal::TailState;
+        let base = Lsn(base_lsn.max(1));
+        match crate::recovery::recover_segment(file, base, is_active, segment_size, max_record_size)
+        {
+            Ok(rec) => match rec.tail_state {
+                TailState::Clean => SegClass::Clean {
+                    max_lsn: rec.max_lsn.0,
+                },
+                TailState::TruncatedAt { offset, .. } => SegClass::Truncated {
+                    offset,
+                    max_lsn: rec.max_lsn.0,
+                },
+            },
+            Err(WalError::TornMidLog { offset, .. }) => SegClass::TornMidLog { offset },
+            Err(WalError::Corruption { offset, .. }) => SegClass::Corruption { offset },
+            Err(_) => SegClass::OtherErr,
+        }
+    }
 }
