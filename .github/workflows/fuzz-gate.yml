@@ -1,0 +1,150 @@
+name: Fuzz gate (self-hosted, §14.13)
+
+# The §14.13 fuzz RELEASE GATE — distinct from the nightly contingent smoke in
+# fuzz.yml. This runs on the self-hosted `fuzz-rig` box (dedicated vCPUs), pins
+# each of F1–F4 to its own core (taskset), and PASSES only on MEASURED CPU-hours
+# (real User+System time, not wall × cores) ≥ N per target AND zero crash
+# artifacts. A hosted runner CANNOT satisfy this gate (shared vCPU ⇒ the CPU-hours
+# are fictional under steal), which is why this is a separate, self-hosted-only,
+# manual-dispatch workflow. Emits scripts/m8/evidence.sh JSON so the DoD is
+# satisfied by an artifact, not a checkbox.
+#
+# Trigger: Actions → "Fuzz gate (self-hosted, §14.13)" → Run workflow.
+#   - hours_per_target: real CPU-hours to require per target (default 24).
+#   - The gate clock starts at the last format change; this job asserts HEAD is
+#     at/after that baseline and records the SHA in the evidence.
+
+on:
+  workflow_dispatch:
+    inputs:
+      hours_per_target:
+        description: "Required MEASURED CPU-hours per target (default 24)"
+        required: false
+        default: "24"
+      format_baseline:
+        description: "Commit the gate clock starts at (last format change)"
+        required: false
+        default: "2b198e7"
+
+concurrency:
+  group: fuzz-gate-${{ github.ref }}
+  cancel-in-progress: false          # never cancel a running gate accumulation
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RSS_LIMIT_MB: "1800"               # 4 × 1800 + OS + swap fits an 8 GiB box
+
+jobs:
+  fuzz-gate:
+    name: fuzz gate (all targets, taskset-pinned)
+    runs-on: [self-hosted, fuzz-rig]  # the dedicated box; NEVER ubuntu-latest
+    timeout-minutes: 2160             # 36 h ceiling (24 h run + slack)
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assert format baseline (gate clock)
+        run: |
+          BASE="${{ github.event.inputs.format_baseline || '2b198e7' }}"
+          if git merge-base --is-ancestor "$BASE" HEAD; then
+            echo "::notice::HEAD $(git rev-parse --short HEAD) is at/after baseline $BASE — clock valid."
+          else
+            echo "::error::HEAD is NOT at/after format baseline $BASE. A format change resets the clock and requires a corpus regrow + cmin first (see fuzz/README.md). Aborting."
+            exit 1
+          fi
+
+      # Toolchain is baked into the fuzz-rig AMI, but re-assert so a stale image fails loud.
+      - name: Verify toolchain present
+        run: |
+          command -v cargo >/dev/null || { echo "::error::cargo missing on runner"; exit 1; }
+          rustup toolchain list | grep -q nightly || { echo "::error::nightly toolchain missing"; exit 1; }
+          cargo +nightly fuzz --version >/dev/null || { echo "::error::cargo-fuzz missing"; exit 1; }
+          command -v taskset >/dev/null || { echo "::error::taskset (util-linux) missing"; exit 1; }
+          command -v /usr/bin/time >/dev/null || { echo "::error::/usr/bin/time (time pkg) missing"; exit 1; }
+          nproc
+
+      - name: Build all targets (ASan, gnu)
+        run: |
+          for t in recovery decode structure model; do
+            cargo +nightly fuzz build "$t" --target x86_64-unknown-linux-gnu
+          done
+
+      - name: Run gate — pin each target to a core, measure real CPU time
+        env:
+          HOURS: ${{ github.event.inputs.hours_per_target || '24' }}
+        run: |
+          set -u
+          GATE_SECONDS=$(( HOURS * 3600 ))
+          TARGETS=(recovery decode structure model)
+          NCORES=$(nproc)
+          if [ "$NCORES" -lt 4 ]; then
+            echo "::error::runner has $NCORES cores; need >= 4 dedicated cores to pin all four targets. Aborting (would corrupt CPU-hour accounting)."
+            exit 1
+          fi
+          mkdir -p evidence
+          echo "::notice::Gate run: ${HOURS} CPU-h/target, ${GATE_SECONDS}s wall, one core per target."
+          for i in "${!TARGETS[@]}"; do
+            t="${TARGETS[$i]}"
+            taskset -c "$i" /usr/bin/time -v -o "evidence/cpu_${t}.time" \
+              cargo +nightly fuzz run "$t" --target x86_64-unknown-linux-gnu -- \
+                -max_total_time="$GATE_SECONDS" \
+                -rss_limit_mb="${RSS_LIMIT_MB}" \
+                -print_final_stats=1 \
+              > "evidence/run_${t}.log" 2>&1 &
+          done
+          wait
+          echo "all targets finished"
+
+      - name: Evaluate gate — measured CPU-hours + zero crashes
+        id: eval
+        env:
+          HOURS: ${{ github.event.inputs.hours_per_target || '24' }}
+        run: |
+          set -u
+          NEED=$(( HOURS * 3600 ))
+          PASS=1
+          declare -a ROWS
+          for t in recovery decode structure model; do
+            # real CPU seconds = User + System from /usr/bin/time -v
+            cpu=$(awk '/User time/{u=$4} /System time/{s=$4} END{printf "%.0f", u+s}' "evidence/cpu_${t}.time")
+            crashes=$(ls "fuzz/artifacts/$t" 2>/dev/null | wc -l | tr -d ' ')
+            ok_cpu=$([ "$cpu" -ge $(( NEED * 95 / 100 )) ] && echo true || echo false)  # 5% steal slack
+            ok_crash=$([ "$crashes" -eq 0 ] && echo true || echo false)
+            [ "$ok_cpu" = true ] && [ "$ok_crash" = true ] || PASS=0
+            echo "$t: cpu_seconds=$cpu (need~$NEED ok=$ok_cpu)  crashes=$crashes (ok=$ok_crash)"
+            ROWS+=("{\"target\":\"$t\",\"cpu_seconds\":$cpu,\"crashes\":$crashes,\"cpu_ok\":$ok_cpu,\"crash_ok\":$ok_crash}")
+          done
+          TARGETS_JSON=$(IFS=,; echo "[${ROWS[*]}]")
+          VERDICT=$([ "$PASS" -eq 1 ] && echo PASS || echo FAIL)
+          # reuse the M8 evidence emitter (dotted keys nest, @-prefix = raw JSON)
+          scripts/m8/evidence.sh emit out=evidence/fuzz_gate.json \
+            gate="fuzz-cpuh-per-target" \
+            baseline="${{ github.event.inputs.format_baseline || '2b198e7' }}" \
+            head="$(git rev-parse HEAD)" \
+            hours_required_per_target="$HOURS" \
+            accounting="real User+System CPU seconds, taskset-pinned, dedicated vCPU" \
+            runner="self-hosted fuzz-rig" \
+            targets="@${TARGETS_JSON}" \
+            verdict="$VERDICT"
+          echo "verdict=$VERDICT" >> "$GITHUB_OUTPUT"
+          python3 -m json.tool evidence/fuzz_gate.json   # validate
+
+      - name: Upload evidence + corpus + any crash artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-gate-${{ github.run_id }}
+          path: |
+            evidence/
+            fuzz/corpus/
+            fuzz/artifacts/
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Fail the run if the gate did not pass
+        if: steps.eval.outputs.verdict != 'PASS'
+        run: |
+          echo "::error::Fuzz gate did NOT pass (see evidence/fuzz_gate.json). Either a target fell short of measured CPU-hours (steal? runner too small?) or a crash artifact was produced (a real D4/D5/D11 bug — file the reproducer, fix, then the clock for that target restarts)."
+          exit 1
