@@ -35,7 +35,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  RSS_LIMIT_MB: "1800"               # 4 × 1800 + OS + swap fits an 8 GiB box
+  RSS_LIMIT_MB: "1400"               # 4 ASan fuzzers + 4g tmpfs scratch on an 8 GiB box —
+                                     # keep per-worker RSS modest to avoid the OOM killer.
+                                     # (On a 16 GiB c7i.2xlarge you can raise this to 2048+.)
 
 jobs:
   fuzz-gate:
@@ -85,6 +87,18 @@ jobs:
           HOURS: ${{ github.event.inputs.hours_per_target || '24' }}
         run: |
           set -u
+          # Fuzz scratch on tmpfs (RAM), NOT the EBS root volume. The recovery/structure/
+          # model harnesses create real WAL segment dirs via tempfile::tempdir() and drive
+          # the true Wal::open path, which fdatasyncs thousands of times/sec. On EBS those
+          # syncs block in iowait (~70%), so the CPU-hour gate would accrue only ~30% of
+          # wall time. tempfile honors $TMPDIR, so redirecting to tmpfs makes the syncs
+          # memory ops → the targets go CPU-bound and real CPU-hours accrue at wall rate.
+          # This does NOT weaken the gate: the fuzzer tests the recovery *logic* over
+          # adversarial bytes (identical regardless of backing store); disk *durability*
+          # is H1's job, not this.
+          sudo mkdir -p /mnt/fuzztmp
+          mountpoint -q /mnt/fuzztmp || sudo mount -t tmpfs -o size=4g tmpfs /mnt/fuzztmp
+          export TMPDIR=/mnt/fuzztmp
           GATE_SECONDS=$(( HOURS * 3600 ))
           TARGETS=(recovery decode structure model)
           NCORES=$(nproc)
@@ -93,7 +107,7 @@ jobs:
             exit 1
           fi
           mkdir -p evidence
-          echo "::notice::Gate run: ${HOURS} CPU-h/target, ${GATE_SECONDS}s wall, one core per target."
+          echo "::notice::Gate run: ${HOURS} CPU-h/target, ${GATE_SECONDS}s wall, one core per target, scratch on tmpfs ($TMPDIR)."
           for i in "${!TARGETS[@]}"; do
             t="${TARGETS[$i]}"
             taskset -c "$i" /usr/bin/time -v -o "evidence/cpu_${t}.time" \
@@ -134,6 +148,7 @@ jobs:
             head="$(git rev-parse HEAD)" \
             hours_required_per_target="$HOURS" \
             accounting="real User+System CPU seconds, taskset-pinned, dedicated vCPU" \
+            scratch="tmpfs (WAL segment scratch in RAM; recovery logic identical to disk-backed — disk durability is H1, not this gate)" \
             runner="self-hosted fuzz-rig" \
             targets="@${TARGETS_JSON}" \
             verdict="$VERDICT"
