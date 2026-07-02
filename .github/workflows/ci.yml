@@ -178,3 +178,20 @@ jobs:
         run: sudo apt-get update -y && sudo apt-get install -y strace
       - name: dir-fsync presence (correct issues it per roll; inject does not)
         run: scripts/m8/dirfsync-presence.sh
+
+  book:
+    # User-facing documentation (book/). `mdbook build` catches broken SUMMARY
+    # entries and malformed chapters; the *code* in the book is verified
+    # separately — every example is mirrored as a compiled test in
+    # tests/book_examples.rs, which the `test` job runs (the book's code blocks
+    # are `rust,ignore` because rustdoc cannot link the crate from mdbook).
+    name: book (mdbook build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install mdbook
+        uses: peaceiris/actions-mdbook@v2
+        with:
+          mdbook-version: "0.5.3"
+      - name: mdbook build
+        run: mdbook build book
