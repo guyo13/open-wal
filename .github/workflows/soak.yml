@@ -9,10 +9,11 @@ name: Soak (M9)
 # NOT run this — it is too slow and the long gate needs hours. The §14.13 soak gate
 # is a MULTI-HOUR run with zero resource regression and zero oracle violation; a
 # hosted nightly slice (default 300s here) is a CONTINGENT smoke that proves the
-# driver/monitors work, NOT the gate. A failure here (resource leak or invariant
-# breach) is a real bug and reds the run. Dispatch with a larger `seconds` (and a
-# dedicated runner) to accumulate real gate evidence; the artifact is uploaded each
-# run.
+# driver/monitors work, NOT the gate. To accumulate real gate evidence, DISPATCH
+# with a larger `seconds` AND set `runner: fuzz-rig` so it runs on the dedicated
+# self-hosted box (a hosted runner is time-limited and cannot hold a multi-hour
+# run). A failure here (resource leak or invariant breach) is a real bug and reds
+# the run. The evidence artifact is uploaded each run.
 on:
   schedule:
     # 05:17 UTC daily — offset from the fuzz (04:17) and bench (03:17) jobs.
@@ -20,13 +21,21 @@ on:
   workflow_dispatch:
     inputs:
       seconds:
-        description: "Soak duration in wall-clock seconds"
+        description: "Soak duration in wall-clock seconds (multi-hour = the real gate, e.g. 21600)"
         required: false
         default: "300"
       seed:
         description: "LCG seed (decimal; blank = the test's fixed default)"
         required: false
         default: ""
+      runner:
+        description: "Where to run: 'hosted' (nightly smoke) or 'fuzz-rig' (self-hosted, for the multi-hour gate)"
+        required: false
+        default: "hosted"
+        type: choice
+        options:
+          - hosted
+          - fuzz-rig
 
 concurrency:
   group: soak-${{ github.workflow }}-${{ github.ref }}
@@ -41,8 +50,11 @@ env:
 jobs:
   soak:
     name: soak / endurance (contingent until multi-hour)
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Scheduled runs and 'hosted' dispatch → ubuntu-latest; 'fuzz-rig' dispatch →
+    # the dedicated self-hosted box (needed to hold a multi-hour run).
+    runs-on: ${{ (github.event.inputs.runner == 'fuzz-rig') && fromJSON('["self-hosted","fuzz-rig"]') || 'ubuntu-latest' }}
+    # 6 h ceiling covers a real multi-hour gate run; the hosted smoke finishes in minutes.
+    timeout-minutes: 375
     steps:
       - uses: actions/checkout@v4
       - name: Install stable toolchain
@@ -55,8 +67,13 @@ jobs:
         run: |
           SECS="${{ github.event.inputs.seconds || '300' }}"
           SEED="${{ github.event.inputs.seed || '' }}"
-          echo "::notice::Soak for ${SECS}s (seed='${SEED:-default}')."
-          echo "::warning::CONTINGENT smoke, NOT the §14.13 multi-hour soak gate. Green here does not satisfy the gate; a failure is a real bug."
+          RUNNER="${{ github.event.inputs.runner || 'hosted' }}"
+          echo "::notice::Soak for ${SECS}s (seed='${SEED:-default}') on '${RUNNER}'."
+          if [ "$RUNNER" = "fuzz-rig" ] && [ "${SECS}" -ge 3600 ]; then
+            echo "::notice::Multi-hour run on the dedicated box — this accrues toward the §14.13 soak gate."
+          else
+            echo "::warning::CONTINGENT smoke, NOT the §14.13 multi-hour soak gate. Green here does not satisfy the gate; a failure is a real bug."
+          fi
           scripts/m9/soak.sh "${SECS}" "${SEED}"
 
       - name: Upload soak evidence
@@ -65,5 +82,5 @@ jobs:
         with:
           name: soak-${{ github.run_id }}
           path: soak-evidence.json
-          retention-days: 30
+          retention-days: 90
           if-no-files-found: warn
