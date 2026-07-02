@@ -20,8 +20,11 @@ readme = "README.md"
 #   - .github/       : CI/nightly workflows. Not needed off the repo.
 #   - fuzz/          : a separate cargo-fuzz crate; already skipped as it has its
 #                      own Cargo.toml, listed here for intent.
-# Tests and benches are intentionally kept (standard package contents; they do
-# not build for downstream consumers and add no runtime deps).
+#   - tests/         : integration + fault-injection harnesses (LazyFS, crash,
+#                      soak, differential; ~224K incl. a C shim). Never built for
+#                      downstream consumers, so they only bloat the package.
+#   - benches/       : criterion perf benches. Dev-only; the `[[bench]]` target
+#                      below still lets them run from the repo.
 exclude = [
     "src/bin",
     "CLAUDE.md",
@@ -29,6 +32,8 @@ exclude = [
     "scripts",
     ".github",
     "fuzz",
+    "tests",
+    "benches",
 ]
 
 [features]
