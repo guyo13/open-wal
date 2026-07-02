@@ -44,10 +44,19 @@ jobs:
     timeout-minutes: 2160             # 36 h ceiling (24 h run + slack)
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history: the baseline-ancestry check below needs the format-baseline
+          # commit (2b198e7) present locally. The default shallow clone (depth 1) has
+          # only HEAD, so `git merge-base --is-ancestor` fails with "Not a valid object".
+          fetch-depth: 0
 
       - name: Assert format baseline (gate clock)
         run: |
           BASE="${{ github.event.inputs.format_baseline || '2b198e7' }}"
+          if ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
+            echo "::error::Baseline commit $BASE is not present in this checkout — the clone is too shallow. Ensure actions/checkout uses fetch-depth: 0."
+            exit 1
+          fi
           if git merge-base --is-ancestor "$BASE" HEAD; then
             echo "::notice::HEAD $(git rev-parse --short HEAD) is at/after baseline $BASE — clock valid."
           else
