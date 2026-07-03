@@ -1,6 +1,6 @@
 [package]
 name = "open-wal"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 # Minimum supported Rust version: the floor implied by edition 2024. No feature
 # beyond this is used; bump deliberately if a later milestone needs a newer API.
