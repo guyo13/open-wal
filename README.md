@@ -113,9 +113,10 @@ still see breaking changes before 1.0. MSRV is 1.85.
 
 ## Learn more
 
-- **[The book](book/)** — a readable guide: getting started, the durability
-  model, recovery, checkpointing, backup and external readers. Build it locally
-  with `mdbook serve book`.
+- **[The book](https://guyo13.github.io/open-wal/)** — a readable guide:
+  getting started, the durability model, recovery, checkpointing, backup and
+  external readers. (Source in [`book/`](book/); build locally with
+  `mdbook serve book`.)
 - **[API docs on docs.rs](https://docs.rs/open-wal)** — every public item is
   documented.
 - **[Design specification](docs/wal_design_v6.md)** — the normative contract

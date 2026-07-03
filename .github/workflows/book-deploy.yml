@@ -1,0 +1,56 @@
+# Deploys the mdBook user guide (book/) to GitHub Pages at
+# https://guyo13.github.io/open-wal/ on every push to main that touches it.
+#
+# One-time repo setting required before the first deploy succeeds:
+#   Settings → Pages → Build and deployment → Source: "GitHub Actions".
+#
+# Per-PR validation (does the book still build?) is the separate blocking
+# `book (mdbook build)` job in ci.yml; this workflow only publishes.
+name: Deploy book
+
+on:
+  push:
+    branches: [main]
+    paths: ["book/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write # deploy to GitHub Pages
+  id-token: write # OIDC token for the Pages deployment
+
+# One Pages deployment at a time; don't cancel an in-flight deploy.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  # Keep in lockstep with the `book` job in ci.yml.
+  MDBOOK_VERSION: "0.5.3"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install mdbook
+        uses: peaceiris/actions-mdbook@v2
+        with:
+          mdbook-version: ${{ env.MDBOOK_VERSION }}
+      - name: mdbook build
+        run: mdbook build book
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: book/book
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
