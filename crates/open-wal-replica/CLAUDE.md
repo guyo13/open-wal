@@ -140,11 +140,13 @@ durability half of R1 is proven by the RM7 LazyFS headline (§15.7.6) — never 
 ## Environment & tooling
 
 - Rust stable, edition 2024, MSRV 1.85 (same as the WAL). Deps minimal: `open-wal`, `crc32c`;
-  `loom` under `[target.'cfg(loom)'.dev-dependencies]`; `proptest`, `tempfile`, `arbitrary`/
-  `cargo-fuzz` for tests.
+  `loom` under `[target.'cfg(loom)'.dependencies]` (NOT dev-deps — the lib itself is built with
+  `--cfg loom` as a regular dependency of `tests/loom_ring.rs`); `proptest`, `tempfile`,
+  `arbitrary`/`cargo-fuzz` for tests.
 - Always before declaring done: `cargo test -p open-wal-replica`,
   `cargo clippy -p open-wal-replica --all-targets -- -D warnings`, `cargo fmt --check`,
-  `RUSTFLAGS="--cfg loom" cargo test -p open-wal-replica --test loom_ring`, and the **root**
+  `RUSTFLAGS="--cfg loom" CARGO_TARGET_DIR=target/loom cargo test -p open-wal-replica --test
+  loom_ring --release`, and the **root**
   `cargo test` to prove `open-wal` is untouched.
 - Fault injection (RM7) needs the same LazyFS/FUSE Linux environment as the WAL's §14.4. If
   unavailable, say so and leave the gate open — never fake or skip it.
@@ -158,6 +160,86 @@ commit messages (e.g. "RM2: ring release watermark, R1 / loom L1"). If the desig
 underspecified, flag it and propose a fix — do not silently diverge.
 
 ## Project status (keep updated)
-- **Current milestone:** RM0 — not started
-- **RM2 loom gate:** NOT yet passed
+- **RM0 — DONE.** Workspace migration: root `Cargo.toml` gains `[workspace] members =
+  ["crates/open-wal-replica"], exclude = ["fuzz"]`; `open-wal` stays the root package and the
+  only default member, so every existing workflow/script invocation is byte-identical (verified:
+  root `cargo test` 137 passed and builds no replica code; root `clippy --all-targets`; MSRV
+  `cargo +1.85.0 check --all-targets --locked`; `cargo package --list` ships no `crates/` file;
+  `fuzz/` still resolves as its own workspace). `Cargo.lock` gained entries only (no existing
+  version moved). The root `lint` job's `cargo fmt --all -- --check` already covers members.
+  `publish.yml` now names `-p open-wal` for package+publish. New CI jobs (not edits to the
+  open-wal ones): `replica — test + clippy`, `replica — MSRV (1.85)`. Crate skeleton:
+  `ReplError` (§14, non-panicking, `#[non_exhaustive]`; adds `Remote{code,msg}` for a peer `ERR`),
+  `wire` codec (§6): `len:u32` counts type+body; pure, allocation-free `decode_frame` (bounded
+  `len` rejected from the prefix alone, unknown type / wrong fixed size / oversize payload /
+  unknown ERR code / non-UTF-8 msg ⇒ `Protocol`, RECORD CRC mismatch ⇒ `WireCrc`), plus a
+  bounded streaming `FrameReader` (keeps partial bytes across a read timeout). §15.1 codec tests
+  incl. every-bit-flip ⇒ `WireCrc` and an arbitrary-bytes proptest. `loom` is a
+  `[target.'cfg(loom)'.dependencies]` entry (NOT dev-deps: the lib itself is compiled with
+  `--cfg loom` as a regular dependency of `tests/loom_ring.rs`, where dev-deps are invisible).
+- **RM1 — DONE.** `Receiver<O: DurabilityObserver = NullObserver>` (§7): own WAL
+  (`open`/`open_with` — the observer variant serves §7.1 replica-hosted consumers, added after
+  PR #51; v7's `options().seed(..)` cold start is RM4), sends `HELLO{durable}`, accepts
+  `SERVING{from}` only if `from == last+1`, per RECORD: CRC (decoder) → **R3 hard check before
+  append** → append → R2 returned-LSN check; group commit on `batch_records`/`batch_interval`
+  (socket read timeout = the interval clock); `ACK{w}` with the value `commit` returned (R4).
+  On any error: commit+ACK what was validly appended, send `ERR(code)`, close (next HELLO then
+  has `durable == last`). Commit `Err` ⇒ `ERR(Poisoned)` and the receiver refuses all later
+  connections (reopen required). Tests (`tests/receiver.rs`, fake primary over loopback TCP):
+  P1 mirroring proptest (op-scripts on a 4 KiB-segment primary ⇒ rolls/splits; byte-identical,
+  same LSNs, ACKs survive reopen), P2 fault proptest (gap/dup/reorder/foreign/stale/bad-CRC ⇒
+  never appended, right `ERR`, reconnect converges), SERVING mismatch, batch_interval, heartbeat,
+  reseed, protocol/oversize, §7.1 observer-sees-only-committed. **Falsifiability shown:**
+  deleting the R3 check makes P2 fail (shrinks to `n=2, Gap`), then reverted. **Not tested
+  here:** the commit-failure ⇒ `ERR(Poisoned)` path (needs fault injection — §15.3 replica-poison
+  scenario, RM7).
+- **RM2 — DONE; the loom gate PASSES (L1–L6 green, all 7 mutations demonstrated to fail).**
+  `ring` (pub, SPMC, §8/§15.7): `Producer::capture` (memcpy into a preallocated slot; no I/O, no
+  syscall, no steady-state alloc; oversized payload grows its buffer once), `release(w)` (one
+  `Release` store + unpark per consumer, sends nothing, clamped to the last capture),
+  `Consumer::drain` (one `Acquire` load of `released` per pass, never emits past it), per-consumer
+  `Release` cursors with an `Acquire` **min** before in-place reuse, per-buffer generation tag +
+  reader pin (`tag<<8|readers`), eviction = tombstone CAS + spare buffer if pinned (never writes a
+  pinned buffer, never blocks, never drops the new capture) ⇒ `NeedsCatchUp`; writer-thread
+  `attach` (Ahead ⇒ §9 step 2 refusal, Behind ⇒ catch-up). Discontinuities are conservative
+  (re-capture after a failed commit tombstones the discarded tail — never resurrected; a
+  capture ≤ released writes nothing). All primitives via `src/sync.rs` (`cfg(loom)` swap).
+  `Shipper` (`#[cfg(not(loom))]`): `capture`/`on_commit`/`poll` on the writer thread; one network
+  thread per replica (+ an ack-reader) — connect/backoff, HELLO, join via the writer thread at
+  `durable+1` (R7), SERVING, RECORD stream, heartbeats, `ACK` ⇒ `replica_acked[id]` (an ack beyond
+  what was sent ends the connection), overflow ⇒ close + re-HELLO ⇒ rejoin if still in the ring
+  else `NeedsCatchUp` (held; RM3 serves it). `min_replica_acked_lsn` (never-acked counts as 0),
+  `replica_acked_lsn`, `replica_status`. **Tests:** ring unit tests; `tests/shipper.rs` — P3
+  never-ahead proptest (real WAL + shipper + receiver; `replica.last ≤ primary.durable`,
+  `acked ≤ replica.durable` at every step; converge byte-identical) **+ its negative control**
+  (release-on-capture misuse is detected by the same check), stalled-replica overflow (socket
+  really fills: ~34k records shipped, then `NeedsCatchUp` mid-stream and again on reconnect;
+  shipped prefix dense/no-dup/byte-identical; worst `capture` ≈ 0.2–3 ms, `on_commit` < 0.3 ms
+  vs a 30 s io_timeout), former-primary rejection, version mismatch, R7 primary restart;
+  `tests/ring_overflow.rs` — P4 proptest (tiny ring + simulated log catch-up: stream exactly
+  `1..=N`, no dup at any cutover; 273 `NeedsCatchUp` on a 2-slot ring). Disabling the consumer's
+  generation check makes P4 fail (shown, reverted).
+  **loom (`tests/loom_ring.rs`, imports the crate's ring):** L1 visibility, L2 never-ahead, L3
+  slot reuse, L4 eviction, L5 no lost wakeup, L6a/L6b SPMC. Bounds: L1/L2/L3/L5 exhaustive;
+  L4/L6a preemption bound 3; L6b bound 2 per-PR (bound 3 run once here: 1.45M iterations,
+  669 s, green). **Loom found a real bug**: `Relaxed` pins let the producer see a consumer's new
+  pin without its earlier unpin ⇒ "spare always free" invariant panicked (L4) ⇒ pins are now
+  `Release`. **Mutation results (each applied to `src/ring.rs`, run, reverted):**
+  | Mutation | Model | Result |
+  |---|---|---|
+  | `released.store` Release→Relaxed | L1 | FAIL — stale slot read ⇒ "NeedsCatchUp without overflow" |
+  | `released.load` Acquire→Relaxed | L1 | FAIL — same |
+  | remove min-cursor check before in-place reuse | L3 | FAIL — loom `Causality violation` (UnsafeCell) |
+  | free on ANY cursor (max) instead of min | L6b | FAIL — loom `Causality violation` |
+  | drop generation bump (tombstone) on eviction | L4 | FAIL — loom `Causality violation` |
+  | drop `unpark` in `release` | L5 | FAIL — loom deadlock (consumer parked forever) |
+  | re-read `released` mid-drain, send to new value | L2 | FAIL — "emitted N past its pass watermark" |
+  Model-strength fixes made to get there (recorded in design §15.7.8): L1's first version did
+  not catch the two L1 mutations because loom's `unpark` synchronizes the target immediately —
+  non-L5 models now register no waker and do bounded drain passes (no spinning: a spin made the
+  max-branch limit, not a real catch, fail M4). Spec refinements flagged in §15.7.8 (pinning
+  instead of overwrite-then-detect for L4; park/unpark instead of Condvar for L5).
+- **Current milestone:** RM3 (catch-up) — BLOCKED on WAL v7 (`options().seed(..)`,
+  `oldest_lsn()`, containing-segment `reader_from`).
+- **RM2 loom gate:** PASSED (see RM2 entry).
 - **WAL v7 dependency (RM3+):** pending

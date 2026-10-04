@@ -1,0 +1,41 @@
+[package]
+name = "open-wal-replica"
+version = "0.1.0"
+edition = "2024"
+# Same MSRV as `open-wal` (the edition-2024 floor). Verified in CI with
+# `cargo +1.85.0 check -p open-wal-replica --all-targets --locked`.
+rust-version = "1.85"
+description = "Async primary/replica log shipping for open-wal (static primary, N replicas)."
+license = "BSD-3-Clause"
+repository = "https://github.com/guyo13/open-wal"
+# Not published yet: the crate is pre-RM3 (catch-up needs WAL spec v7). Flip this
+# deliberately when the replica contract's §15.6 definition of done is met.
+publish = false
+exclude = ["CLAUDE.md", "tests"]
+
+[dependencies]
+# The WAL this crate replicates. Public API only (`Wal::open`/`append`/`commit`/
+# `durable_lsn`/`last_lsn`, `WalConfig`, `WalError`); never its internals.
+open-wal = { path = "../..", version = "0.2" }
+# Castagnoli CRC-32C for the wire `RECORD` checksum (§6, R9). NOT crc32fast — that
+# is the wrong polynomial (same footgun as the WAL, root CLAUDE.md).
+crc32c = "0.6"
+
+# loom model-checks the shipper ring (§15.7). It must be a *normal* dependency
+# (not a dev-dependency) gated on `cfg(loom)`: the ring's production code in
+# `src/` swaps its atomics/`UnsafeCell`/`Arc`/thread primitives for loom's under
+# `--cfg loom`, and the library is compiled as a regular (non-test) dependency of
+# `tests/loom_ring.rs`, where dev-dependencies are not visible to it. The cfg is
+# never set in a normal build, so this adds nothing to ordinary dependents.
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
+[dev-dependencies]
+# Property tests (§15.2 P1–P4).
+proptest = "1"
+# Temp directories for the primary/replica WALs in tests.
+tempfile = "3"
+
+[lints.rust]
+# `cfg(loom)` is set only via RUSTFLAGS="--cfg loom" for the §15.7 gate.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }

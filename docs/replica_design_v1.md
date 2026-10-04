@@ -203,6 +203,13 @@ HELLO; unknown type ⇒ `ERR(Protocol)`.
 | `ERR` | both | `code:u16, msg` | `Contiguity`, `WireCrc`, `Protocol`, `Poisoned`. Then close. |
 
 - `RECORD` batching: the sender MAY pack several records per TCP write; framing is per-record.
+- **Framing details (as built, RM0):** `len` counts the bytes *after* the length prefix (the
+  type byte plus the body), so a frame occupies `4 + len` bytes. `len = 0`, or `len` above the
+  receiver's bound (`1 + 12 + max_record_size`, or the `ERR` bound if larger), is `ERR(Protocol)`
+  and is rejected from the 4-byte prefix alone — no body is buffered. Type bytes are 1–7 in the
+  table's order. `ERR.code`: `Contiguity=1, WireCrc=2, Protocol=3, Poisoned=4` (unknown code ⇒
+  `ERR(Protocol)`); `ERR.msg` is UTF-8, ≤ 1024 bytes. `SERVING.primary_oldest = 0` means "not
+  reported" (RM2 sends 0; RM3 fills it from v7's `oldest_lsn()`).
 - Backpressure is TCP's; the shipper never blocks the writer thread waiting on the socket (§8.3).
 
 ---
@@ -412,7 +419,8 @@ costing a round-trip + remote fsync per acknowledged batch — documented as suc
 ## 14. Configuration, errors, milestones
 
 **`ShipperConfig`:** `ring_bytes` (e.g. 64 MiB), `replicas: Vec<Addr>`, `heartbeat`,
-`reconnect_backoff`. **`ReceiverConfig`:** `listen`, `wal_dir`, `wal_config`
+`reconnect_backoff`. *(As built: plus `slot_bytes` — the ring is `max(2, ring_bytes / slot_bytes)`
+fixed slots — and `max_reconnect_backoff`, `io_timeout`, `send_batch`.)* **`ReceiverConfig`:** `listen`, `wal_dir`, `wal_config`
 (`segment_size`/`max_record_size` MUST match the primary's), `batch_records`,
 `batch_interval`.
 
@@ -595,8 +603,44 @@ not ship it.
 - Exhaustive only for the modeled ring size/record count; larger configurations are covered by
   the §15.4 oracle and §15.5 crash matrices, not by loom.
 
+#### 15.7.8 As built (RM2) — refinements of §15.7.2–15.7.5, flagged for review
+The RM2 implementation follows §15.7's structure; the points below are where the text was
+underspecified or where loom showed it needed sharpening. None weakens R1.
+- **Eviction never writes a pinned slot.** L4 as worded ("evict the oldest slot and overwrite
+  it; a consumer whose cursor pointed at it observes the generation mismatch") is a data race
+  if that consumer is *mid-copy* when the producer overwrites — a seqlock over `UnsafeCell`
+  bytes, which loom (correctly) reports. As built, each payload buffer carries one atomic word
+  `tag << 8 | readers`; a consumer **pins** it with a CAS that succeeds only if `tag` is the
+  LSN it wants, copies out, then unpins (`Release`). Eviction **tombstones** the buffer with a
+  CAS (this is the generation bump: no new pin can succeed), overwrites it in place only if no
+  reader holds it, and otherwise retires it and remaps the slot to one of `consumers` spare
+  buffers (each consumer pins ≤ 1 buffer, so a spare always exists). A consumer that pinned
+  before the tombstone reads the genuine old record; every later one sees the mismatch ⇒
+  `NeedsCatchUp`. The §15.7.4 min-cursor `Acquire` remains the gate for **in-place** reuse.
+- **Pins are `Release` (found by loom).** With a `Relaxed` pin, the producer could observe a
+  consumer's *new* pin without its earlier unpin, count a released spare as still pinned, and
+  run out of spares (L4 hit the "spare always free" invariant). Pins stay non-`Acquire`, so
+  `released` remains the only producer→consumer edge for record data (what L1 checks).
+- **Wakeup is park/unpark, not `Mutex`+`Condvar`.** The writer must never take a lock a
+  consumer can hold (§4.2). The park token makes "consumer sees nothing → producer releases +
+  unparks → consumer parks" safe. The L5 mutation is "drop the `unpark` in `release`".
+- **Model hygiene (loom over-approximation).** loom's `unpark` joins the unparker's causality
+  into the target thread *immediately*, even if it never parks (`std` only orders memory for
+  the `park` that consumes the token). Models other than L5 therefore register **no** waker and
+  make a fixed number of concurrent drain passes (no spinning — a spin on `released` lets loom
+  feed stale values until "max branches"), then finish draining after `join`. Without this the
+  L1 `Release→Relaxed` mutations were masked; with it they fail.
+- **Preemption bounds.** L1, L2, L3, L5 are exhaustive (no bound). L4 and L6a run at
+  preemption bound 3, L6b at 2 (L6b at bound 3 ≈ 1.45M interleavings / 11 min — run once,
+  green); unbounded, these do not finish, and they are already at the §15.7.3 minimum size.
+  Every §15.7.5 mutation was shown to fail at the per-PR bounds.
+- **`loom` is a `[target.'cfg(loom)'.dependencies]` entry**, not a dev-dependency: the library
+  itself is compiled with `--cfg loom` as a regular dependency of `tests/loom_ring.rs`, where
+  dev-dependencies are invisible. The cfg is never set in a normal build.
+
 #### 15.7.7 Where it runs
-`RUSTFLAGS="--cfg loom" cargo test --test loom_ring`. Fast at this bound ⇒ **per-PR,
+`RUSTFLAGS="--cfg loom" cargo test -p open-wal-replica --test loom_ring --release` (`--release`
+only for speed; CI uses a separate `CARGO_TARGET_DIR`). Fast at this bound ⇒ **per-PR,
 blocking** (a loom failure is a real concurrency bug). Also `cargo test` (non-loom) MUST still
 build and run the ring's ordinary unit tests — the `cfg(loom)` swap must not change the
 non-loom code path.
