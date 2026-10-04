@@ -109,6 +109,40 @@ assert!(matches!(
 Pass the **same config** every time you open a given WAL directory; the config
 is not persisted in the log.
 
+## Open-time options
+
+`Wal::open` covers the common case. For anything that is chosen once, at open
+time, rather than being steady-state configuration, use the `Wal::options()`
+builder — `Wal::open(dir, config)` is exactly `Wal::options().open(dir, config)`:
+
+```rust,ignore
+// A replica seeded from a snapshot at LSN 1000 starts its own log at 1001,
+// mirroring the primary's LSN space.
+let (mut wal, report) = Wal::options()
+    .seed(Lsn(1001))          // cold-start origin; default Lsn(1)
+    .observer(MyObserver)     // optional; default NullObserver
+    .open(dir, WalConfig::default())?;
+assert_eq!(report.oldest_lsn, Lsn(1001));
+assert_eq!(report.durable_lsn, Lsn(1000));
+assert_eq!(wal.append(b"first")?, Lsn(1001));
+```
+
+- **`seed(initial_lsn)`** only matters when `open` finds an **empty**
+  directory: the first segment is created at that base, so the first `append`
+  gets `initial_lsn`. If the directory already holds a log the seed is
+  **ignored** and normal recovery runs — the on-disk log is authoritative, so
+  don't treat the seed as an assertion (a seeded log that later checkpoints
+  will have `oldest_lsn() > initial_lsn`). `Lsn(0)` is reserved and rejected
+  with `InvalidConfig`.
+- **`observer(o)`** is the same durability hook as `Wal::open_with`; see
+  [external access](external-access.md#publishing-the-watermark-durabilityobserver).
+
+The current retention floor — the oldest LSN still in the log — is available
+at any time as `wal.oldest_lsn()` (it equals `RecoveryReport::oldest_lsn` at
+open and moves forward on [checkpoint](checkpointing.md)). See §6/§8.4 of the
+[design spec](https://github.com/guyo13/open-wal/blob/main/docs/wal_design_v7.md)
+for the normative definition.
+
 ## Where to go next
 
 The single most important thing to understand before shipping anything on top

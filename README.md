@@ -119,7 +119,7 @@ still see breaking changes before 1.0. MSRV is 1.85.
   `mdbook serve book`.)
 - **[API docs on docs.rs](https://docs.rs/open-wal)** — every public item is
   documented.
-- **[Design specification](docs/wal_design_v6.md)** — the normative contract
+- **[Design specification](docs/wal_design_v7.md)** — the normative contract
   (durability invariants D1–D12, on-disk format, recovery algorithm) and the
   test plan behind the guarantees.
 

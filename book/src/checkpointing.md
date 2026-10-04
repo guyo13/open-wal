@@ -22,7 +22,8 @@ It deletes **whole sealed segments** that are fully at or below `up_to` —
 oldest first, followed by a directory fsync so the deletions are durable. It
 never rewrites, compacts, or partially truncates anything, and it **never
 deletes the active segment**. Afterwards the oldest available LSN advances;
-records above `up_to` are exactly as readable as before. If no segment is
+records above `up_to` are exactly as readable as before (`wal.oldest_lsn()`
+reports the new floor). If no segment is
 fully superseded, the call is a no-op — space is reclaimed at segment
 granularity, so `segment_size` is also your retention granularity.
 

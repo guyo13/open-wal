@@ -59,7 +59,7 @@ and removes multi-writer interleaving from the correctness argument. See
 This book is the human on-ramp. The normative contract — the twelve durability
 invariants (D1–D12), the exact on-disk byte layout, the recovery algorithm, and
 the fault-injection test plan that backs the guarantees — lives in the
-[design specification](https://github.com/guyo13/open-wal/blob/main/docs/wal_design_v6.md).
+[design specification](https://github.com/guyo13/open-wal/blob/main/docs/wal_design_v7.md).
 Where this book says "the log guarantees X", the spec is where X is stated
 precisely and mapped to tests. When in doubt, the spec wins.
 

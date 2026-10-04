@@ -121,7 +121,7 @@ swallow.
 
 Summing up the contract in user terms (the spec states these precisely as
 invariants D1–D12 in
-[§4 of the design spec](https://github.com/guyo13/open-wal/blob/main/docs/wal_design_v6.md)):
+[§4 of the design spec](https://github.com/guyo13/open-wal/blob/main/docs/wal_design_v7.md)):
 
 - After `commit()` returns `Ok(w)`, records `<= w` survive process crash and
   power loss.
