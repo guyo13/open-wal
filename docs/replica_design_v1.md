@@ -1,8 +1,8 @@
 # `open-wal-replica` — Design, Implementation & Test Specification
 
 **Status:** Draft **v1** — async master/slave, static primary, no election, no sharding.
-**Depends on:** `open-wal` at **spec v7** (`initial_lsn`, `oldest_lsn()`, containing-segment
-`reader_from`). Do not begin RM3+ until the v7 WAL delta has landed.
+**Depends on:** `open-wal` at **spec v7** (`Wal::options().seed(..)` cold-start seed,
+`oldest_lsn()`, containing-segment `reader_from`). Do not begin RM3+ until the v7 WAL delta has landed.
 **Intended audience:** a coding agent implementing the crate, plus a human reviewer.
 **Crate name:** `open-wal-replica` (owner's call; the name is not load-bearing).
 
@@ -150,7 +150,7 @@ Each maps to tests in §15.
   latest `commit() → Ok(w)` watermark. A CRC-valid captured record whose commit has not
   returned is **not shippable** (the §15.1 durability-visibility gap, applied to the ring).
 - **R2 — LSN mirroring.** Every record has the **same LSN** on primary and replica. The
-  replica's `Wal` is cold-started at the primary LSN it begins from (`initial_lsn`), and
+  replica's `Wal` is cold-started at the primary LSN it begins from (`Wal::options().seed(..)`), and
   because `append` assigns `last_lsn + 1`, mirroring holds iff R3 holds.
 - **R3 — Stream contiguity (hard check).** The receiver MUST verify each incoming record's
   `lsn == replica_wal.last_lsn() + 1` **before** `append`. Any other value (gap, duplicate,
@@ -210,7 +210,9 @@ HELLO; unknown type ⇒ `ERR(Protocol)`.
 ## 7. Receiver (replica) — NORMATIVE
 
 1. **Open** its own `Wal` in its own directory (`WalConfig` with the primary's
-   `segment_size`/`max_record_size`; `initial_lsn` per §10 on a fresh seed, else default).
+   `segment_size`/`max_record_size`; via `Wal::options().seed(Lsn(s_lsn + 1)).open(dir, cfg)`
+   on a fresh seed per §10, else plain `Wal::open`; add `.observer(o)` if the replica hosts
+   downstream consumers — §7.1).
    Recovery runs as usual; `durable_lsn` is the resume point.
 2. **Connect** to the primary; send `HELLO{durable_lsn}`.
 3. On `SERVING{from}`: assert `from == last_lsn() + 1`, else `ERR(Contiguity)`.
@@ -228,6 +230,36 @@ HELLO; unknown type ⇒ `ERR(Protocol)`.
 
 The receiver MUST NOT accept records out of order, MUST NOT append on a CRC failure, and
 MUST NOT ack `last_lsn`.
+
+### 7.1 Replica-hosted downstream consumers (NORMATIVE where marked)
+
+A replica is a full `open-wal` node, so it MAY host downstream consumers (read models,
+subscribers, a further replication tier) off its **own** `DurabilityObserver` or its own
+`on_commit`-style hook, instead of the primary publishing to every consumer. This is not just
+fan-out offload — it has a stronger safety property than primary-hosted publishing:
+
+- **What a replica publishes is durable on at least two nodes.** A replica's observer fires
+  after the *replica's* `commit() → Ok`, and by R1 every such record is already durable on the
+  primary. A consumer fed from a replica therefore never sees a record durable on only one node.
+- **It survives failover.** Under the §12.1 promotion rule (highest `durable_lsn` wins),
+  everything any replica has published is retained by the new primary. A consumer fed from the
+  *primary's* observer, by contrast, can see the un-shipped tail — records that are **lost**
+  when the primary dies — and act on data that does not survive. Replica-hosted publishing
+  bounds consumers to the 2-durable prefix at zero cost to primary latency: a poor-man's
+  semi-sync for the consumer path.
+- **Consequence (NORMATIVE):** the §12.1 rule "promote the replica with the highest
+  `durable_lsn`" is **load-bearing for consumer correctness**, not only for log density.
+  Promoting a lower replica while a higher one has published would make that higher replica's
+  consumers diverge from the new primary. Operators MUST NOT promote below the highest
+  publishing replica.
+- **Latency:** replica-fed publish latency = replication lag + the replica's group-commit
+  interval (`batch_records`/`batch_interval`). Tune the replica's batch for the consumer SLA.
+- **Consumer rule (NORMATIVE):** a replica-hosted consumer MUST act only on records the
+  replica has **committed** (observer / post-`commit` hook), never on `append` — the replica-side
+  analogue of R1.
+- **Chain replication** (a replica running its own `Shipper` fed by its own commits, i.e.
+  primary → A → B) is permitted by this architecture and needs no new mechanism; it is
+  deferred as a documented v1.x pattern, not built in v1.
 
 ---
 
@@ -316,7 +348,8 @@ Re-seed procedure (replica):
 2. Obtain snapshot `(s_lsn, stream)` from the primary (out-of-band transfer; v1 MAY ship it
    over the same TCP as a `SNAPSHOT` frame set, or use any side channel — implementation choice).
 3. `applier.apply(s_lsn, stream)`.
-4. `Wal::open` with `initial_lsn = s_lsn + 1` (WAL v7). Now `durable_lsn == s_lsn`.
+4. `Wal::options().seed(Lsn(s_lsn + 1))[.observer(o)].open(dir, cfg)` (WAL v7). Now
+   `durable_lsn == s_lsn`.
 5. `HELLO{durable_lsn = s_lsn}` ⇒ primary serves from `s_lsn + 1` (§9), which MUST be
    `≥ oldest_lsn` — the primary MUST NOT checkpoint past `s_lsn` while the re-seed is in
    flight (§11 margin), else the re-seed loops. Track in-flight re-seeds in the checkpoint policy.
@@ -347,7 +380,8 @@ up_to = min(latest_durable_snapshot_lsn,                 // WAL §9 rule — bin
    (config/orchestration). Async has no in-band fencing; this step is operational and MUST
    happen first.
 2. Choose the replica with the **highest `durable_lsn`** (query each). Because of R5, every
-   other replica is a prefix of it.
+   other replica is a prefix of it. **This choice is also load-bearing for any replica-hosted
+   consumers (§7.1):** promoting a lower replica would make consumers on a higher one diverge.
 3. That replica's `Wal` **is already a valid primary log** — the same directory, opened as the
    writer. Start the application as primary on it; start its `Shipper`.
 4. Point the remaining replicas at the new primary; they `HELLO` with their `durable_lsn` and
@@ -394,7 +428,7 @@ costing a round-trip + remote fsync per acknowledged batch — documented as suc
   until the ring's cross-thread barrier is model-checked).*
 - **RM3** — catch-up (§9) using WAL v7 `oldest_lsn()` + containing-segment `reader_from`.
   *§15.3 catch-up, §15.2 P5.*
-- **RM4** — re-seed traits + `initial_lsn` cold start; re-seed loop guard. *§15.3 re-seed.*
+- **RM4** — re-seed traits + `options().seed(..)` cold start; re-seed loop guard. *§15.3 re-seed.*
 - **RM5** — checkpoint policy helper + promotion runbook + former-primary rejection (§12.2).
   *§15.3 promotion, rejoin-rejected.*
 - **RM6** — model/oracle test (§15.4).
@@ -424,8 +458,8 @@ slot accounting (capture/release/free/evict).
 
 ### 15.3 Scenario / integration
 - **Ring overflow → catch-up → live cutover** with no gap/dup (assert at cutover).
-- **Re-seed end to end:** replica behind floor ⇒ `RESEED_REQUIRED` ⇒ snapshot ⇒ `initial_lsn =
-  s+1` ⇒ resume ⇒ converges; and the in-flight-reseed checkpoint guard prevents the loop.
+- **Re-seed end to end:** replica behind floor ⇒ `RESEED_REQUIRED` ⇒ snapshot ⇒
+  `options().seed(s+1).open(..)` ⇒ resume ⇒ converges; and the in-flight-reseed checkpoint guard prevents the loop.
 - **Promotion:** kill primary; promote highest replica; others catch up without truncation;
   content = dense prefix of old primary's durable log.
 - **Former primary rejoin is REJECTED:** old primary (ahead) sends HELLO ⇒ `ERR(Contiguity)`,
@@ -581,5 +615,5 @@ non-loom code path.
 - **Snapshot transport standardization** — v1 leaves it to the integrator.
 
 ## 17. References
-- open-wal `docs/wal_design_v7.md` §4 (D1–D12), §8.5, §9, §15 (esp. §15.1, §15.4, §15.7).
+- open-wal `docs/wal_design_v7.md` §4 (D1–D12), §6 (`OpenOptions`), §8.5, §9, §15 (esp. §15.1, §15.4, §15.7).
 - PostgreSQL streaming replication & `pg_basebackup`; Raft (Ongaro & Ousterhout) — for what v2 must add.
