@@ -175,6 +175,22 @@ underspecified, flag it and propose a fix — do not silently diverge.
   incl. every-bit-flip ⇒ `WireCrc` and an arbitrary-bytes proptest. `loom` is a
   `[target.'cfg(loom)'.dependencies]` entry (NOT dev-deps: the lib itself is compiled with
   `--cfg loom` as a regular dependency of `tests/loom_ring.rs`, where dev-deps are invisible).
-- **Current milestone:** RM1 (`Receiver`)
+- **RM1 — DONE.** `Receiver<O: DurabilityObserver = NullObserver>` (§7): own WAL
+  (`open`/`open_with` — the observer variant serves §7.1 replica-hosted consumers, added after
+  PR #51; v7's `options().seed(..)` cold start is RM4), sends `HELLO{durable}`, accepts
+  `SERVING{from}` only if `from == last+1`, per RECORD: CRC (decoder) → **R3 hard check before
+  append** → append → R2 returned-LSN check; group commit on `batch_records`/`batch_interval`
+  (socket read timeout = the interval clock); `ACK{w}` with the value `commit` returned (R4).
+  On any error: commit+ACK what was validly appended, send `ERR(code)`, close (next HELLO then
+  has `durable == last`). Commit `Err` ⇒ `ERR(Poisoned)` and the receiver refuses all later
+  connections (reopen required). Tests (`tests/receiver.rs`, fake primary over loopback TCP):
+  P1 mirroring proptest (op-scripts on a 4 KiB-segment primary ⇒ rolls/splits; byte-identical,
+  same LSNs, ACKs survive reopen), P2 fault proptest (gap/dup/reorder/foreign/stale/bad-CRC ⇒
+  never appended, right `ERR`, reconnect converges), SERVING mismatch, batch_interval, heartbeat,
+  reseed, protocol/oversize, §7.1 observer-sees-only-committed. **Falsifiability shown:**
+  deleting the R3 check makes P2 fail (shrinks to `n=2, Gap`), then reverted. **Not tested
+  here:** the commit-failure ⇒ `ERR(Poisoned)` path (needs fault injection — §15.3 replica-poison
+  scenario, RM7).
+- **Current milestone:** RM2 (`Shipper` + ring + loom gate)
 - **RM2 loom gate:** NOT yet passed
 - **WAL v7 dependency (RM3+):** pending
