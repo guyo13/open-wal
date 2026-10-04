@@ -195,3 +195,35 @@ jobs:
           mdbook-version: "0.5.3"
       - name: mdbook build
         run: mdbook build book
+
+  # ---------------------------------------------------------------------------
+  # open-wal-replica (crates/open-wal-replica) — NEW jobs; the open-wal jobs above
+  # are unchanged and still build/test only the root package (the workspace's
+  # default member). Formatting of this member is already covered by the `lint`
+  # job's `cargo fmt --all -- --check`.
+  # ---------------------------------------------------------------------------
+  replica:
+    name: replica — test + clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy
+        run: cargo clippy -p open-wal-replica --all-targets -- -D warnings
+      - name: test
+        run: cargo test -p open-wal-replica
+
+  replica-msrv:
+    name: replica — MSRV (1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust 1.85
+        uses: dtolnay/rust-toolchain@1.85.0
+      - uses: Swatinem/rust-cache@v2
+      - name: check
+        run: cargo check -p open-wal-replica --all-targets --locked

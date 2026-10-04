@@ -158,6 +158,23 @@ commit messages (e.g. "RM2: ring release watermark, R1 / loom L1"). If the desig
 underspecified, flag it and propose a fix — do not silently diverge.
 
 ## Project status (keep updated)
-- **Current milestone:** RM0 — not started
+- **RM0 — DONE.** Workspace migration: root `Cargo.toml` gains `[workspace] members =
+  ["crates/open-wal-replica"], exclude = ["fuzz"]`; `open-wal` stays the root package and the
+  only default member, so every existing workflow/script invocation is byte-identical (verified:
+  root `cargo test` 137 passed and builds no replica code; root `clippy --all-targets`; MSRV
+  `cargo +1.85.0 check --all-targets --locked`; `cargo package --list` ships no `crates/` file;
+  `fuzz/` still resolves as its own workspace). `Cargo.lock` gained entries only (no existing
+  version moved). The root `lint` job's `cargo fmt --all -- --check` already covers members.
+  `publish.yml` now names `-p open-wal` for package+publish. New CI jobs (not edits to the
+  open-wal ones): `replica — test + clippy`, `replica — MSRV (1.85)`. Crate skeleton:
+  `ReplError` (§14, non-panicking, `#[non_exhaustive]`; adds `Remote{code,msg}` for a peer `ERR`),
+  `wire` codec (§6): `len:u32` counts type+body; pure, allocation-free `decode_frame` (bounded
+  `len` rejected from the prefix alone, unknown type / wrong fixed size / oversize payload /
+  unknown ERR code / non-UTF-8 msg ⇒ `Protocol`, RECORD CRC mismatch ⇒ `WireCrc`), plus a
+  bounded streaming `FrameReader` (keeps partial bytes across a read timeout). §15.1 codec tests
+  incl. every-bit-flip ⇒ `WireCrc` and an arbitrary-bytes proptest. `loom` is a
+  `[target.'cfg(loom)'.dependencies]` entry (NOT dev-deps: the lib itself is compiled with
+  `--cfg loom` as a regular dependency of `tests/loom_ring.rs`, where dev-deps are invisible).
+- **Current milestone:** RM1 (`Receiver`)
 - **RM2 loom gate:** NOT yet passed
 - **WAL v7 dependency (RM3+):** pending
