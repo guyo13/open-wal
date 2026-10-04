@@ -3,7 +3,8 @@
 # lazyfs-gate.sh — build, mount, and run the LazyFS power-loss gate.
 #
 # The gate (`tests/lazyfs_gate.rs`, §14.4b + §14.4g, plus M4's §14.4c split-batch
-# and §14.4d dir-fsync negative control) needs a LazyFS/FUSE mount:
+# and §14.4d dir-fsync negative control; `tests/lazyfs_v7.rs` re-runs the
+# cold-start/roll/checkpoint cases at a v7 cold-start seed) needs a LazyFS/FUSE mount:
 # the WAL writes into the mount, data lives in LazyFS's page cache, and a
 # `lazyfs::clear-cache` command drops everything not `fdatasync`'d — a faithful
 # power loss. This script makes that environment reproducible locally, in CI, and
@@ -166,6 +167,10 @@ cmd_run() {
   ( cd "$REPO_ROOT" && \
     LAZYFS_MNT="$LAZYFS_MNT" LAZYFS_FIFO="$LAZYFS_FIFO" LAZYFS_LOG="$LAZYFS_LOG" \
     cargo test --test lazyfs_gate -- --ignored --test-threads=1 --nocapture )
+  # v7 §14.4c: the same power-loss cases with a cold-start seed (base = N).
+  ( cd "$REPO_ROOT" && \
+    LAZYFS_MNT="$LAZYFS_MNT" LAZYFS_FIFO="$LAZYFS_FIFO" LAZYFS_LOG="$LAZYFS_LOG" \
+    cargo test --test lazyfs_v7 -- --ignored --test-threads=1 --nocapture )
 
   # §14.4d negative control is DEFERRED to M8. It needs a build that omits the
   # roll's directory fsync to FAIL recovery — but LazyFS cannot model that: its
