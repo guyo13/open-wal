@@ -6,7 +6,7 @@ top of `open-wal` (static primary, N replicas, no election, no sharding). This k
 separate, parallel effort — do not block on it and do not touch `open-wal`'s `src/`).
 
 ## Read first — in this order, before any code
-1. `crates/open-wal-replica/CLAUDE.md` (provided; land it in RM0). Re-read before each milestone.
+1. `crates/open-wal-replica/CLAUDE.md` (already on `main`; read it). Re-read before each milestone.
 2. `docs/replica_design_v1.md` — the build contract. **§4.1–4.2** (why capture-at-append, thread
    model), **§5** (R1–R9), **§6** (wire), **§7** (receiver), **§8** (shipper/ring), and
    **§15.7 (loom) — read this BEFORE designing the ring; the loom tests pin its structure.**
