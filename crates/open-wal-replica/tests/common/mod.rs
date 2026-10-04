@@ -186,3 +186,63 @@ impl FakePrimary {
         rest
     }
 }
+
+/// A real `Receiver` serving connections in a loop on its own thread until
+/// [`ReplicaServer::stop`].
+pub struct ReplicaServer {
+    pub addr: SocketAddr,
+    pub watermarks: std::sync::Arc<open_wal_replica::ReplicaWatermarks>,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: JoinHandle<(Receiver, Vec<Result<(), ReplError>>)>,
+}
+
+impl ReplicaServer {
+    pub fn start(dir: &Path, cfg: ReceiverConfig) -> ReplicaServer {
+        Self::start_on(TcpListener::bind("127.0.0.1:0").expect("bind"), dir, cfg)
+    }
+
+    pub fn start_on(listener: TcpListener, dir: &Path, cfg: ReceiverConfig) -> ReplicaServer {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let mut rx = Receiver::open(dir, cfg).expect("receiver open");
+        let addr = listener.local_addr().unwrap();
+        let watermarks = rx.watermarks();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let st = std::sync::Arc::clone(&stop);
+        let handle = std::thread::spawn(move || {
+            let mut results = Vec::new();
+            loop {
+                let (s, _) = listener.accept().expect("accept");
+                if st.load(Ordering::Acquire) {
+                    return (rx, results);
+                }
+                results.push(rx.serve_connection(s));
+            }
+        });
+        ReplicaServer {
+            addr,
+            watermarks,
+            stop,
+            handle,
+        }
+    }
+
+    /// Stop accepting (the current connection must already be closed by the
+    /// primary) and return the receiver plus every session's result.
+    pub fn stop(self) -> (Receiver, Vec<Result<(), ReplError>>) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        let _ = TcpStream::connect(self.addr);
+        self.handle.join().expect("receiver thread")
+    }
+}
+
+/// Spin (sleeping briefly) until `f` holds or `secs` elapse; panics on timeout.
+pub fn wait_until(secs: u64, what: &str, mut f: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+    while !f() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}

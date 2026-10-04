@@ -227,3 +227,27 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: check
         run: cargo check -p open-wal-replica --all-targets --locked
+
+  replica-loom:
+    # RM2 GATE (§15.7): loom model-checks the shipper ring — L1 visibility,
+    # L2 never-ahead, L3 slot reuse, L4 eviction, L5 no lost wakeup, L6 SPMC —
+    # driving the crate's production `ring` compiled against loom's primitives
+    # (the `cfg(loom)` swap in src/sync.rs). Per-PR and BLOCKING: a loom failure
+    # is a real concurrency bug. `--release` only for speed (the models are
+    # identical); a separate target dir keeps the `--cfg loom` build from
+    # invalidating the normal one. Each §15.7.5 mutation was shown to fail its
+    # model (recorded in crates/open-wal-replica/CLAUDE.md).
+    name: replica — loom ring gate (§15.7 L1–L6)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: loom
+      - name: loom L1–L6
+        env:
+          RUSTFLAGS: --cfg loom
+          CARGO_TARGET_DIR: target/loom
+        run: cargo test -p open-wal-replica --test loom_ring --release
