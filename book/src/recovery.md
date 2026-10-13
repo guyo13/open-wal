@@ -81,7 +81,7 @@ shrink the log.
 
 These are user-facing distillations of invariants D1–D12; the precise
 normative statements and their test mapping are in
-[§4 of the design spec](https://github.com/guyo13/open-wal/blob/main/docs/wal_design_v6.md).
+[§4 of the design spec](https://github.com/guyo13/open-wal/blob/main/docs/wal_design_v7.md).
 
 ## One operational note: reopening after a crash
 

@@ -131,8 +131,28 @@ impl<O: DurabilityObserver> Wal<O> {
         config: WalConfig,
         observer: O,
     ) -> Result<(Wal<O>, RecoveryReport)> {
+        Self::open_seeded(dir, config, observer, Lsn::FIRST)
+    }
+
+    /// The shared open path behind [`open`](Wal::open), [`open_with`](Wal::open_with)
+    /// and [`OpenOptions::open`](crate::OpenOptions::open) (v7 §6). `seed` is the
+    /// cold-start origin (§8.4): honored **only** when the directory holds no log
+    /// (including one emptied by the §8.4 incomplete-create discard), ignored when
+    /// recovering an existing log — the on-disk log is authoritative. `open` /
+    /// `open_with` pass `Lsn::FIRST`, preserving the v6 behavior exactly.
+    pub(crate) fn open_seeded(
+        dir: &Path,
+        config: WalConfig,
+        observer: O,
+        seed: Lsn,
+    ) -> Result<(Wal<O>, RecoveryReport)> {
         // §5.3 precondition, additive form (no `segment_size - 91` underflow).
         if u64::from(config.max_record_size) + 91 > config.segment_size {
+            return Err(WalError::InvalidConfig);
+        }
+        // v7 §11: `Lsn(0)` is the reserved "none" sentinel, never a record LSN, so
+        // it can never be a segment base (header decode rejects it too).
+        if seed.is_none() {
             return Err(WalError::InvalidConfig);
         }
 
@@ -172,7 +192,7 @@ impl<O: DurabilityObserver> Wal<O> {
         Self::discard_incomplete_highest(dir, &mut bases, config)?;
 
         let rec = if bases.is_empty() {
-            Self::cold_start(dir, config.segment_size)?
+            Self::cold_start(dir, config.segment_size, seed)?
         } else {
             Self::recover_all(dir, &bases, config)?
         };
@@ -204,18 +224,22 @@ impl<O: DurabilityObserver> Wal<O> {
         Ok((wal, report))
     }
 
-    /// Cold start (§8.4): create `…0001.wal`, then fsync the directory so the
-    /// new filename is durable (§7.4 step 5).
-    fn cold_start(dir: &Path, segment_size: u64) -> Result<Recovered> {
-        let active = segment::create(dir, Lsn::FIRST, segment_size)?;
+    /// Cold start (§8.4): create `{seed:020}.wal` (`…0001.wal` by default), then
+    /// fsync the directory so the new filename is durable (§7.4 step 5). A cold
+    /// start at `seed = N` is structurally identical to the post-checkpoint state
+    /// `P = N` that recovery already handles (v7 §8.4, §4 D2). `seed ≥ 1` is
+    /// validated by the caller.
+    fn cold_start(dir: &Path, segment_size: u64, seed: Lsn) -> Result<Recovered> {
+        let active = segment::create(dir, seed, segment_size)?;
         fsync_dir(dir)?;
-        // base 1, empty: write offset just past the header, durable_lsn = 0.
+        // base `seed`, empty: write offset just past the header,
+        // durable_lsn = seed − 1 (no underflow: seed ≥ 1).
         Ok(Recovered {
             active,
             write_offset: HEADER_SIZE,
-            last_lsn: Lsn::NONE,
-            oldest_lsn: Lsn::FIRST,
-            segments: vec![Lsn::FIRST],
+            last_lsn: Lsn(seed.0 - 1),
+            oldest_lsn: seed,
+            segments: vec![seed],
             tail_state: TailState::Clean,
         })
     }
@@ -518,24 +542,39 @@ impl<O: DurabilityObserver> Wal<O> {
         self.last_lsn
     }
 
+    /// Current retention floor `P`: the base LSN of the oldest surviving segment
+    /// (v7 §6). Equals [`RecoveryReport::oldest_lsn`] at open and advances on
+    /// [`checkpoint`](Wal::checkpoint). A [`reader_from`](Wal::reader_from) below
+    /// it is a fatal gap (§15.4).
+    #[must_use]
+    pub fn oldest_lsn(&self) -> Lsn {
+        self.oldest_lsn
+    }
+
     /// A streaming replay [`Reader`] starting at `from` (§6).
     ///
     /// `from == Lsn(0)` means "from the beginning". A `from` below the oldest
     /// available LSN is a fatal gap (§15.4) — the needed records were
-    /// checkpointed away; never a silent skip. (Dormant in M2, where
-    /// `oldest_lsn == 1`.)
+    /// checkpointed away; never a silent skip.
+    ///
+    /// The reader starts in the segment **containing** `from` (the greatest
+    /// `base_lsn ≤ from`, found by binary search over the sorted segment list —
+    /// §8.5, v7), so the cost of positioning is one segment scan from that
+    /// segment's start to `from`, not a scan of the whole retained log.
     pub fn reader_from(&self, from: Lsn) -> Result<Reader<'_>> {
         if from.0 != 0 && from < self.oldest_lsn {
             return Err(WalError::ContiguityViolation);
         }
         let effective_from = if from.0 == 0 { Lsn::FIRST } else { from };
-        // Open the oldest segment for the reader. (Opening it here, before any
-        // measured `Reader::next`, keeps the single-segment read hot path
+        let start = containing_segment_idx(&self.segments, effective_from);
+        // Open the containing segment for the reader. (Opening it here, before
+        // any measured `Reader::next`, keeps the single-segment read hot path
         // zero-alloc; crossing a boundary later opens the next file lazily.)
-        let first = File::open(self.dir.join(segment::filename_for(self.segments[0])))?;
+        let first = File::open(self.dir.join(segment::filename_for(self.segments[start])))?;
         Ok(Reader::new(
             &self.dir,
             &self.segments,
+            start,
             first,
             effective_from,
             self.segment_size,
@@ -617,6 +656,17 @@ fn deletable_prefix_len(bases: &[Lsn], up_to: Lsn) -> usize {
     // binary-searches the cut in O(log N). `b.0 − 1` cannot underflow: a valid base
     // is ≥ 1 (`Lsn(0)` is the reserved sentinel, rejected at header decode).
     bases[1..].partition_point(|&b| b.0 - 1 <= up_to.0)
+}
+
+/// Index of the segment containing `from` (§8.5, v7): the greatest `bases[i] ≤
+/// from`. Segment `i` covers `[bases[i], bases[i+1])` (dense, contiguous —
+/// validated by recovery), so that segment holds `from` if it exists at all. A
+/// `from` below `bases[0]` (only reachable for "from the beginning" on a log
+/// whose floor is above 1) maps to the oldest segment; a `from` past the last
+/// assigned LSN maps to the active segment (the reader then yields nothing).
+/// `bases` is sorted ascending and non-empty (the writer's invariant).
+fn containing_segment_idx(bases: &[Lsn], from: Lsn) -> usize {
+    bases.partition_point(|&b| b <= from).saturating_sub(1)
 }
 
 /// `fsync` a directory so a newly-created filename within it is durable (§7.4).
@@ -1309,5 +1359,459 @@ mod tests {
         wal.poisoned = true;
         assert!(matches!(wal.checkpoint(Lsn(2)), Err(WalError::Poisoned)));
         assert!(dir.path().join(segment::filename_for(Lsn(1))).exists());
+    }
+
+    // ----- v7: OpenOptions seed, oldest_lsn(), containing-segment reader_from -----
+
+    /// The `*.wal` filenames in `dir`, sorted.
+    fn wal_files(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok()?.file_name().into_string().ok())
+            .filter(|n| n.ends_with(".wal"))
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// Replay everything from `from` as owned `(lsn, payload)` pairs.
+    fn replay(wal: &Wal<impl DurabilityObserver>, from: Lsn) -> Vec<(u64, Vec<u8>)> {
+        let mut r = wal.reader_from(from).unwrap();
+        let mut out = Vec::new();
+        while let Some(rec) = r.next() {
+            let (lsn, p) = rec.unwrap();
+            out.push((lsn.0, p.to_vec()));
+        }
+        out
+    }
+
+    #[test]
+    fn v7_seed_zero_is_invalid_config() {
+        // v7 §11: `Lsn(0)` is the reserved "none" sentinel — never a base.
+        let dir = tmp();
+        let path = dir.path().join("wal");
+        assert!(matches!(
+            Wal::options().seed(Lsn::NONE).open(&path, cfg()),
+            Err(WalError::InvalidConfig)
+        ));
+        // Rejected before touching the filesystem: no directory, no segment.
+        assert!(!path.exists());
+        // Also rejected (not ignored) when a log already exists — validation is
+        // unconditional, so a bad seed is never silently accepted.
+        drop(Wal::open(dir.path(), cfg()).unwrap());
+        assert!(matches!(
+            Wal::options().seed(Lsn(0)).open(dir.path(), cfg()),
+            Err(WalError::InvalidConfig)
+        ));
+    }
+
+    #[test]
+    fn v7_default_options_equal_open() {
+        // `open(d,c)` ≡ `options().open(d,c)`; both cold-start at base 1.
+        let a = tmp();
+        let b = tmp();
+        let (wa, ra) = Wal::open(a.path(), cfg()).unwrap();
+        let (wb, rb) = Wal::options().open(b.path(), cfg()).unwrap();
+        for (w, r) in [(&wa, ra), (&wb, rb)] {
+            assert_eq!(r.oldest_lsn, Lsn(1));
+            assert_eq!(r.durable_lsn, Lsn(0));
+            assert_eq!(r.tail_state, TailState::Clean);
+            assert_eq!(w.oldest_lsn(), Lsn(1));
+            assert_eq!(w.segments, vec![Lsn(1)]);
+        }
+        assert_eq!(wal_files(a.path()), wal_files(b.path()));
+        // An explicit seed of 1 is the same as the default.
+        let c = tmp();
+        let (_, rc) = Wal::options().seed(Lsn(1)).open(c.path(), cfg()).unwrap();
+        assert_eq!((rc.oldest_lsn, rc.durable_lsn), (Lsn(1), Lsn(0)));
+        assert_eq!(wal_files(c.path()), wal_files(a.path()));
+    }
+
+    #[test]
+    fn v7_cold_start_at_seed() {
+        // v7 §8.4: cold start at N ⇒ `{N:020}.wal`, oldest = N, durable = N − 1,
+        // first append ⇒ N. Includes a large N (filenames are 20-digit padded).
+        for n in [2u64, 1001, 1 << 40, u64::MAX / 2] {
+            let dir = tmp();
+            let (mut wal, report) = Wal::options().seed(Lsn(n)).open(dir.path(), cfg()).unwrap();
+            assert_eq!(report.oldest_lsn, Lsn(n), "n={n}");
+            assert_eq!(report.durable_lsn, Lsn(n - 1), "n={n}");
+            assert_eq!(report.tail_state, TailState::Clean);
+            assert_eq!(report.segments_scanned, 1);
+            assert_eq!(wal.oldest_lsn(), Lsn(n));
+            assert_eq!(wal.durable_lsn(), Lsn(n - 1));
+            assert_eq!(wal.last_lsn(), Lsn(n - 1));
+            assert_eq!(wal_files(dir.path()), vec![format!("{n:020}.wal")]);
+
+            assert_eq!(wal.append(b"first").unwrap(), Lsn(n));
+            assert_eq!(wal.append(b"second").unwrap(), Lsn(n + 1));
+            assert_eq!(wal.commit().unwrap(), Lsn(n + 1));
+            assert_eq!(
+                replay(&wal, Lsn(0)),
+                vec![(n, b"first".to_vec()), (n + 1, b"second".to_vec())]
+            );
+            drop(wal);
+
+            // Reopen (plain `open`, seed 1): the log is authoritative.
+            let (wal, report) = Wal::open(dir.path(), cfg()).unwrap();
+            assert_eq!(report.oldest_lsn, Lsn(n));
+            assert_eq!(report.durable_lsn, Lsn(n + 1));
+            assert_eq!(wal.oldest_lsn(), Lsn(n));
+            assert_eq!(replay(&wal, Lsn(n + 1)), vec![(n + 1, b"second".to_vec())]);
+            // Below the seeded floor is a fatal gap (§15.4), never a silent skip.
+            assert!(matches!(
+                wal.reader_from(Lsn(n - 1)),
+                Err(WalError::ContiguityViolation)
+            ));
+        }
+    }
+
+    #[test]
+    fn v7_seed_is_ignored_for_an_existing_log() {
+        // D7: recovery is authoritative; a different seed on reopen is ignored —
+        // whether the existing log is empty or populated, seeded or not.
+        let dir = tmp();
+        let (mut wal, _) = Wal::options()
+            .seed(Lsn(500))
+            .open(dir.path(), cfg())
+            .unwrap();
+        drop(wal);
+        // Empty seeded log, reopened with another seed: still based at 500.
+        let (w, r) = Wal::options().seed(Lsn(7)).open(dir.path(), cfg()).unwrap();
+        assert_eq!((r.oldest_lsn, r.durable_lsn), (Lsn(500), Lsn(499)));
+        wal = w;
+        wal.append(b"x").unwrap();
+        assert_eq!(wal.commit().unwrap(), Lsn(500));
+        drop(wal);
+        for other in [1u64, 499, 500, 501, 1 << 40] {
+            let (wal, r) = Wal::options()
+                .seed(Lsn(other))
+                .open(dir.path(), cfg())
+                .unwrap();
+            assert_eq!(
+                (r.oldest_lsn, r.durable_lsn),
+                (Lsn(500), Lsn(500)),
+                "seed={other}"
+            );
+            assert_eq!(wal.oldest_lsn(), Lsn(500));
+            assert_eq!(wal_files(dir.path()), vec![format!("{:020}.wal", 500)]);
+        }
+        // And an unseeded (base-1) log ignores a seed too.
+        let d2 = tmp();
+        let (mut w, _) = Wal::open(d2.path(), cfg()).unwrap();
+        w.append(b"a").unwrap();
+        w.commit().unwrap();
+        drop(w);
+        let (_, r) = Wal::options().seed(Lsn(99)).open(d2.path(), cfg()).unwrap();
+        assert_eq!((r.oldest_lsn, r.durable_lsn), (Lsn(1), Lsn(1)));
+    }
+
+    #[test]
+    fn v7_seeded_with_observer_fires_seeded_lsns() {
+        // `options().seed(N).observer(o).open(..)` yields a `Wal<O>` whose
+        // observer sees the seeded LSN space — including across a split/roll.
+        #[derive(Default)]
+        struct Rec(Vec<Lsn>);
+        impl DurabilityObserver for Rec {
+            fn on_durable(&mut self, lsn: Lsn) {
+                self.0.push(lsn);
+            }
+        }
+        let dir = tmp();
+        let (mut wal, report): (Wal<Rec>, _) = Wal::options()
+            .seed(Lsn(1000))
+            .observer(Rec::default())
+            .open(dir.path(), tiny_cfg())
+            .unwrap();
+        assert_eq!(report.durable_lsn, Lsn(999));
+        wal.append(&[1u8; 200]).unwrap();
+        assert_eq!(wal.commit().unwrap(), Lsn(1000));
+        // Three more 200-byte records: 2 per tiny segment ⇒ a split + roll.
+        for i in 2..=4u8 {
+            wal.append(&[i; 200]).unwrap();
+        }
+        assert_eq!(wal.commit().unwrap(), Lsn(1003));
+        assert_eq!(wal.observer.0, vec![Lsn(1000), Lsn(1001), Lsn(1003)]);
+        assert_eq!(wal.segments, vec![Lsn(1000), Lsn(1002)]);
+
+        // Builder order does not matter: observer then seed.
+        let d2 = tmp();
+        let (mut w2, _) = Wal::options()
+            .observer(Rec::default())
+            .seed(Lsn(77))
+            .open(d2.path(), cfg())
+            .unwrap();
+        w2.append(b"y").unwrap();
+        w2.commit().unwrap();
+        assert_eq!(w2.observer.0, vec![Lsn(77)]);
+    }
+
+    #[test]
+    fn v7_open_with_equals_options_observer() {
+        // `open_with(d,c,o)` ≡ `options().observer(o).open(d,c)`: both base 1.
+        let a = tmp();
+        let b = tmp();
+        let (_, ra) = Wal::open_with(a.path(), cfg(), NullObserver).unwrap();
+        let (_, rb) = Wal::options()
+            .observer(NullObserver)
+            .open(b.path(), cfg())
+            .unwrap();
+        assert_eq!((ra.oldest_lsn, ra.durable_lsn), (Lsn(1), Lsn(0)));
+        assert_eq!((rb.oldest_lsn, rb.durable_lsn), (Lsn(1), Lsn(0)));
+        assert_eq!(wal_files(a.path()), wal_files(b.path()));
+    }
+
+    #[test]
+    fn v7_oldest_lsn_tracks_report_and_checkpoint() {
+        // `oldest_lsn()` equals `RecoveryReport::oldest_lsn` at open, is unmoved
+        // by commits/rolls, and advances on `checkpoint` (only).
+        let dir = tmp();
+        three_segment_log(dir.path()); // bases 1, 3, 5
+        let (mut wal, report) = Wal::open(dir.path(), tiny_cfg()).unwrap();
+        assert_eq!(wal.oldest_lsn(), report.oldest_lsn);
+        assert_eq!(wal.oldest_lsn(), Lsn(1));
+        wal.checkpoint(Lsn(1)).unwrap(); // nothing fully superseded
+        assert_eq!(wal.oldest_lsn(), Lsn(1));
+        wal.checkpoint(Lsn(2)).unwrap(); // seg 1 = [1,3) superseded
+        assert_eq!(wal.oldest_lsn(), Lsn(3));
+        wal.append(&[6u8; 200]).unwrap();
+        wal.append(&[7u8; 200]).unwrap();
+        wal.commit().unwrap(); // rolls to a new active segment
+        assert_eq!(wal.oldest_lsn(), Lsn(3));
+        wal.checkpoint(Lsn(6)).unwrap(); // segs 3 and 5 superseded
+        assert_eq!(wal.oldest_lsn(), Lsn(7));
+        assert_eq!(wal.oldest_lsn(), wal.segments[0]);
+        drop(wal);
+        let (wal, report) = Wal::open(dir.path(), tiny_cfg()).unwrap();
+        assert_eq!(report.oldest_lsn, Lsn(7));
+        assert_eq!(wal.oldest_lsn(), report.oldest_lsn);
+
+        // Seeded log: oldest_lsn() starts at the seed and advances past it.
+        let d2 = tmp();
+        let (mut w, r) = Wal::options()
+            .seed(Lsn(40))
+            .open(d2.path(), tiny_cfg())
+            .unwrap();
+        assert_eq!((w.oldest_lsn(), r.oldest_lsn), (Lsn(40), Lsn(40)));
+        for i in 0..5u8 {
+            w.append(&[i; 200]).unwrap();
+        }
+        assert_eq!(w.commit().unwrap(), Lsn(44)); // bases 40, 42, 44
+        w.checkpoint(Lsn(43)).unwrap();
+        assert_eq!(w.oldest_lsn(), Lsn(44));
+    }
+
+    #[test]
+    fn v7_containing_segment_idx_math() {
+        // §8.5: greatest base ≤ from; below the first base ⇒ 0; past the end ⇒
+        // the active segment.
+        let bases = [Lsn(1), Lsn(3), Lsn(6)];
+        let cases: &[(u64, usize)] = &[
+            (0, 0),
+            (1, 0),
+            (2, 0),
+            (3, 1),
+            (5, 1),
+            (6, 2),
+            (7, 2),
+            (u64::MAX, 2),
+        ];
+        for &(from, want) in cases {
+            assert_eq!(
+                containing_segment_idx(&bases, Lsn(from)),
+                want,
+                "from={from}"
+            );
+        }
+        assert_eq!(containing_segment_idx(&[Lsn(10)], Lsn(1)), 0);
+        assert_eq!(containing_segment_idx(&[Lsn(10)], Lsn(10)), 0);
+        assert_eq!(containing_segment_idx(&[Lsn(10), Lsn(20)], Lsn(9)), 0);
+        assert_eq!(containing_segment_idx(&[Lsn(10), Lsn(20)], Lsn(19)), 0);
+        assert_eq!(containing_segment_idx(&[Lsn(10), Lsn(20)], Lsn(20)), 1);
+    }
+
+    /// Assert `reader_from(from)` opens `want_base` and yields exactly the records
+    /// `≥ from` of `all` (dense from `all[0].0`), in order (D6).
+    fn assert_seek(
+        wal: &Wal<impl DurabilityObserver>,
+        all: &[(u64, Vec<u8>)],
+        from: u64,
+        want_base: Lsn,
+    ) {
+        let r = wal.reader_from(Lsn(from)).unwrap();
+        assert_eq!(
+            r.open_segment_base(),
+            Some(want_base),
+            "reader_from({from}) must open the containing segment"
+        );
+        drop(r);
+        let start = from.max(1);
+        let want: Vec<(u64, Vec<u8>)> = all.iter().filter(|(l, _)| *l >= start).cloned().collect();
+        assert_eq!(replay(wal, Lsn(from)), want, "from={from}");
+    }
+
+    #[test]
+    fn v7_reader_from_opens_the_containing_segment() {
+        // §8.5 (v7): the reader opens the greatest base ≤ from — NOT segments[0] —
+        // and still yields exactly the records ≥ from in order (D6). Covers from
+        // == a base, base − 1, mid-segment, the durable tip, and past it.
+        let dir = tmp();
+        let payloads = three_segment_log(dir.path()); // bases 1, 3, 5; LSNs 1..=5
+        let (wal, _) = Wal::open(dir.path(), tiny_cfg()).unwrap();
+        let all: Vec<(u64, Vec<u8>)> = (1..=5u64).zip(payloads).collect();
+        assert_eq!(replay(&wal, Lsn(0)), all);
+        let cases: &[(u64, u64)] = &[
+            (0, 1), // "from the beginning"
+            (1, 1),
+            (2, 1), // base 3 − 1
+            (3, 3), // == base
+            (4, 3), // base 5 − 1
+            (5, 5), // == active base == durable_lsn
+            (6, 5), // past durable_lsn ⇒ active segment, nothing yielded
+            (1000, 5),
+        ];
+        for &(from, base) in cases {
+            assert_seek(&wal, &all, from, Lsn(base));
+        }
+    }
+
+    #[test]
+    fn v7_reader_from_seeks_in_a_seeded_checkpointed_log() {
+        // Same, on a log cold-started at 100 and checkpointed (oldest > seed): the
+        // seek uses the live segment list, below-floor stays a fatal gap.
+        let dir = tmp();
+        let (mut wal, _) = Wal::options()
+            .seed(Lsn(100))
+            .open(dir.path(), tiny_cfg())
+            .unwrap();
+        let mut all = Vec::new();
+        for i in 0..7u8 {
+            let p = vec![i; 200];
+            let lsn = wal.append(&p).unwrap();
+            all.push((lsn.0, p));
+        }
+        assert_eq!(wal.commit().unwrap(), Lsn(106));
+        assert_eq!(wal.segments, vec![Lsn(100), Lsn(102), Lsn(104), Lsn(106)]);
+        wal.checkpoint(Lsn(101)).unwrap();
+        assert_eq!(wal.oldest_lsn(), Lsn(102));
+        let all: Vec<(u64, Vec<u8>)> = all.into_iter().filter(|(l, _)| *l >= 102).collect();
+        assert!(matches!(
+            wal.reader_from(Lsn(101)),
+            Err(WalError::ContiguityViolation)
+        ));
+        let cases: &[(u64, u64)] = &[
+            (0, 102),
+            (102, 102),
+            (103, 102),
+            (104, 104),
+            (105, 104),
+            (106, 106),
+            (107, 106),
+        ];
+        for &(from, base) in cases {
+            assert_seek(&wal, &all, from, Lsn(base));
+        }
+    }
+
+    // §14.4a/§14.4c (v7): cold-start-at-N crash points, fabricated
+    // deterministically (the same §8.4 machinery as the roll case, now with
+    // base = N). `segment::create` = create_new (size 0) → fallocate (zeros) →
+    // header pwrite → fdatasync; `cold_start` then fsyncs the directory.
+
+    #[test]
+    fn v7_crash_after_create_before_fallocate_recovers() {
+        // Crash right after create_new: a size-0 `{N}.wal`, no records ⇒ §8.4
+        // discard, then cold start at the (re)open's seed (D9).
+        let n = 5000u64;
+        let dir = tmp();
+        File::create(dir.path().join(segment::filename_for(Lsn(n)))).unwrap();
+        let (mut wal, r) = Wal::options().seed(Lsn(n)).open(dir.path(), cfg()).unwrap();
+        assert_eq!((r.oldest_lsn, r.durable_lsn), (Lsn(n), Lsn(n - 1)));
+        assert_eq!(r.tail_state, TailState::Clean);
+        assert_eq!(wal.append(b"a").unwrap(), Lsn(n));
+        wal.commit().unwrap();
+        assert_eq!(replay(&wal, Lsn(0)), vec![(n, b"a".to_vec())]);
+    }
+
+    #[test]
+    fn v7_crash_after_fallocate_before_header_recovers() {
+        // Crash after pre-allocation, before the header write: a segment-sized
+        // all-zero `{N}.wal` ⇒ no valid header, no record ⇒ discard ⇒ cold start.
+        let n = 1u64 << 33;
+        let dir = tmp();
+        segment::create(dir.path(), Lsn(n), cfg().segment_size).unwrap();
+        let f = OpenOptions::new()
+            .write(true)
+            .open(dir.path().join(segment::filename_for(Lsn(n))))
+            .unwrap();
+        f.write_all_at(&[0u8; HEADER_SIZE as usize], 0).unwrap();
+        f.sync_data().unwrap();
+        drop(f);
+        let (_, r) = Wal::options().seed(Lsn(n)).open(dir.path(), cfg()).unwrap();
+        assert_eq!((r.oldest_lsn, r.durable_lsn), (Lsn(n), Lsn(n - 1)));
+        assert_eq!(wal_files(dir.path()), vec![format!("{n:020}.wal")]);
+    }
+
+    #[test]
+    fn v7_crash_with_torn_header_recovers() {
+        // Crash mid header write / before its fdatasync (torn header): discard ⇒
+        // cold start. No durable record ever existed, so nothing is lost even
+        // when the reopen supplies a *different* seed (it simply cold-starts
+        // there — the old file held no log).
+        let n = 321u64;
+        let dir = tmp();
+        segment::create(dir.path(), Lsn(n), cfg().segment_size).unwrap();
+        clobber_header(dir.path(), Lsn(n));
+        let (_, r) = Wal::options().seed(Lsn(n)).open(dir.path(), cfg()).unwrap();
+        assert_eq!((r.oldest_lsn, r.durable_lsn), (Lsn(n), Lsn(n - 1)));
+
+        let d2 = tmp();
+        segment::create(d2.path(), Lsn(n), cfg().segment_size).unwrap();
+        clobber_header(d2.path(), Lsn(n));
+        let (_, r) = Wal::options().seed(Lsn(9)).open(d2.path(), cfg()).unwrap();
+        assert_eq!((r.oldest_lsn, r.durable_lsn), (Lsn(9), Lsn(8)));
+        assert_eq!(wal_files(d2.path()), vec![format!("{:020}.wal", 9)]);
+    }
+
+    #[test]
+    fn v7_crash_before_dir_fsync_recovers() {
+        // Crash after the header is synced but before the dir-fsync: either the
+        // dirent survived (a valid empty segment at N ⇒ adopted as the empty
+        // active segment, durable = N − 1, and authoritative over any seed) or
+        // it was lost (empty dir ⇒ cold start at the seed). Both are valid D9
+        // outcomes; neither holds a durable record.
+        let n = 64u64;
+        let dir = tmp();
+        segment::create(dir.path(), Lsn(n), cfg().segment_size).unwrap(); // no dir-fsync
+        let (mut wal, r) = Wal::options().seed(Lsn(3)).open(dir.path(), cfg()).unwrap();
+        assert_eq!((r.oldest_lsn, r.durable_lsn), (Lsn(n), Lsn(n - 1)));
+        assert_eq!(wal.append(b"z").unwrap(), Lsn(n));
+        wal.commit().unwrap();
+        drop(wal);
+        let (wal, r) = Wal::open(dir.path(), cfg()).unwrap();
+        assert_eq!((r.oldest_lsn, r.durable_lsn), (Lsn(n), Lsn(n)));
+        assert_eq!(replay(&wal, Lsn(0)), vec![(n, b"z".to_vec())]);
+
+        // Dirent lost ⇒ the directory is empty ⇒ cold start at the seed.
+        let d2 = tmp();
+        let (_, r) = Wal::options().seed(Lsn(n)).open(d2.path(), cfg()).unwrap();
+        assert_eq!((r.oldest_lsn, r.durable_lsn), (Lsn(n), Lsn(n - 1)));
+    }
+
+    #[test]
+    fn v7_crash_during_first_roll_of_seeded_log_recovers() {
+        // The roll case on a seeded log: an incomplete highest-base file above a
+        // populated seeded segment is discarded; the seeded segment stays active.
+        let dir = tmp();
+        fab_segment(dir.path(), Lsn(900), &[b"a", b"b"]);
+        segment::create(dir.path(), Lsn(902), cfg().segment_size).unwrap();
+        clobber_header(dir.path(), Lsn(902));
+        let (wal, r) = Wal::options().seed(Lsn(1)).open(dir.path(), cfg()).unwrap();
+        assert_eq!((r.oldest_lsn, r.durable_lsn), (Lsn(900), Lsn(901)));
+        assert_eq!(wal.segments, vec![Lsn(900)]);
+        assert_eq!(
+            replay(&wal, Lsn(0)),
+            vec![(900, b"a".to_vec()), (901, b"b".to_vec())]
+        );
     }
 }

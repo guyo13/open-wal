@@ -3,7 +3,7 @@
 This chapter is a readable summary — enough to understand what the files are,
 reason about recovery, and write an external reader. The normative byte-level
 layout is
-[§5 of the design spec](https://github.com/guyo13/open-wal/blob/main/docs/wal_design_v6.md),
+[§5 of the design spec](https://github.com/guyo13/open-wal/blob/main/docs/wal_design_v7.md),
 which wins on any disagreement.
 
 ## Directory layout
