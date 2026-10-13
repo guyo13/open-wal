@@ -1,11 +1,17 @@
 # Write-Ahead Log (WAL) Component — Design, Implementation & Test Specification
 
-**Status:** **v7** — v6.1 plus three additive replication-support changes (Decision 7); all decisions resolved
+**Status:** **v7.1** — v6.1 plus three additive replication-support changes (Decision 7) and the v7.1 LSN-exhaustion fix; all decisions resolved
 **Target language:** Rust (stable)
 **Intended audience:** A coding agent implementing the component, plus a human reviewer.
 **Context:** Journal/WAL for an LMAX-style single-writer, event-sourced system with complex incremental business logic. Durability-first (acknowledge only after durable).
 
 ---
+
+## Changelog (v7 → v7.1)
+
+- **LSN space is finite; exhaustion is loud (§4 D2, §7.1, §8.1, §8.2, §10, §12).** `append` returns the new **non-poisoning** `LsnExhausted` when `last_lsn == u64::MAX` instead of reusing the LSN; recovery treats any non-sentinel bytes after a `u64::MAX` record as fatal corruption and a segment after a `u64::MAX`-max segment as a contiguity violation. Closes a D2/D6 duplicate-LSN hole made reachable by `OpenOptions::seed` (v7): `Lsn::next()` saturates, so `seed(Lsn(u64::MAX))` + two appends assigned `u64::MAX` twice and recovery accepted both. `Lsn::next()` is unchanged (public; still saturating, documented as **not** for sequencing); a new `Lsn::checked_next()` is used at all three sequencing sites. `seed(Lsn(u64::MAX))` stays legal: exactly one append succeeds.
+  - **Edge resolved during implementation (§8.2 step 7):** a file that physically ends fewer than 20 bytes after the `u64::MAX` record, with **all** remaining bytes zero, is the zero region cut short (§14.4f physical truncation / a partial §15.6 backup copy of the active segment), not "data after the last LSN": it is classified exactly as truncation is at any other LSN — active ⇒ torn tail at that offset (durably zero-extended), sealed ⇒ `Corruption`. Any non-zero byte there stays fatal `Corruption`. (Found by the F3 `DuplicateMaxLsn` control; without it a partial backup of an at-capacity log would be unrestorable.)
+  - **Tests:** `lsn::checked_next_detects_exhaustion`; `wal::tests::v71_*` (non-poisoning `LsnExhausted`, seed at/near `u64::MAX`, cross-segment `ContiguityViolation`, end-to-end `[MAX][MAX]` open failure); `recovery::tests::v71_*` (`[MAX][sentinel]` clean, **`[MAX][MAX]` ⇒ `Corruption`** — the regression test, wrapped LSN, garbage, a torn `MAX` record itself, physically truncated zero / non-zero tails); `tests/lsn_exhaustion_property.rs` (§14.2, seeds in `[u64::MAX−8, u64::MAX]`); F3 `Mutation::DuplicateMaxLsn`; §14.9 differential scenario cases (incl. short files) with the reference parser updated from this text. Falsifiability shown: reverting the recovery site to `next()` fails the `[MAX][MAX]` tests, the differential and F3; reverting the `append` site makes the seed tests assign a duplicate LSN.
 
 ## Changelog (v6.1 → v7)
 
@@ -152,7 +158,7 @@ The component is the `Wal`, owned by exactly one thread. After `commit()` return
 Each invariant maps to tests in §14. All MUST hold on honest hardware (§8.3, §14.8).
 
 - **D1 — Durability on commit.** After `commit()` returns `Ok(w)`, every record with `lsn ≤ w` is durable: it survives an immediate process crash *and* power loss.
-- **D2 — Dense, gap-free surviving suffix.** At all times the durable content is a contiguous run of LSNs `P..=k`, where `P` is the `base_lsn` of the *oldest surviving segment* (`P = 1` until the first checkpoint). Recovery MUST never produce an *internal* gap (a missing LSN between `P` and `k`). Recovery does **not**, and by design **cannot**, distinguish an authorized prefix deletion (`P > 1` via checkpoint) from an unauthorized one; preventing unauthorized deletion is the integrator's responsibility, anchored by its durable snapshot.
+- **D2 — Dense, gap-free surviving suffix.** At all times the durable content is a contiguous run of LSNs `P..=k`, where `P` is the `base_lsn` of the *oldest surviving segment* (`P = 1` until the first checkpoint). Recovery MUST never produce an *internal* gap (a missing LSN between `P` and `k`). The LSN space is `[1, u64::MAX]` (v7.1): a log with `last_lsn == u64::MAX` is **at capacity** — no further record can be appended (`LsnExhausted`, §7.1) and none may follow it on disk (§8.1, §8.2). Recovery does **not**, and by design **cannot**, distinguish an authorized prefix deletion (`P > 1` via checkpoint) from an unauthorized one; preventing unauthorized deletion is the integrator's responsibility, anchored by its durable snapshot.
 - **D3 — At-most-tail loss on crash.** A crash MAY lose only records appended but not yet covered by a returned `commit()`. It MUST NOT lose any record `≤` the last returned `durable_lsn`.
 - **D4 — Torn-tail truncation.** A partial/torn write at the physical tail MUST be detected (length bounds + CRC) and cleanly truncated; the truncated region MUST be invalidated per §8.2. A torn record MUST NOT be surfaced as valid.
 - **D5 — Mid-log corruption is fatal, not silent.** A corrupt record that is *not* the tail (a structurally valid record with the correct next LSN exists after it, within the bounded scan window) MUST cause recovery to halt with a distinct, loud error. It MUST NOT be silently truncated (that would discard acknowledged data). This is why the end-of-records sentinel is recognized only by an **all-zero header**, not `rec_type == 0` alone (§8.2 step 1): the CRC covers `rec_type`, so a corruption that zeroes an interior record's `rec_type` byte must fail the CRC and be classified as mid-log corruption, not mistaken for the sentinel.
@@ -350,7 +356,8 @@ The write handle MUST be `Send` but **not `Sync`**; write methods take `&mut sel
 
 1. Reject if `payload.len() > max_record_size` (`RecordTooLarge`).
 2. Reject if the handle is poisoned (`§12`).
-3. Assign `lsn = last_lsn + 1`.
+3. **(v7.1)** Reject if `last_lsn == u64::MAX` (`LsnExhausted`): the LSN space is exhausted. This is **not** a poison condition (§12) — nothing is modified (`last_lsn`, the staging buffer and the poison flag are untouched), a `commit` of already-appended records still succeeds, reads still work, and every further `append` returns `LsnExhausted` again. The integrator's recovery path is to rotate to a new log.
+3a. Assign `lsn = last_lsn + 1` (checked, never saturating — `Lsn::checked_next`).
 4. Encode the framed record into a reused in-memory staging buffer (no allocation in steady state). Update `last_lsn`.
 5. Return `lsn`.
 
@@ -409,7 +416,7 @@ Runs in `open`, single-threaded, before any append.
 
 1. List `<wal_dir>`, collect `*.wal`, parse `base_lsn` from each filename, **sort ascending** (never rely on directory iteration order — determinism).
 2. Validate each segment header (§5.2). A bad header on any **sealed** segment is fatal.
-3. Recover each segment's record range (§8.2). Verify **cross-segment continuity**: for each adjacent pair, `prev_segment_max_lsn + 1 == next_segment.base_lsn`. An internal gap here is fatal (`ContiguityViolation`, violates D2). **An empty segment has no `max_lsn` and MUST NOT participate as `prev_segment` in this check.** An empty segment is only valid as the **active** (highest-base) segment — e.g. after a crash immediately following a roll (§8.4) — in which case there is no subsequent segment to validate against. An empty *sealed* (non-highest-base) segment is a `ContiguityViolation` (fatal): a sealed segment must contain at least one record, since a roll only occurs to write records that did not fit.
+3. Recover each segment's record range (§8.2). Verify **cross-segment continuity**: for each adjacent pair, `prev_segment_max_lsn + 1 == next_segment.base_lsn`; **(v7.1)** if `prev_segment_max_lsn == u64::MAX` the log is at capacity and **no segment may follow** — a following segment (populated or empty) is `ContiguityViolation`. An internal gap here is fatal (`ContiguityViolation`, violates D2). **An empty segment has no `max_lsn` and MUST NOT participate as `prev_segment` in this check.** An empty segment is only valid as the **active** (highest-base) segment — e.g. after a crash immediately following a roll (§8.4) — in which case there is no subsequent segment to validate against. An empty *sealed* (non-highest-base) segment is a `ContiguityViolation` (fatal): a sealed segment must contain at least one record, since a roll only occurs to write records that did not fit.
 4. `oldest_lsn (P)` = base of the lowest segment. `durable_lsn (k)` = max LSN of the active segment after its tail handling; for an **empty active segment**, `k = base_lsn − 1` (e.g. base 101 ⇒ `durable_lsn = 100`, matching the prior segment's max). A missing *prefix* (`P > 1`) is accepted silently (authorized-checkpoint assumption; see §4 D2).
 
 ### 8.2 Intra-segment scan, tail handling, and corruption detection
@@ -427,6 +434,7 @@ For each record:
      - **Found ⇒ mid-log corruption ⇒ FATAL** (`TornMidLog`). The found record proves data after X was genuine and acknowledged; truncating would silently drop it (D5). *(This inference is sound because every prior truncation zeroed the post-tail region — §8.2.1 — so no stale-but-valid record can appear here; a valid record after a gap is therefore real corruption, not resurrection.)*
      - **Not found within the bound ⇒ torn tail.** Truncate logically at X, then **physically invalidate** the region from X to segment EOF, and record `TailState::TruncatedAt`; `durable_lsn` = last valid LSN before X. The invalidation MUST be durable before recovery completes (see §8.2.1).
 6. On a valid record: record `(lsn → offset)` into the **sparse index** (see §8.5), set `expected_next_lsn = lsn + 1`, advance by the padded record size.
+7. **(v7.1) At capacity.** If the valid record's `lsn == u64::MAX` there is no `expected_next_lsn`: the only legal continuation is the end of records (step 1 — the all-zero sentinel or `< 20` logical bytes). Any further bytes that are not the sentinel — whether they decode as a valid record (e.g. a duplicate `u64::MAX`) or as an invalid one — are fatal **`Corruption`** at that offset (no writer can produce them; §8.2.1 zeroing guarantees a genuine tail is zero), in active and sealed segments alike. The step-5 forward scan / torn-tail path does **not** apply. **Single exception:** if the file *physically* ends fewer than 20 bytes past that offset and every remaining byte is zero, that is the zero region cut short (§14.4f truncation / a partial §15.6 backup copy), classified exactly as truncation at any other LSN: active ⇒ torn tail at that offset (`TruncatedAt`, durably zero-extended per §8.2.1), sealed ⇒ `Corruption`. Recovery still terminates, reads at most 19 extra bytes, and never panics (D11).
 
 #### 8.2.1 Physical invalidation of a truncated tail (NORMATIVE)
 
@@ -474,7 +482,7 @@ Recovery MUST be a pure function of on-disk bytes — no wall clock, no environm
 ---
 
 ## 10. Error handling (NORMATIVE)
-`WalError` is a non-panicking enum with at least: `Io`, `Corruption { segment, offset, detail }`, `TornMidLog { segment, offset }`, `RecordTooLarge`, `InvalidConfig`, `BadSegmentHeader`, `Locked`, `FsyncFailed`, `ContiguityViolation`, `Poisoned`. The recovery parser MUST return errors, never panic, for all inputs (D11).
+`WalError` is a non-panicking enum with at least: `Io`, `Corruption { segment, offset, detail }`, `TornMidLog { segment, offset }`, `RecordTooLarge`, `InvalidConfig`, `BadSegmentHeader`, `Locked`, `FsyncFailed`, `ContiguityViolation`, `Poisoned`, and **(v7.1)** `LsnExhausted` (an `append` at `last_lsn == u64::MAX`; non-poisoning — §7.1, §12). The recovery parser MUST return errors, never panic, for all inputs (D11).
 
 ---
 
@@ -496,6 +504,8 @@ A failed `fdatasync`/`F_FULLFSYNC` is dangerous: on Linux a failed `fsync` may a
 - A retry-forever policy is **forbidden** — indistinguishable from a deadlock to the publish side and may silently lie about durability.
 
 *(The v1 `PropagateError`/"remain usable" option is removed: it was incompatible with a dense-LSN log.)*
+
+**(v7.1) `LsnExhausted` is NOT a poison condition.** It means the log is *full*, not *broken*: no durability was lost and no LSN slot is in doubt. It MUST NOT set the poison flag and MUST NOT touch `last_lsn` or the staging buffer; `commit` of already-appended records, reads, and `checkpoint` keep working, and every further `append` returns `LsnExhausted` again. Poison remains reserved for durability failures.
 
 ---
 
