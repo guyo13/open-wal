@@ -62,6 +62,18 @@ so the next format change has a precedent:
   174→316, structure 130→129, decode 17→40, model 321→348; per-target coverage
   rose (recovery 780→892, structure 561→592, model 798→839); zero crashes. The
   24-CPU-hour/target gate clock therefore starts at `2b198e7`.
+- **v7.1 (`d844d5f`, `Mutation::DuplicateMaxLsn` added to F3)** — `structure` only.
+  Adding an enum variant re-maps how existing corpus bytes `Arbitrary`-decode to
+  mutations (still valid inputs, but a stale coverage map — the same hygiene rule
+  as a format change, applied to a mutation-menu change). Regrown (`-max_total_time=300`,
+  278 148 execs, zero crashes) + `cargo fuzz cmin`: **129 → 141** minimized entries,
+  coverage **664 → 681** edges (features 1715 → 1794), 19 entries now reach
+  `DuplicateMaxLsn`. The presence check showed `cmin` had **dropped** the interior
+  `ZeroRecType` shape, so one fuzzer-found seed reaching it was re-added
+  (`54c1894f…`, see below) ⇒ **142** entries. *Open question (designer):* v7.1 also
+  changed recovery classification (the at-`u64::MAX` `Corruption` arm), which by the
+  §14.13 rule may reset the 24-CPU-hour clock and call for regrowing all four
+  targets; only `structure` was regrown here.
 
 ## Coverage & regression trust model
 
@@ -90,13 +102,18 @@ Those are the proof. The **fuzzer** additionally starts from that shape: the
 `structure` corpus already carries an interior-`ZeroRecType` entry (verified by
 replaying the target's `arbitrary` decode + record-build + mutation-selection logic
 over the committed corpus — 1 interior-`ZeroRecType` and 11 total-`ZeroRecType`
-entries as of the `2b198e7` regrow). It survives `cmin` because the
-`rec_type→0 → CRC-fail → classify → TornMidLog` path is a **distinct coverage arm**,
-so a coverage-preserving minimization keeps at least one entry reaching it. We
-therefore do **not** commit a redundant hand-authored seed; if a future regrow's
-`cmin` ever drops the shape (re-run the presence check), the two deterministic tests
-above still hold the line, and a fresh interior-`ZeroRecType` seed can be re-added
-then.
+entries as of the `2b198e7` regrow). **Correction (v7.1 regrow):** the shape is
+*not* guaranteed to survive `cmin` — the interior `rec_type→0 → CRC-fail → classify →
+TornMidLog` path shares its coverage with interior `FlipCrc`/`FlipBody` entries, and
+the v7.1 `cmin` dropped it. Per this policy a fresh seed was re-added:
+`corpus/structure/54c1894fb00b53174610d5f00c4c25dbf8b29530`, found by running the
+target with a temporary "panic on interior `ZeroRecType`" hook (the saved artifact is
+the seed), then confirmed against the real target. **Presence check** (re-run after
+every `structure` regrow): temporarily add
+`eprintln!("PRESENCE {:?} interior={}", s.mutation, m < n - 1)` after
+`apply_mutation`, run `cargo +nightly fuzz run structure -- -runs=0`, and
+`grep -o 'PRESENCE.*' | sort | uniq -c`; expect `ZeroRecType interior=true ≥ 1`.
+The two deterministic tests above hold the line regardless.
 
 ## CI
 
