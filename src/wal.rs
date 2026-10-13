@@ -370,7 +370,9 @@ impl<O: DurabilityObserver> Wal<O> {
             // Cross-segment continuity (§8.1 step 3): this segment's base must
             // immediately follow the previous non-empty segment's max LSN.
             // (`is_some_and` rather than a let-chain to stay on the 1.85 MSRV.)
-            if prev_max.is_some_and(|pm| pm.next() != base) {
+            // v7.1: a segment whose max is `u64::MAX` is at LSN capacity, so no
+            // segment may follow it (`checked_next() == None ≠ Some(base)`).
+            if prev_max.is_some_and(|pm| pm.checked_next() != Some(base)) {
                 return Err(WalError::ContiguityViolation);
             }
 
@@ -418,7 +420,10 @@ impl<O: DurabilityObserver> Wal<O> {
         if payload.len() > self.max_record_size as usize {
             return Err(WalError::RecordTooLarge);
         }
-        let lsn = self.last_lsn.next();
+        // v7.1 (§7.1): the LSN space is finite. At `last_lsn == u64::MAX` the log
+        // is full — `LsnExhausted`, which is NOT a poison condition (§12): no
+        // state is touched, prior appends still commit, reads still work.
+        let lsn = self.last_lsn.checked_next().ok_or(WalError::LsnExhausted)?;
         crate::record::encode_into(&mut self.staging, lsn, payload);
         self.last_lsn = lsn;
         Ok(lsn)
@@ -1813,5 +1818,147 @@ mod tests {
             replay(&wal, Lsn(0)),
             vec![(900, b"a".to_vec()), (901, b"b".to_vec())]
         );
+    }
+
+    // ----- v7.1: LsnExhausted (non-poisoning) + cross-segment capacity -----
+
+    const MAX: Lsn = Lsn(u64::MAX);
+
+    #[test]
+    fn v71_append_at_max_is_lsn_exhausted_and_not_poisoned() {
+        // A log at capacity is FULL, not BROKEN (§12): LsnExhausted leaves the
+        // handle usable — last/durable unchanged, the staged batch still commits,
+        // reads work, and every further append is LsnExhausted (never Poisoned).
+        let dir = tmp();
+        let (mut wal, _) = Wal::options()
+            .seed(Lsn(u64::MAX - 1))
+            .open(dir.path(), cfg())
+            .unwrap();
+        assert_eq!(wal.append(b"a").unwrap(), Lsn(u64::MAX - 1));
+        wal.commit().unwrap();
+        assert_eq!(wal.append(b"b").unwrap(), MAX); // staged, not yet committed
+        let staged = wal.staging.len();
+        assert!(matches!(wal.append(b"c"), Err(WalError::LsnExhausted)));
+        assert!(!wal.poisoned, "LsnExhausted must not poison");
+        assert_eq!(wal.last_lsn(), MAX);
+        assert_eq!(wal.durable_lsn(), Lsn(u64::MAX - 1));
+        assert_eq!(wal.staging.len(), staged, "staging must be untouched");
+        // Reads work before and after the commit.
+        assert_eq!(replay(&wal, Lsn(0)).len(), 1);
+        assert_eq!(wal.commit().unwrap(), MAX);
+        assert_eq!(
+            replay(&wal, Lsn(0)),
+            vec![(u64::MAX - 1, b"a".to_vec()), (u64::MAX, b"b".to_vec())]
+        );
+        // Repeatedly LsnExhausted, never Poisoned; commit stays a valid no-op.
+        for _ in 0..3 {
+            assert!(matches!(wal.append(b"d"), Err(WalError::LsnExhausted)));
+        }
+        assert_eq!(wal.commit().unwrap(), MAX);
+        assert!(wal.checkpoint(Lsn(0)).is_ok());
+        // An oversized payload still reports RecordTooLarge first (§7.1 order).
+        assert!(matches!(
+            wal.append(&vec![0u8; cfg().max_record_size as usize + 1]),
+            Err(WalError::RecordTooLarge)
+        ));
+        drop(wal);
+
+        // Recovery of the at-capacity log is clean and still refuses appends.
+        let (mut wal, r) = Wal::open(dir.path(), cfg()).unwrap();
+        assert_eq!((r.durable_lsn, r.tail_state), (MAX, TailState::Clean));
+        assert!(matches!(wal.append(b"e"), Err(WalError::LsnExhausted)));
+        assert!(!wal.poisoned);
+    }
+
+    #[test]
+    fn v71_seed_at_max_allows_exactly_one_append() {
+        // seed(u64::MAX) is legal (not rejected): one append at MAX, then full.
+        let dir = tmp();
+        let (mut wal, r) = Wal::options().seed(MAX).open(dir.path(), cfg()).unwrap();
+        assert_eq!((r.oldest_lsn, r.durable_lsn), (MAX, Lsn(u64::MAX - 1)));
+        assert_eq!(wal.append(b"only").unwrap(), MAX);
+        assert!(matches!(wal.append(b"dup"), Err(WalError::LsnExhausted)));
+        assert_eq!(wal.commit().unwrap(), MAX);
+        drop(wal);
+        let (wal, r) = Wal::open(dir.path(), cfg()).unwrap();
+        assert_eq!(r.durable_lsn, MAX);
+        assert_eq!(replay(&wal, Lsn(0)), vec![(u64::MAX, b"only".to_vec())]);
+    }
+
+    #[test]
+    fn v71_seed_near_max_yields_distinct_dense_lsns() {
+        // seed(MAX − 2): three appends succeed, the fourth is LsnExhausted, and the
+        // recovered LSNs are distinct and dense — also across a split/roll.
+        for config in [cfg(), tiny_cfg()] {
+            let dir = tmp();
+            let base = u64::MAX - 2;
+            let (mut wal, _) = Wal::options()
+                .seed(Lsn(base))
+                .open(dir.path(), config)
+                .unwrap();
+            for i in 0..3u64 {
+                assert_eq!(wal.append(&[i as u8; 200]).unwrap(), Lsn(base + i));
+            }
+            assert!(matches!(
+                wal.append(&[9u8; 200]),
+                Err(WalError::LsnExhausted)
+            ));
+            assert_eq!(wal.commit().unwrap(), MAX);
+            drop(wal);
+            let (wal, r) = Wal::open(dir.path(), config).unwrap();
+            assert_eq!((r.oldest_lsn, r.durable_lsn), (Lsn(base), MAX));
+            let got: Vec<u64> = replay(&wal, Lsn(0)).into_iter().map(|(l, _)| l).collect();
+            assert_eq!(got, vec![base, base + 1, u64::MAX]);
+        }
+    }
+
+    /// Hand-craft a segment at `base` holding records with the given explicit
+    /// `lsns` (which may repeat — impossible via the writer), via the production
+    /// encoder.
+    fn fab_lsns(dir: &Path, base: Lsn, lsns: &[u64]) {
+        let f = segment::create(dir, base, cfg().segment_size).unwrap();
+        let mut offset = HEADER_SIZE;
+        let mut buf = Vec::new();
+        for &l in lsns {
+            buf.clear();
+            offset += record::encode_into(&mut buf, Lsn(l), b"p") as u64;
+            f.write_all_at(&buf, offset - buf.len() as u64).unwrap();
+        }
+        f.sync_data().unwrap();
+    }
+
+    #[test]
+    fn v71_segment_after_max_segment_is_contiguity_violation() {
+        // §8.1 (v7.1): a sealed segment whose max is u64::MAX can have no
+        // successor. Saturating `next()` made `MAX.next() == MAX == base` pass;
+        // now it is ContiguityViolation — populated or empty successor.
+        for successor in [&[u64::MAX][..], &[][..]] {
+            let dir = tmp();
+            fab_lsns(dir.path(), Lsn(u64::MAX - 1), &[u64::MAX - 1, u64::MAX]);
+            fab_lsns(dir.path(), MAX, successor);
+            assert!(
+                matches!(
+                    Wal::open(dir.path(), cfg()),
+                    Err(WalError::ContiguityViolation)
+                ),
+                "successor {successor:?}"
+            );
+        }
+        // Control: the at-capacity segment alone opens cleanly.
+        let dir = tmp();
+        fab_lsns(dir.path(), Lsn(u64::MAX - 1), &[u64::MAX - 1, u64::MAX]);
+        let (_, r) = Wal::open(dir.path(), cfg()).unwrap();
+        assert_eq!(r.durable_lsn, MAX);
+    }
+
+    #[test]
+    fn v71_duplicate_max_on_disk_fails_open() {
+        // End-to-end via the public open path: [MAX][MAX] is fatal Corruption.
+        let dir = tmp();
+        fab_lsns(dir.path(), MAX, &[u64::MAX, u64::MAX]);
+        assert!(matches!(
+            Wal::open(dir.path(), cfg()),
+            Err(WalError::Corruption { segment, .. }) if segment == MAX
+        ));
     }
 }

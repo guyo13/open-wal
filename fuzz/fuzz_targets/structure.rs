@@ -49,6 +49,11 @@ enum Mutation {
     /// Set `rec_type` to a reserved value AND fix the CRC ⇒ a CRC-valid record
     /// the decoder rejects as `UnknownRecType` (invalid).
     ReservedRecType,
+    /// v7.1: lay the run so its last record is LSN `u64::MAX`, then append a
+    /// SECOND CRC-valid `u64::MAX` record (the duplicate-LSN hole). No writer can
+    /// produce it; recovery MUST classify it as fatal `Corruption` at the
+    /// duplicate's offset — never `Ok`. Handled by [`dup_max_case`].
+    DuplicateMaxLsn,
 }
 
 impl Mutation {
@@ -93,6 +98,10 @@ fuzz_target!(|s: Scenario| {
         segment_size: seg,
         max_record_size,
     };
+    if s.mutate && matches!(s.mutation, Mutation::DuplicateMaxLsn) {
+        dup_max_case(&s, cfg);
+        return;
+    }
     // base in [1, 1<<40] so base + n never overflows and the header accepts it.
     let base = (s.base % (1u64 << 40)) + 1;
 
@@ -245,6 +254,109 @@ fn apply_mutation(bytes: &mut [u8], mutation: Mutation, off: usize, framed: usiz
             let crc = open_wal::crc32c(&bytes[off + 4..off + framed]);
             bytes[off..off + 4].copy_from_slice(&crc.to_le_bytes());
         }
+        // Needs its own layout (a run ending at u64::MAX); never routed here.
+        Mutation::DuplicateMaxLsn => unreachable!("handled by dup_max_case"),
+    }
+}
+
+/// v7.1 `DuplicateMaxLsn`: build a dense run whose last record is LSN
+/// `u64::MAX`. Control: that run alone opens `Ok`, clean, `durable == MAX`, and
+/// `append` is `LsnExhausted` (not poisoned). Then add a second CRC-valid
+/// `u64::MAX` record: `open` MUST be fatal `Corruption` at its offset — never
+/// `Ok` (the pre-v7.1 bug accepted it), never `TornMidLog`/a torn tail.
+fn dup_max_case(s: &Scenario, cfg: WalConfig) {
+    let seg = cfg.segment_size as usize;
+    let payload_cap = (cfg.max_record_size as usize).min(64);
+    let mut plens: Vec<usize> = s.payloads.iter().take(6).map(|p| p.len().min(payload_cap)).collect();
+    if plens.is_empty() {
+        plens.push(0);
+    }
+    let dup_plen = plens[(s.byte_sel as usize) % plens.len()];
+    // Keep header + run + duplicate within one segment.
+    while !plens.is_empty()
+        && HEADER_SIZE + plens.iter().map(|&l| framed_size(l)).sum::<usize>() + framed_size(dup_plen) > seg
+    {
+        plens.pop();
+    }
+    if plens.is_empty() {
+        return;
+    }
+    let k = plens.len() as u64;
+    let base = u64::MAX - (k - 1); // records base..=u64::MAX
+    let payload = |i: usize, l: usize| -> Vec<u8> {
+        s.payloads.get(i).map_or_else(Vec::new, |p| p[..l.min(p.len())].to_vec())
+    };
+
+    let mut bytes = open_wal::fuzzing::segment_header_bytes(base);
+    let mut origs = Vec::new();
+    for (i, &l) in plens.iter().enumerate() {
+        let p = payload(i, l);
+        open_wal::fuzzing::encode_record_into(&mut bytes, base + i as u64, &p);
+        origs.push(p);
+    }
+    let dup_off = bytes.len();
+
+    // ---- control: the at-capacity run alone is clean ----
+    let dir = match tempfile::tempdir() {
+        Ok(d) => d,
+        Err(_) => return,
+    };
+    let path = dir.path().join(format!("{base:020}.wal"));
+    let mut control = bytes.clone();
+    control.extend(std::iter::repeat(0u8).take(s.trailing_zeros as usize));
+    if fs::write(&path, &control).is_err() {
+        return;
+    }
+    {
+        let (mut wal, report) = Wal::open(dir.path(), cfg).expect("at-capacity run must open");
+        assert_eq!(report.durable_lsn, Lsn(u64::MAX), "control: durable must be MAX");
+        // The file is written short (header + run + `trailing_zeros` zeros, not
+        // padded to `segment_size`). Fewer than 20 trailing zeros is the zero
+        // region physically cut short ⇒ a torn tail exactly at the end of the
+        // run (§14.4f); 20+ zeros is an all-zero sentinel ⇒ clean.
+        match report.tail_state {
+            TailState::Clean => {}
+            TailState::TruncatedAt { offset, .. } => {
+                assert!((s.trailing_zeros as usize) < 20, "control: truncated despite a full zero header");
+                assert_eq!(offset, dup_off as u64, "control: torn tail must be at the end of the run");
+            }
+        }
+        // Dense, byte-identical base..=u64::MAX (no `durable + 1` arithmetic).
+        let got = replay(&wal);
+        assert_eq!(got.len(), origs.len(), "control: replay length");
+        for (i, (lsn, payload)) in got.iter().enumerate() {
+            assert_eq!(*lsn, base + i as u64, "control: D2 not dense at {i}");
+            assert_eq!(payload, &origs[i], "control: D6 bytes differ at {lsn}");
+        }
+        assert!(
+            // Empty payload: RecordTooLarge is checked first, and the fuzzer can
+            // pick max_record_size == 0.
+            matches!(wal.append(b""), Err(WalError::LsnExhausted)),
+            "control: append at MAX must be LsnExhausted"
+        );
+        assert!(wal.commit().is_ok(), "control: LsnExhausted must not poison");
+    }
+
+    // ---- the duplicate: fatal Corruption at its offset ----
+    let dup_payload = payload((s.byte_sel as usize) % plens.len(), dup_plen);
+    open_wal::fuzzing::encode_record_into(&mut bytes, u64::MAX, &dup_payload);
+    bytes.extend(std::iter::repeat(0u8).take(s.trailing_zeros as usize));
+    if fs::write(&path, &bytes).is_err() {
+        return;
+    }
+    open_wal::fuzzing::scan_probe_reset();
+    let res = Wal::open(dir.path(), cfg);
+    assert!(
+        open_wal::fuzzing::scan_probe_peak() <= open_wal::fuzzing::scan_bound(cfg.max_record_size),
+        "forward scan exceeded bound"
+    );
+    match res {
+        Err(WalError::Corruption { segment, offset, .. }) => {
+            assert_eq!(segment, Lsn(base));
+            assert_eq!(offset, dup_off as u64, "duplicate MAX: wrong corruption offset");
+        }
+        Ok((_, r)) => panic!("D2/D6: duplicate u64::MAX record accepted (durable {})", r.durable_lsn.0),
+        Err(e) => panic!("duplicate u64::MAX must be Corruption, got {e:?}"),
     }
 }
 

@@ -20,6 +20,12 @@
 //! shared *dependency*, not shared *parse logic*; re-implementing CRC-32C would
 //! test the crate, not the parser.
 //!
+//! It also implements the **v7.1 LSN-capacity rule** (§8.2): after a record with
+//! LSN `u64::MAX` only the end of records may follow; any other bytes there are
+//! `Corruption` (never accepted, no forward scan) — except a physically
+//! truncated, all-zero remainder shorter than a record header, which is the zero
+//! region cut short and classifies like truncation anywhere (active ⇒ torn tail).
+//!
 //! It implements the **post-issue-#26 contract**: the sentinel is an all-zero
 //! 20-byte header, and a `rec_type == 0` record with a non-zero CRC is `Invalid`
 //! (→ `TornMidLog` interior / torn-tail at the end), never a clean sentinel. A
@@ -187,9 +193,41 @@ fn reference_classify(
     let mut offset = HEADER_SIZE as u64;
     let mut expected = base;
     let mut last_valid = base - 1; // base-1: empty segment ⇒ Clean{base-1} (§8.1)
+    // v7.1 (§4 D2, §8.2): the LSN space is [1, u64::MAX]. Once a record with
+    // LSN u64::MAX has been accepted the segment is at capacity: the ONLY legal
+    // continuation is the end of records; any further record — valid-looking or
+    // invalid — is fatal corruption at its offset, with no forward scan.
+    let mut at_capacity = false;
 
     loop {
-        match ref_read_record_at(bytes, offset, segment_size, max_record_size) {
+        let scan = ref_read_record_at(bytes, offset, segment_size, max_record_size);
+        if at_capacity {
+            return match scan {
+                RScan::CleanEnd => SegClass::Clean {
+                    max_lsn: last_valid,
+                },
+                RScan::Record { .. } => SegClass::Corruption { offset },
+                RScan::Invalid => {
+                    // Exception: the file physically ENDS within a record header
+                    // of `offset` and every remaining byte is zero — the zero
+                    // region cut short (§14.4f truncation / partial backup copy).
+                    // That is truncation like at any other LSN: a torn tail on
+                    // the active segment, fatal on a sealed one.
+                    let off = offset as usize;
+                    let rest = bytes.get(off..).unwrap_or(&[]);
+                    let zero_cut = rest.len() < REC_HEADER && rest.iter().all(|&b| b == 0);
+                    if is_active && zero_cut {
+                        SegClass::Truncated {
+                            offset,
+                            max_lsn: last_valid,
+                        }
+                    } else {
+                        SegClass::Corruption { offset }
+                    }
+                }
+            };
+        }
+        match scan {
             RScan::Record { lsn, framed } => {
                 if lsn != expected {
                     // A structurally valid record with the wrong LSN is invalid at
@@ -207,7 +245,11 @@ fn reference_classify(
                 }
                 last_valid = lsn;
                 offset += framed;
-                expected = lsn + 1;
+                if lsn == u64::MAX {
+                    at_capacity = true;
+                } else {
+                    expected = lsn + 1;
+                }
             }
             RScan::CleanEnd => {
                 return SegClass::Clean {
@@ -322,6 +364,18 @@ fn build_segment(base: u64, payloads: &[&[u8]]) -> (Vec<u8>, Vec<usize>) {
     for (i, p) in payloads.iter().enumerate() {
         offsets.push(bytes.len());
         fuzzing::encode_record_into(&mut bytes, base + i as u64, p);
+    }
+    (bytes, offsets)
+}
+
+/// Build `header(base) + records` with EXPLICIT LSNs (which may repeat or wrap —
+/// layouts no writer can produce), returning the bytes and each record's offset.
+fn build_segment_lsns(base: u64, records: &[(u64, &[u8])]) -> (Vec<u8>, Vec<usize>) {
+    let mut bytes = fuzzing::segment_header_bytes(base);
+    let mut offsets = Vec::new();
+    for &(lsn, p) in records {
+        offsets.push(bytes.len());
+        fuzzing::encode_record_into(&mut bytes, lsn, p);
     }
     (bytes, offsets)
 }
@@ -527,6 +581,65 @@ fn scenario_cases(h: &mut Harness) {
             bytes.resize(seg as usize, 0);
             for &active in &[true, false] {
                 h.check("len-over-max", &bytes, base, active, seg, max);
+            }
+        }
+
+        // 12. v7.1 LSN exhaustion (§8.2): after a `u64::MAX` record only the
+        //     all-zero sentinel may follow. [MAX][sentinel] ⇒ Clean{MAX};
+        //     [MAX][MAX] (the duplicate-LSN hole), [MAX][wrapped lsn 1] and
+        //     [MAX][garbage] ⇒ Corruption at the following offset (no forward
+        //     scan / torn tail, active or sealed).
+        {
+            const M: u64 = u64::MAX;
+            let mut cases: Vec<(&str, u64, Vec<u8>)> = Vec::new();
+            let (b, _) = build_segment_lsns(M, &[(M, &p(8))]);
+            cases.push(("v71-max-then-sentinel", M, b));
+            let (b, _) = build_segment_lsns(M - 1, &[(M - 1, &p(1)), (M, &p(20))]);
+            cases.push(("v71-run-to-max-then-sentinel", M - 1, b));
+            let (b, _) = build_segment_lsns(M, &[(M, &p(8)), (M, &p(8))]);
+            cases.push(("v71-dup-max", M, b));
+            let (b, _) = build_segment_lsns(M - 1, &[(M - 1, &p(0)), (M, &p(7)), (M, &p(7))]);
+            cases.push(("v71-run-to-max-dup", M - 1, b));
+            let (b, _) = build_segment_lsns(M, &[(M, &p(8)), (1, &p(8))]);
+            cases.push(("v71-max-then-wrapped", M, b));
+            let (mut b, _) = build_segment_lsns(M, &[(M, &p(8))]);
+            b.extend_from_slice(&[0xC3u8; 40]);
+            cases.push(("v71-max-then-garbage", M, b));
+            let (mut b, _) = build_segment_lsns(M, &[(M, &p(8))]);
+            let crc_dup = build_segment_lsns(M, &[(M, &p(8))]).0[HEADER_SIZE..].to_vec();
+            let mut torn = crc_dup;
+            torn[CRC_OFF] ^= 0xFF; // a CRC-corrupt (invalid) record after MAX
+            b.extend_from_slice(&torn);
+            cases.push(("v71-max-then-invalid-record", M, b));
+            for (label, base_m, mut bytes) in cases {
+                bytes.resize(seg as usize, 0);
+                for &active in &[true, false] {
+                    h.check(label, &bytes, base_m, active, seg, max);
+                }
+            }
+            // Physically SHORT files after the u64::MAX record (§14.4f truncation /
+            // a partial §15.6 backup copy) — NOT resized to `seg`. EOF right after
+            // the record, or a few zero bytes then EOF, is the zero region cut
+            // short (active ⇒ torn tail, sealed ⇒ Corruption); a few NON-zero
+            // bytes then EOF is data after the last LSN ⇒ Corruption.
+            let (rec, _) = build_segment_lsns(M, &[(M, &p(8))]);
+            let mut short: Vec<(&str, Vec<u8>)> = vec![("v71-max-eof", rec.clone())];
+            for k in [1usize, 5, 19] {
+                let mut z = rec.clone();
+                z.resize(rec.len() + k, 0);
+                short.push(("v71-max-short-zeros", z));
+                let mut g = rec.clone();
+                g.resize(rec.len() + k, 0);
+                *g.last_mut().unwrap() = 0x11;
+                short.push(("v71-max-short-nonzero", g));
+            }
+            let mut z20 = rec.clone();
+            z20.resize(rec.len() + 20, 0); // a full all-zero header ⇒ clean end
+            short.push(("v71-max-zero-header-eof", z20));
+            for (label, bytes) in short {
+                for &active in &[true, false] {
+                    h.check(label, &bytes, M, active, seg, max);
+                }
             }
         }
 
