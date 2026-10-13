@@ -1961,4 +1961,30 @@ mod tests {
             Err(WalError::Corruption { segment, .. }) if segment == MAX
         ));
     }
+
+    #[test]
+    fn v71_reader_stops_after_max_and_never_yields_a_duplicate() {
+        // Live-reader hygiene (v7.1 follow-up): the Reader sequences with
+        // `checked_next`, so after yielding `u64::MAX` nothing more is yielded —
+        // even if a CRC-valid duplicate `u64::MAX` record lands on disk after
+        // recovery (which recovery itself would refuse on the next open).
+        let dir = tmp();
+        let (mut wal, _) = Wal::options()
+            .seed(Lsn(u64::MAX - 1))
+            .open(dir.path(), cfg())
+            .unwrap();
+        wal.append(b"a").unwrap();
+        wal.append(b"last").unwrap();
+        assert_eq!(wal.commit().unwrap(), MAX);
+        // Plant a duplicate MAX record right after the last real one.
+        let mut buf = Vec::new();
+        record::encode_into(&mut buf, MAX, b"duplicate");
+        wal.active.write_all_at(&buf, wal.write_offset).unwrap();
+        assert_eq!(
+            replay(&wal, Lsn(0)),
+            vec![(u64::MAX - 1, b"a".to_vec()), (u64::MAX, b"last".to_vec())],
+            "the duplicate u64::MAX must not be yielded"
+        );
+        assert_eq!(replay(&wal, MAX), vec![(u64::MAX, b"last".to_vec())]);
+    }
 }
