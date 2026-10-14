@@ -39,7 +39,9 @@ pub struct Reader<'w> {
     /// after the stream ends.
     file: Option<File>,
     offset: u64,
-    expected_lsn: Lsn,
+    /// The LSN the next record must carry; `None` once a `u64::MAX` record has
+    /// been yielded — the LSN space is exhausted, so nothing may follow (v7.1).
+    expected_lsn: Option<Lsn>,
     from: Lsn,
     segment_size: u64,
     max_record_size: u32,
@@ -70,7 +72,7 @@ impl<'w> Reader<'w> {
             seg_idx: start,
             file: Some(first),
             offset: segment::HEADER_SIZE,
-            expected_lsn: segments[start],
+            expected_lsn: Some(segments[start]),
             from,
             segment_size,
             max_record_size,
@@ -166,7 +168,7 @@ impl<'w> Reader<'w> {
                     payload_len,
                     framed_len,
                 }) => {
-                    if lsn != self.expected_lsn {
+                    if Some(lsn) != self.expected_lsn {
                         // A clean log has dense, in-order LSNs across segments; a
                         // break ends the valid records (defensive — recovery
                         // already validated continuity).
@@ -174,7 +176,10 @@ impl<'w> Reader<'w> {
                         return None;
                     }
                     self.offset += framed_len as u64;
-                    self.expected_lsn = lsn.next();
+                    // `checked_next`, never the saturating `next()`: after
+                    // `u64::MAX` no record may follow, so a (corrupt) duplicate
+                    // `u64::MAX` ends the stream instead of being yielded (v7.1).
+                    self.expected_lsn = lsn.checked_next();
                     if lsn < self.from {
                         continue;
                     }
