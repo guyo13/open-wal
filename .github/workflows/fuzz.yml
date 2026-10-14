@@ -4,7 +4,8 @@ name: Fuzz (M9)
 # per-PR (the per-PR lane runs a short smoke in ci.yml). This is the same honest
 # stopgap as the LazyFS / dm-flakey gates: the §14.13 release gate is "≥ 24
 # CPU-hours PER TARGET accumulated since the last parser/format change
-# (currently 2b198e7, the all-zero-header sentinel fix), zero outstanding
+# (currently d844d5f, v7.1's at-u64::MAX recovery arm; F2/F4 carry over from
+# 2b198e7 — see fuzz/README.md), zero outstanding
 # crashes, bounded-scan counter never exceeded", which a hosted runner's short
 # nightly slice does NOT meet — so a green run here is CONTINGENT, not the gate.
 # A format change resets the clock and requires a corpus regrow + `cargo fuzz
@@ -64,7 +65,7 @@ jobs:
           MAX_TOTAL_TIME: ${{ github.event.inputs.max_total_time || '300' }}
         run: |
           echo "::notice::Fuzzing '${{ matrix.target }}' for ${MAX_TOTAL_TIME}s."
-          echo "::warning::Time-boxed CONTINGENT run, NOT the §14.13 release gate (>= 24 CPU-hours PER TARGET since the last format change, 2b198e7). Green here does not satisfy the gate; a crash is a real bug."
+          echo "::warning::Time-boxed CONTINGENT run, NOT the §14.13 release gate (>= 24 CPU-hours PER TARGET since the last format change, d844d5f for F1/F3; F2/F4 carry over from 2b198e7). Green here does not satisfy the gate; a crash is a real bug."
           cargo +nightly fuzz run "${{ matrix.target }}" --target x86_64-unknown-linux-gnu -- -max_total_time="${MAX_TOTAL_TIME}" -rss_limit_mb=4096
       - name: Upload corpus + crash artifacts
         if: always()

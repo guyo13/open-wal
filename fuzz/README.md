@@ -27,7 +27,8 @@ cargo +nightly fuzz run recovery -- -runs=100000
 
 # Long run (the §14.13 release gate: >= 24 CPU-hours PER TARGET, zero crashes,
 # bounded-scan counter never exceeded, accumulated SINCE the last parser/format
-# change — currently 2b198e7, the all-zero-header sentinel fix).
+# change — currently d844d5f for recovery/structure, v7.1; decode/model carry
+# over from 2b198e7 — see the regrow log below).
 cargo +nightly fuzz run recovery
 ```
 
@@ -70,10 +71,15 @@ so the next format change has a precedent:
   coverage **664 → 681** edges (features 1715 → 1794), 19 entries now reach
   `DuplicateMaxLsn`. The presence check showed `cmin` had **dropped** the interior
   `ZeroRecType` shape, so one fuzzer-found seed reaching it was re-added
-  (`54c1894f…`, see below) ⇒ **142** entries. *Open question (designer):* v7.1 also
-  changed recovery classification (the at-`u64::MAX` `Corruption` arm), which by the
-  §14.13 rule may reset the 24-CPU-hour clock and call for regrowing all four
-  targets; only `structure` was regrown here.
+  (`54c1894f…`, see below) ⇒ **142** entries.
+  **Gate clock (designer decision):** v7.1 added a recovery-classification arm (the
+  at-`u64::MAX` `Corruption` rule) — a classification change, like `2b198e7` — so the
+  §14.13 clock **resets to `d844d5f`** for the targets that can reach it: **F1
+  `recovery`** (its `Arbitrary` `base_lsn` spans all of `u64`) and **F3 `structure`**
+  (`DuplicateMaxLsn`). **F2 `decode` and F4 `model` carry over** from `2b198e7`: F2's
+  single-record decoder is byte-identical, and F4 has no seed so it cannot construct a
+  `u64::MAX` log. The 24-CPU-h gate was met at `2b198e7` for all four; F1 + F3 re-run
+  pending (~48 CPU-h). `fuzz-gate.yml` defaults `format_baseline` to `d844d5f`.
 
 ## Coverage & regression trust model
 
