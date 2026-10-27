@@ -360,9 +360,12 @@ Let `released` be the shipper's released watermark: the latest `on_commit(w)`, o
      the only guard (§5.1, §16).
 3. Else send `SERVING{from = d+1, primary_oldest = wal.oldest_lsn()}` (read at decision
    time) and serve `d+1..`. Serve from the ring if it holds the cursor. Otherwise serve from
-   the log in bounded chunks (§9.1) until the replica can cut over to the ring (§9.2). The
-   join answer for step 3 carries the first chunk answer, for `cursor = d + 1`, computed in
-   the same `poll`.
+   the log in bounded chunks (§9.1) until the replica can cut over to the ring (§9.2).
+   - **A join answer never opens a reader**, so it is never deferred and never capped. Step 3
+     applies §9.1 answers 1–2 at `cursor = d + 1` (Attached, or Wait).
+   - Where answer 3 would read, the join answers **NeedChunk** instead. The network thread
+     sends `SERVING`, which lets heartbeats flow, and then posts `Chunk{d + 1}`.
+   - A HELLO is therefore decided, and `SERVING` sent, within one `poll` of the join request.
 
 `d + 1` is always computed with `Lsn::checked_next()` (WAL v7.1), never the saturating
 `next()`. The same holds for every cursor advance below.
@@ -394,9 +397,14 @@ stall the writer for the whole lag and buffer it in memory. Therefore:
      the fast path for a replica whose `d + 1` is still in the ring.
   2. Else if `cursor > released` ⇒ **Wait**, **without opening a reader**. A replica that is
      caught up but outside the ring, or one that is ahead of `released`, costs no log I/O.
-  3. Else open `wal.reader_from(cursor)`. Copy records into the replica's chunk buffer while
-     `lsn ≤ released` and the copied payload stays within `catchup_chunk_bytes` (always at
-     least one record). Then `attach(id, last + 1)`:
+  3. Else, if this `poll` has already opened `catchup_replicas_per_poll` readers ⇒
+     **Deferred**. Nothing is read, and the network thread re-posts the same request at once.
+     Otherwise open `wal.reader_from(cursor)` and copy records into the replica's chunk buffer
+     while `lsn ≤ released` and the chunk's size stays within `catchup_chunk_bytes`, always
+     taking at least one record. The size counts **each record as `payload.len() + 32`
+     bytes**: the WAL's 20-byte header and padding on the read side, and the 17-byte `RECORD`
+     frame on the wire. A log of empty or tiny payloads therefore cannot make a chunk
+     unbounded. Then call `attach(id, last + 1)`:
      - Ok ⇒ **Chunk{records, attached}**;
      - `Behind` ⇒ **Chunk{records}**;
      - `Ahead` cannot occur, because of the ceiling.
@@ -417,10 +425,16 @@ stall the writer for the whole lag and buffer it in memory. Therefore:
     empty chunk.
   - `poll` returns `Err(ReplError::PrimaryLogUnreadable{lsn})`.
   - The replica's status becomes `Failed` and its session ends.
-  - The shipper remembers `lsn`. Any later request whose cursor is `≤ lsn` is answered
-    ReadFailed without reading. There is no rescan loop, and a ring copy of `lsn` is not
-    used to paper over it.
-  - The condition persists until the integrator recreates the `Shipper`.
+  - `lsn` is the LSN catch-up expected and did not get. The record that is actually corrupt
+    may be earlier in the same segment, because the reader's skip-scan passes through it and
+    the API does not say where it stopped.
+  - **Catch-up is then disabled for the whole shipper (sticky).** Every later chunk request,
+    from any replica and at any cursor, is answered ReadFailed{first lsn} without reading.
+    There is no rescan loop, and no ring copy is used to paper over a corrupt log.
+  - Replicas already streaming from the ring are unaffected.
+  - The condition persists until the integrator recreates the `Shipper`. A primary whose
+    committed log cannot be read is a WAL D5-class emergency: its next `open()` will refuse
+    it too.
 - **Poisoned primary.** `poll(wal)` MAY be called on a poisoned primary handle; the crate
   cannot detect poison through `&Wal`. The ceiling still binds: nothing above `released` is
   served, even though the file may hold CRC-valid records above it.
@@ -429,7 +443,15 @@ stall the writer for the whole lag and buffer it in memory. Therefore:
     waits on a lock or a queue.
   - At most one request per replica is outstanding.
   - Memory is one reused buffer per catching-up replica: `≤ catchup_chunk_bytes +
-    max_record_size` payload bytes.
+    max_record_size + 32` bytes, counted in the same per-record units as the chunk budget.
+- **`poll` always finishes its pass.**
+  - It answers every request it takes: answers, Deferred, errors.
+  - It collects errors and returns them after the pass, never part-way through with a
+    request left `TAKEN` or unanswered.
+  - Its pass starts at a rotating replica index, so a replica deferred by the cap is answered
+    first by a later `poll`.
+  - Every `poll` that has a chunk request opens at least one reader, unless catch-up is
+    disabled by a sticky ReadFailed. Catch-up therefore always makes progress.
 - **Writer stall per `poll` (honest bound).**
   - `reader_from(cursor)` starts at the base of the segment containing `cursor`. It reads and
     CRC-checks every earlier record in that segment (WAL §8.5). A `Reader` borrows `&Wal`, so
@@ -437,15 +459,21 @@ stall the writer for the whole lag and buffer it in memory. Therefore:
   - One answer that opens a reader therefore reads at most `segment_size +
     catchup_chunk_bytes + max framed record` bytes.
   - `poll` opens a reader for at most `catchup_replicas_per_poll` replicas, round-robin
-    (default 1). Answers that read nothing (Attached, Wait, join decisions) are not limited.
+    (default 1). Answers that read nothing are not limited: join decisions, NeedChunk,
+    Attached, Wait, Deferred, and a sticky ReadFailed.
   - The per-`poll` stall is therefore bounded by the chunk and segment sizes, not by the
     number of lagging replicas.
-  - Total log reads for a lag `L` are about `L · (1 + (S/C − 1)/2)`, where
-    `S = segment_size` and `C = catchup_chunk_bytes`. With `C ≥ S` this is `≤ 2L + S`.
+  - Read amplification depends on the chunk size `C = catchup_chunk_bytes`, the segment size
+    `S = segment_size`, and where in its segment the first chunk starts. Chunks start
+    wherever the previous one ended. For `C < S`, total log reads for a lag `L` are:
+    - about `L · (1 + S/(2C))` on average;
+    - `L · (1 + (S/C + 1)/2)` in the worst case.
+
+    For `C ≥ S` they are `≤ 2L + S`.
   - Measured hot-cache cost is about 12 ms per 16 MiB rescanned. With the WAL's default
     128 MiB segments, one answer can therefore stall the writer for about 100 ms.
-  - A replicated WAL SHOULD use `segment_size ≤ 32 MiB`. Then one answer reads ≤ 48 MiB and
-    the amplification is ≤ 1.5× at the default `C`.
+  - A replicated WAL SHOULD use `segment_size ≤ 32 MiB`. Then one answer reads ≤ 48 MiB, and
+    amplification at the default `C` is ≈ 2× on average and ≤ 2.5× in the worst case.
   - Removing the prefix rescan needs a resumable reader position from the WAL (§16). That is
     a WAL API change, out of RM3 scope.
   - Defaults: `catchup_chunk_bytes = 16 MiB`, `catchup_replicas_per_poll = 1`. Neither the
@@ -473,6 +501,8 @@ stall the writer for the whole lag and buffer it in memory. Therefore:
   - On **Chunk{records}**, it sends the records and posts the next chunk request.
   - On **Wait**, it posts the next request after the next release wake or `heartbeat`,
     whichever comes first.
+  - On **Deferred**, it re-posts the same request at once.
+  - On **NeedChunk** (a join answer), it sends `SERVING`, then posts `Chunk{d + 1}`.
   - `Consumer::resume()` MUST return the answered cursor. Otherwise the session ends with
     `ERR(Contiguity)`.
 - **Sending-side contiguity (R3, primary side; defence in depth).**
@@ -503,10 +533,20 @@ stall the writer for the whole lag and buffer it in memory. Therefore:
   leads to step 1 and R6.
 - **LSN domain.** The ring tags LSNs `≤ ring::MAX_LSN` (2^56 − 2). This rule is pulled forward
   from RM4, because RM3 makes mid-stream attach the normal path.
-  - `Shipper::new` MUST return `Err` when `wal.last_lsn() ≥ ring::MAX_LSN`.
-  - `Producer::capture` MUST check the bound on its fast path too: `lsn != next || lsn >
-    MAX_LSN` goes to the cold path. This is a producer-local compare that touches no atomic.
-  - If a capture crosses the bound at runtime, the shipper becomes **terminal**:
+  - `Shipper::new` MUST return `Err` when `wal.last_lsn() ≥ ring::MAX_LSN`, i.e. when the
+    next record could not be captured. It checks `checked_next` (`LsnExhausted`) first, then
+    the domain, so a WAL at `u64::MAX` keeps its RM2 error.
+    - A WAL seeded at `MAX_LSN + 1` (`last_lsn = MAX_LSN`) is refused.
+    - A WAL seeded at `MAX_LSN` (`last_lsn = MAX_LSN − 1`) is accepted and ships exactly the
+      record `MAX_LSN`.
+  - `Shipper::capture` MUST test `lsn > ring::MAX_LSN` itself, **before** calling the ring. On
+    a crossing it enters the terminal state without calling `Producer::capture`. The ring's
+    cold path `debug_assert!`s on that input, so it must never receive it.
+  - `Producer::capture` MUST also check the bound on its fast path (`lsn != next || lsn >
+    MAX_LSN` goes to the cold path). This is defence in depth for direct ring users: a
+    producer-local compare that touches no atomic. Ring unit tests prove it, in the existing
+    `catch_unwind` + `is_err() == cfg!(debug_assertions)` style.
+  - Once a capture crosses the bound at runtime, the shipper is **terminal**:
     - every session ends with `ERR(Protocol, "LSN domain exhausted")`;
     - statuses become `Failed`;
     - `poll` returns `Err(ReplError::LsnDomainExhausted)`.
@@ -522,8 +562,20 @@ network thread posts and the writer answers in a later `poll`.
   - A state word moves `IDLE → PENDING → TAKEN → DONE → IDLE`.
   - The writer touches the slot only between `TAKEN` and `DONE`.
   - The network thread touches it only in `IDLE`, or after it has observed `DONE`.
-  - The slot lives in its own module, written against the crate's loom-swappable atomics, so
-    §15.7 L8 drives the shipped code.
+  - The slot lives in its own module, written against the crate's loom-swappable
+    primitives. The answer and the chunk buffer sit in `crate::sync::UnsafeCell`, so loom
+    reports any unsynchronized access (the §15.7.2 analogue). The module is built under
+    `--cfg loom`; `shipper.rs` is not.
+  - The module exports the **whole sequences**, and `shipper.rs` calls them verbatim:
+    - `post(req)`;
+    - `answer(f)`: CAS `PENDING → TAKEN`, run `f` (which may call `Producer::attach`), write
+      the answer, store `DONE`;
+    - `abandon(consumer)`: CAS `PENDING → IDLE`; otherwise wait for `DONE`, detach if the
+      answer attached, store `IDLE`;
+    - `await_answer()`.
+
+    §15.7 L8 therefore drives the shipped sequences, and each L8 mutation is applied inside
+    them.
 - **Network thread.**
   - It detaches its consumer, fills the slot, and stores `PENDING` (Release). It then sets
     the shipper's pending flag and waits for `DONE` (Acquire).
@@ -832,11 +884,11 @@ very interleavings we want explored).
     - No eviction is possible, so assert exactly `[5, 6]` and `Streaming`. A spurious
       `NeedsCatchUp` fails it.
     - Exhaustive.
-- **L8 Handshake teardown (RM3, §9.3).** It drives the crate's request-slot module, not a
-  copy.
-  - The writer thread answers a pending request by attaching.
-  - Concurrently, the network thread abandons the session: it tries CAS `PENDING → IDLE`,
-    otherwise waits for `DONE` and detaches.
+- **L8 Handshake teardown (RM3, §9.3).** It drives the crate's request-slot module and its
+  exported sequences (`post`, `answer`, `abandon`), never a copy.
+  - The writer thread calls `answer` with an `f` that attaches.
+  - Concurrently, the network thread calls `abandon`. It waits with bounded `yield_now`
+    retries, never a spin on a single load.
   - End state: the consumer's cursor is `PARKED` (no stale attach) and the slot is `IDLE`.
     Loom reports no race on the slot's answer or buffer.
 
@@ -861,6 +913,7 @@ confirm loom reports a race or an assertion trips, revert, and record it in the 
 | *(RM3)* Network thread abandons a request with a plain store instead of the CAS | **L8** (stale attach) |
 | *(RM3)* Writer stores `DONE` before it attaches | **L8** |
 | *(RM3)* Network thread does not wait for `DONE` when the CAS fails | **L8** |
+| *(RM3)* Writer writes the answer **after** storing `DONE` | **L8** (loom `UnsafeCell` race) |
 
 If a mutation does **not** make its model fail, the model is too weak — fix the model, do
 not ship it.
