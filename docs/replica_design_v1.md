@@ -5,6 +5,9 @@
 `oldest_lsn()`, containing-segment `reader_from`). Do not begin RM3+ until the v7 WAL delta has landed.
 **Intended audience:** a coding agent implementing the crate, plus a human reviewer.
 **Crate name:** `open-wal-replica` (owner's call; the name is not load-bearing).
+**Revisions:** 2026-10-27 — §9 step 2 off-by-one fixed: the "ahead of the primary" test is
+`d > durable_lsn` (as §12.2 always said), not `d + 1 > durable_lsn`, which rejected every
+fully caught-up replica as a former primary.
 
 This is a build contract in the same style as the WAL spec: invariants are normative,
 tests are co-equal deliverables, and **the crate is "done" only when its fault-injection tests
@@ -311,9 +314,14 @@ Triggered by a replica `HELLO{durable_lsn = d}` (fresh connect, reconnect, or af
 overflow). On the **writer thread** (it needs `&Wal`):
 
 1. If `d + 1 < wal.oldest_lsn()` ⇒ send `RESEED_REQUIRED{oldest}` (R6). Stop.
-2. Else if `d + 1 > wal.durable_lsn()` ⇒ replica claims more than we have durably. This can
+2. Else if `d > wal.durable_lsn()` ⇒ replica claims more than we have durably. This can
    only be a **former primary or a bug** ⇒ send `ERR(Contiguity)`; the replica MUST NOT be
-   served (§12.2). Log loudly.
+   served (§12.2). Log loudly. (`d == wal.durable_lsn()` is a **fully caught-up** replica, not
+   an ahead one: step 3 serves it an empty range and it joins the live ring at
+   `durable_lsn + 1`.) Compute `d + 1` in steps 1 and 3 with `Lsn::checked_next()` (WAL v7.1),
+   never the saturating `next()` — `d` arrives off the wire. `None` means `d == u64::MAX`:
+   either it is ahead (step 2) or the primary's LSN space is exhausted too and there is
+   nothing to serve; never wrap or saturate it into a `from`.
 3. Else: send `SERVING{from = d+1}`; open `wal.reader_from(Lsn(d+1))`; for each record with
    `lsn ≤ wal.durable_lsn()` (re-read the watermark — never read past it, R1), copy to the
    network thread's queue. Stop at the watermark; the replica's cursor now joins the live ring
