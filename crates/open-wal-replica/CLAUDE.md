@@ -258,7 +258,54 @@ underspecified, flag it and propose a fix — do not silently diverge.
   `PROPTEST_CASES` already overrides `cases: N` (verified: P4 0.10 s → 7.5 s at 2000). Notes 2
   (`MAX_LSN` vs `seed`, RM4) and 7 (0.3.0 bump must also bump this crate's `open-wal`
   requirement) are tracked, not done here.
+- **RM2 review round 2 (2026-10-27, crate-wide review on #53; loom gate CONFIRMED by the
+  designer at `b72a2fd` — all 9 mutations re-derived independently).** Five fixes, each with a
+  regression test shown **failing on the unfixed code**, then passing:
+  - **R1 (major) honest ACKs killed sessions:** `stream_records` published `sent` only after
+    `write_all` returned, so a replica ACKing the front of a batch bigger than the socket buffers
+    tripped `ack_reader`'s `durable > sent` check. Fix: store `sent` **before** the write (every
+    receivable byte is already in `out`, so the R4 bound stays sound). Test
+    `acks_during_a_blocked_batch_write_keep_the_session` (512 × 60 KB records, `send_batch` 256,
+    real `Receiver` at `batch_records=1`): old ordering **144 sessions** ⇒ FAIL; fixed: 1 session,
+    acked == durable, byte-identical.
+  - **R2 (major) R4 had no independent oracle:** P3 compared acks with `ReplicaWatermarks.durable`,
+    which the receiver writes itself. Tests now open the replica via `open_with(DurableTap)` — a
+    `DurabilityObserver` the WAL fires inside `commit` after the sync — and assert every ACK is
+    `≤` the tap at receipt (P1 via `FakePrimary::await_ack_tapped`; P3 via `ReplicaServer.tap`).
+    **Mutation row (receiver, not ring):** `commit_and_ack` sends `ACK{last_lsn}` BEFORE
+    `wal.commit()` ⇒ P1 FAIL "R4: ACK 4 received while the replica WAL is durable only to 0", P3
+    FAIL (self-report check fired first). **Strong form** (also publish `watermarks.durable` early,
+    so the self-report agrees with the lie) ⇒ P3 FAIL on the tap alone: "R4: acked 5 > what the
+    replica WAL certified durable (0)". Reverted (file byte-compared).
+  - **R3 (major) a silent primary wedged the replica:** `ReceiverConfig::new` now defaults
+    `idle_timeout = Some(5 s)` (≥ 3× the 500 ms shipper heartbeat); `None` is documented as
+    disabling dead-primary detection. Tests `default_idle_timeout_detects_a_dead_primary` +
+    `half_open_primary_does_not_wedge_the_replica` (primary #1 acks then goes silent with its
+    socket open; the restarted primary's connection must be served): with `None` the second HELLO
+    never arrives ⇒ FAIL (20 s read timeout); fixed: served after ~5 s, resumes at durable 1.
+  - **R4 (minor) stale `acked` after wipe/re-seed:** on an accepted (not `JOIN_AHEAD`) HELLO the
+    shipper now `store`s the HELLO's `durable_lsn` into `acked` (doc comments updated). Test
+    `acked_drops_when_a_wiped_replica_says_hello`: old ⇒ `acked` stays 5 ⇒ FAIL; fixed ⇒ drops to 0.
+  - **R5 (minor) a poisoning commit could send no ERR:** `send_err` now sends `ERR(Poisoned)`
+    whenever the receiver is poisoned. Finding while writing the test: a mid-stream `Io` commit
+    failure was already reported as `Poisoned` (the end-of-session commit retry returns
+    `WalError::Poisoned`); the real hole is a session ending on an in-band fault (contiguity) whose
+    end-of-session commit then fails with `Io` — that error replaced the pending one and nothing
+    was sent. Test `poisoning_end_of_session_commit_still_sends_err_poisoned` (planted
+    next-segment file ⇒ the roll's `O_EXCL` create fails): old ⇒ `rest = []` ⇒ FAIL; fixed ⇒
+    `ERR(Poisoned)`. (`io_commit_failure_is_reported_as_err_poisoned` covers the batch-full path.)
+  - **Recommended, done:** reconnect backoff resets once a session reached Streaming, even if it
+    ends in `Err`; new `two_replicas_stream_independently` (each replica byte-identical, own acks,
+    each replica WAL's tap == w).
+  - **Deferred to RM3 (not fixed here):** `hold()` sends HEARTBEAT before SERVING; the real
+    `Receiver` answers that with `ERR(Protocol)`, so a held replica reconnect-loops. RM3's §9
+    catch-up replaces `hold()` — add a real-`Receiver` interop test then.
+  - Still tracked: ring `MAX_LSN` vs `seed` (RM4); the 0.3.0 commit must bump this crate's
+    `open-wal` requirement to `"0.3"`.
+  `ring.rs` untouched this round (all 9 loom mutation rows stand); loom gate 8/8 green; replica
+  suite 58/58 (×3 runs); root `cargo test` 174/0.
 - **Current milestone:** RM3 (catch-up) — **BLOCKED until the RM2 gate is re-reviewed** on #53.
   (Implement the corrected §9 step 2: reject iff `d > durable_lsn`.)
-- **RM2 loom gate:** L1–L6 + L2b green, nine mutations fail; awaiting designer re-review.
+- **RM2 loom gate:** L1–L6 + L2b green, nine mutations fail — CONFIRMED by the designer at
+  `b72a2fd`; round-2 crate fixes awaiting re-review.
 - **WAL v7 dependency (RM3+):** landed (#52 v7, #54 v7.1).

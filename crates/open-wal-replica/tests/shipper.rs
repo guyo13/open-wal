@@ -60,6 +60,9 @@ fn op_strategy() -> impl Strategy<Value = Op> {
 /// thread) last; acked before the replica's durable.
 fn assert_never_ahead(wal: &Wal, sh: &Shipper, server: &ReplicaServer) {
     let acked = sh.replica_acked_lsn(0).unwrap();
+    // Independent R4 oracle: the replica WAL's own DurabilityObserver, fired
+    // inside `commit` after the sync — not a value the receiver writes itself.
+    let r_wal_durable = server.tap.get();
     let r_durable = server.watermarks.durable_lsn();
     let r_last = server.watermarks.last_lsn();
     let p_durable = wal.durable_lsn();
@@ -74,6 +77,10 @@ fn assert_never_ahead(wal: &Wal, sh: &Shipper, server: &ReplicaServer) {
     assert!(
         acked <= r_durable,
         "R4: acked {acked} > replica durable {r_durable}"
+    );
+    assert!(
+        acked.0 <= r_wal_durable,
+        "R4: acked {acked} > what the replica WAL certified durable ({r_wal_durable})"
     );
 }
 
@@ -474,4 +481,146 @@ fn shipper_on_exhausted_wal_is_refused() {
             last: Lsn(u64::MAX)
         })
     ));
+}
+
+/// Review R1: an honest ACK that arrives while a large `write_all` is still
+/// blocked must not kill the session. Each send batch here (up to 256 records
+/// of 60 KB ≈ 15 MB) is far larger than loopback socket buffering, and the real
+/// receiver commits + ACKs every record (`batch_records = 1`), so it ACKs the
+/// front of a batch long before the primary's `write_all` returns. The whole
+/// log must stream over ONE session, and the final ack must equal the
+/// primary's durable watermark.
+#[test]
+fn acks_during_a_blocked_batch_write_keep_the_session() {
+    const N: u64 = 512;
+    const LEN: usize = 60_000;
+    let big = open_wal::WalConfig {
+        segment_size: 16 * 1024 * 1024,
+        max_record_size: 64 * 1024,
+    };
+    let pdir = tempfile::tempdir().unwrap();
+    let rdir = tempfile::tempdir().unwrap();
+    let mut rcfg = ReceiverConfig::new(big);
+    rcfg.batch_records = 1;
+    rcfg.batch_interval = Duration::from_millis(1);
+    let server = ReplicaServer::start(rdir.path(), rcfg);
+    let (mut wal, _) = Wal::open(pdir.path(), big).unwrap();
+    let mut cfg = ship_cfg(server.addr);
+    cfg.slot_bytes = 64 * 1024;
+    cfg.ring_bytes = 1024 * 64 * 1024; // 1024 slots ≫ N: no overflow
+    cfg.send_batch = 256;
+    cfg.io_timeout = Duration::from_secs(30);
+    let mut sh = Shipper::new(cfg, &wal).unwrap();
+    for l in 1..=N {
+        let p = payload(l, LEN);
+        let lsn = wal.append(&p).unwrap();
+        sh.capture(lsn, &p);
+        if l % 128 == 0 {
+            let w = wal.commit().unwrap();
+            sh.on_commit(w);
+        }
+    }
+    let w = wal.commit().unwrap();
+    sh.on_commit(w);
+    wait_until(120, "replica to ack everything", || {
+        sh.poll();
+        sh.replica_acked_lsn(0) == Some(w)
+    });
+    sh.shutdown();
+    let (rx, results) = server.stop();
+    assert_eq!(
+        results.len(),
+        1,
+        "honest ACKs must not tear the session down (sessions: {})",
+        results.len()
+    );
+    assert_no_inband_errors(&results);
+    assert_eq!(rx.durable_lsn(), w);
+    assert_eq!(read_all(rx.wal()), read_all(&wal));
+}
+
+/// Review R4: `acked` reflects the CURRENT replica. After the replica is wiped
+/// and replaced (a fresh WAL, §10/§12.2) its HELLO carries a lower
+/// `durable_lsn`, and `replica_acked_lsn` must drop to it — otherwise the §11
+/// checkpoint input reports durability the replica no longer has.
+#[test]
+fn acked_drops_when_a_wiped_replica_says_hello() {
+    let pdir = tempfile::tempdir().unwrap();
+    let (mut wal, _) = Wal::open(pdir.path(), SMALL).unwrap();
+    let fake = FakeReplica::new();
+    let mut sh = Shipper::new(ship_cfg(fake.addr()), &wal).unwrap();
+    let s = fake.accept_hello(0, PROTO_VERSION);
+    wait_until(10, "join", || {
+        sh.poll();
+        sh.replica_status(0) == Some(ReplicaStatus::Streaming)
+    });
+    for i in 0..5u8 {
+        let lsn = wal.append(&[i]).unwrap();
+        sh.capture(lsn, &[i]);
+    }
+    let w = wal.commit().unwrap();
+    sh.on_commit(w);
+    // Read SERVING + 5 RECORDs, then ack them all.
+    let mut rd = FrameReader::new(s.try_clone().unwrap(), Limits::new(64));
+    let mut got = 0;
+    while got < 5 {
+        if let Frame::Record { .. } = rd.read_frame().unwrap() {
+            got += 1;
+        }
+    }
+    let mut b = Vec::new();
+    wire::encode_frame(&Frame::Ack { durable_lsn: w }, &mut b);
+    (&s).write_all_checked(&b);
+    wait_until(10, "ack 5", || sh.replica_acked_lsn(0) == Some(w));
+    // The replica is wiped and replaced: the new one connects with HELLO{0}.
+    drop(rd);
+    drop(s);
+    let _s2 = fake.accept_hello(0, PROTO_VERSION);
+    wait_until(10, "acked to drop to the new replica's durable_lsn", || {
+        sh.poll();
+        sh.replica_acked_lsn(0) == Some(Lsn(0))
+    });
+    assert_eq!(sh.min_replica_acked_lsn(), Some(Lsn(0)));
+    sh.shutdown();
+}
+
+/// Two replicas stream independently: each gets the whole log byte-identical
+/// and acks on its own (per-replica join routing and ack accounting).
+#[test]
+fn two_replicas_stream_independently() {
+    let pdir = tempfile::tempdir().unwrap();
+    let (ra, rb) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let a = ReplicaServer::start(ra.path(), rx_cfg());
+    let b = ReplicaServer::start(rb.path(), rx_cfg());
+    let (mut wal, _) = Wal::open(pdir.path(), SMALL).unwrap();
+    let mut cfg = ship_cfg(a.addr);
+    cfg.replicas.push(b.addr);
+    let mut sh = Shipper::new(cfg, &wal).unwrap();
+    for l in 1..=300u64 {
+        let p = payload(l, (l as usize * 7) % 200);
+        let lsn = wal.append(&p).unwrap();
+        sh.capture(lsn, &p);
+        if l % 17 == 0 {
+            let w = wal.commit().unwrap();
+            sh.on_commit(w);
+        }
+    }
+    let w = wal.commit().unwrap();
+    sh.on_commit(w);
+    wait_until(30, "both replicas to ack", || {
+        sh.poll();
+        sh.replica_acked_lsn(0) == Some(w) && sh.replica_acked_lsn(1) == Some(w)
+    });
+    assert_eq!(sh.min_replica_acked_lsn(), Some(w));
+    assert_eq!(sh.replica_status(0), Some(ReplicaStatus::Streaming));
+    assert_eq!(sh.replica_status(1), Some(ReplicaStatus::Streaming));
+    sh.shutdown();
+    let want = read_all(&wal);
+    for server in [a, b] {
+        let tap = server.tap.clone();
+        let (rx, results) = server.stop();
+        assert_no_inband_errors(&results);
+        assert_eq!(read_all(rx.wal()), want);
+        assert_eq!(tap.get(), w.0, "each replica WAL is itself durable to w");
+    }
 }

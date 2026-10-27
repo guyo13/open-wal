@@ -45,7 +45,7 @@ use std::time::{Duration, Instant};
 use open_wal::{DurabilityObserver, Lsn, NullObserver, Wal, WalConfig, WalError};
 
 use crate::error::{ReplError, Result};
-use crate::wire::{self, Frame, FrameReader, Limits, PROTO_VERSION};
+use crate::wire::{self, ErrCode, Frame, FrameReader, Limits, PROTO_VERSION};
 
 /// Receiver configuration (§14).
 #[derive(Clone, Debug)]
@@ -61,14 +61,18 @@ pub struct ReceiverConfig {
     /// batch is not full.
     pub batch_interval: Duration,
     /// Close the connection if the primary sends nothing for this long while
-    /// nothing is pending (`None` = wait forever). The primary heartbeats when
-    /// idle, so a value of a few heartbeat periods detects a dead primary.
+    /// nothing is pending. The primary heartbeats when idle, so a few
+    /// heartbeat periods detects a primary that died without FIN/RST (power
+    /// loss, partition) — without it the receiver would block in `read`
+    /// forever and never serve the restarted primary's new connection (R7).
+    /// Default 5 s (≥ 3× the shipper's default 500 ms heartbeat). **`None`
+    /// disables dead-primary detection.**
     pub idle_timeout: Option<Duration>,
 }
 
 impl ReceiverConfig {
-    /// Defaults around `wal_config`: batches of up to 256 records or 2 ms, no
-    /// idle timeout, `replica_id` 0.
+    /// Defaults around `wal_config`: batches of up to 256 records or 2 ms, a
+    /// 5 s idle timeout (dead-primary detection), `replica_id` 0.
     #[must_use]
     pub fn new(wal_config: WalConfig) -> ReceiverConfig {
         ReceiverConfig {
@@ -76,7 +80,7 @@ impl ReceiverConfig {
             replica_id: 0,
             batch_records: 256,
             batch_interval: Duration::from_millis(2),
-            idle_timeout: None,
+            idle_timeout: Some(Duration::from_secs(5)),
         }
     }
 }
@@ -373,7 +377,16 @@ impl<O: DurabilityObserver> Receiver<O> {
     }
 
     fn send_err(&mut self, stream: &TcpStream, e: &ReplError) -> Result<()> {
-        match e.err_code() {
+        // §7 step 5 (review R5): EVERY poisoning commit is reported as
+        // ERR(Poisoned) — whatever `WalError` it surfaced as (`FsyncFailed`,
+        // or `Io` from a failed write/roll), and even when it replaced a
+        // pending in-band error at end of session.
+        let code = if self.poisoned {
+            Some(ErrCode::Poisoned)
+        } else {
+            e.err_code()
+        };
+        match code {
             Some(code) => {
                 let msg = e.to_string();
                 self.send(stream, &Frame::Err { code, msg: &msg })

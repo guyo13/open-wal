@@ -124,7 +124,10 @@ const JOIN_AHEAD: u8 = 3;
 /// Per-replica state shared between the writer thread and its network thread.
 #[derive(Default)]
 struct ReplicaShared {
-    /// Highest `ACK`/`HEARTBEAT` watermark this replica reported (R4).
+    /// This replica's durable watermark as last reported (R4): set to the
+    /// HELLO's `durable_lsn` when a session is accepted (so a wiped / re-seeded
+    /// replica's lower watermark replaces a stale one), then raised by each
+    /// `ACK`/`HEARTBEAT` within the session. Never above what was sent.
     acked: AtomicU64,
     status: AtomicU8,
     /// `from` LSN of a pending join request (0 = none).
@@ -315,9 +318,17 @@ fn replica_thread(id: ReplicaId, cfg: ShipperConfig, mut consumer: Consumer, net
     let mut backoff = cfg.reconnect_backoff;
     while !net.shutdown.load(Ordering::Acquire) {
         set_status(r, ReplicaStatus::Connecting);
-        let outcome = session(&cfg, cfg.replicas[id], &mut consumer, net, r);
+        let mut streamed = false;
+        let outcome = session(&cfg, cfg.replicas[id], &mut consumer, net, r, &mut streamed);
         consumer.detach();
         match outcome {
+            // A session that reached Streaming and then hit a transport error
+            // is a normal disconnect: reconnect promptly (do not keep an
+            // escalated backoff, or the replica may drop out of the ring).
+            Err(_) if streamed => {
+                backoff = cfg.reconnect_backoff;
+                nap(net, backoff);
+            }
             // Fell behind mid-stream: reconnect at once — the replica's new
             // resume point may still be in the ring.
             Ok(SessionEnd::FellBehind) => backoff = cfg.reconnect_backoff,
@@ -356,6 +367,7 @@ fn session(
     consumer: &mut Consumer,
     net: &Net,
     r: &ReplicaShared,
+    streamed: &mut bool,
 ) -> Result<SessionEnd> {
     let stream = TcpStream::connect_timeout(&addr, cfg.io_timeout)?;
     stream.set_nodelay(true)?;
@@ -426,6 +438,13 @@ fn session(
             d => break d,
         }
     };
+    if decision != JOIN_AHEAD {
+        // Review R4: `acked` describes the replica that is connected NOW. After
+        // a wipe / replacement / re-seed (§10, §12.2) its HELLO carries a lower
+        // durable_lsn, which must replace the stale watermark (it feeds the
+        // §11 checkpoint input). An honest reconnect never lowers it (D1).
+        r.acked.store(durable.0, Ordering::Release);
+    }
     match decision {
         JOIN_AHEAD => {
             set_status(r, ReplicaStatus::Rejected);
@@ -459,6 +478,7 @@ fn session(
         },
     )?;
     set_status(r, ReplicaStatus::Streaming);
+    *streamed = true;
     stream.set_read_timeout(Some(ack_timeout(cfg)))?;
 
     let dead = AtomicBool::new(false);
@@ -510,11 +530,15 @@ fn stream_records(
             last = Some(lsn);
         });
         if !out.is_empty() {
-            w.write_all(&out)?;
-            last_send = Instant::now();
+            // Publish `sent` BEFORE the write (review R1): the replica can
+            // receive, commit and ACK the front of this batch while `write_all`
+            // is still blocked on a large batch. Every byte it can receive is
+            // already in `out`, so `sent` stays a sound upper bound for R4.
             if let Some(l) = last {
                 sent.store(l.0, Ordering::Release);
             }
+            w.write_all(&out)?;
+            last_send = Instant::now();
         }
         match d.status {
             ConsumerStatus::Streaming => {}
@@ -576,9 +600,11 @@ fn hold(
     });
 }
 
-/// Read the replica's `ACK`/`HEARTBEAT` frames into `acked` (monotonic). An
-/// ack beyond what was sent on this connection is a protocol violation (R4: a
-/// replica can only be durable to what it received) and ends the connection.
+/// Read the replica's `ACK`/`HEARTBEAT` frames into `acked` — monotonic
+/// **within a session**; the session start resets it to the HELLO's
+/// `durable_lsn` (see `session`). An ack beyond what was sent on this
+/// connection is a protocol violation (R4: a replica can only be durable to
+/// what it received) and ends the connection.
 fn ack_reader(
     mut rd: FrameReader<TcpStream>,
     r: &ReplicaShared,

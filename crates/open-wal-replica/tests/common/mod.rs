@@ -6,6 +6,8 @@
 use std::io::Write;
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -46,6 +48,49 @@ pub fn payload(lsn: u64, len: usize) -> Vec<u8> {
 
 /// A spawned receiver thread: yields the receiver and each session's result.
 pub type ReceiverThread = JoinHandle<(Receiver, Vec<Result<(), ReplError>>)>;
+
+/// The **independent R4 oracle**: a `DurabilityObserver` on the replica WAL.
+/// The WAL fires it inside `commit`, after the `fdatasync` — so its value is
+/// what the replica WAL itself certifies durable, not anything the receiver
+/// reports about itself. Every ACK a primary sees must be `≤` it at receipt.
+#[derive(Clone, Default)]
+pub struct DurableTap(pub Arc<AtomicU64>);
+
+impl DurableTap {
+    pub fn get(&self) -> u64 {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+impl open_wal::DurabilityObserver for DurableTap {
+    fn on_durable(&mut self, d: Lsn) {
+        self.0.fetch_max(d.0, Ordering::AcqRel);
+    }
+}
+
+/// Like [`spawn_receiver`], but the replica WAL carries a [`DurableTap`].
+pub fn spawn_receiver_tapped(
+    dir: &Path,
+    cfg: ReceiverConfig,
+    connections: usize,
+) -> (SocketAddr, TappedReceiverThread, DurableTap) {
+    let tap = DurableTap::default();
+    let mut rx = Receiver::open_with(dir, cfg, tap.clone()).expect("receiver open");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().unwrap();
+    let h = std::thread::spawn(move || {
+        let mut results = Vec::new();
+        for _ in 0..connections {
+            let (s, _) = listener.accept().expect("accept");
+            results.push(rx.serve_connection(s));
+        }
+        (rx, results)
+    });
+    (addr, h, tap)
+}
+
+/// A spawned tapped receiver thread.
+pub type TappedReceiverThread = JoinHandle<(Receiver<DurableTap>, Vec<Result<(), ReplError>>)>;
 
 /// A receiver thread: accepts `connections` connections on a fresh loopback
 /// listener and serves each, returning the receiver and each session result.
@@ -176,6 +221,30 @@ impl FakePrimary {
         }
     }
 
+    /// Like [`await_ack`](Self::await_ack), checking R4 against the
+    /// independent oracle: every ACK must be `≤` the replica WAL's own durable
+    /// watermark (the tap) at the moment the ACK is received.
+    pub fn await_ack_tapped(&mut self, target: u64, tap: &DurableTap) -> Vec<u64> {
+        let mut acks = Vec::new();
+        loop {
+            match self.next() {
+                Some(Got::Ack(a)) => {
+                    let durable = tap.get();
+                    assert!(
+                        a <= durable,
+                        "R4: ACK {a} received while the replica WAL is durable only to {durable}"
+                    );
+                    acks.push(a);
+                    if a >= target {
+                        return acks;
+                    }
+                }
+                Some(Got::Heartbeat(_)) => {}
+                other => panic!("waiting for ACK {target}, got {other:?} after {acks:?}"),
+            }
+        }
+    }
+
     /// Close our sending half and read everything the replica still sends.
     pub fn finish(mut self) -> Vec<Got> {
         let _ = self.stream.shutdown(Shutdown::Write);
@@ -192,8 +261,10 @@ impl FakePrimary {
 pub struct ReplicaServer {
     pub addr: SocketAddr,
     pub watermarks: std::sync::Arc<open_wal_replica::ReplicaWatermarks>,
+    /// Independent R4 oracle (see [`DurableTap`]).
+    pub tap: DurableTap,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    handle: JoinHandle<(Receiver, Vec<Result<(), ReplError>>)>,
+    handle: TappedReceiverThread,
 }
 
 impl ReplicaServer {
@@ -203,7 +274,8 @@ impl ReplicaServer {
 
     pub fn start_on(listener: TcpListener, dir: &Path, cfg: ReceiverConfig) -> ReplicaServer {
         use std::sync::atomic::{AtomicBool, Ordering};
-        let mut rx = Receiver::open(dir, cfg).expect("receiver open");
+        let tap = DurableTap::default();
+        let mut rx = Receiver::open_with(dir, cfg, tap.clone()).expect("receiver open");
         let addr = listener.local_addr().unwrap();
         let watermarks = rx.watermarks();
         let stop = std::sync::Arc::new(AtomicBool::new(false));
@@ -221,6 +293,7 @@ impl ReplicaServer {
         ReplicaServer {
             addr,
             watermarks,
+            tap,
             stop,
             handle,
         }
@@ -228,7 +301,7 @@ impl ReplicaServer {
 
     /// Stop accepting (the current connection must already be closed by the
     /// primary) and return the receiver plus every session's result.
-    pub fn stop(self) -> (Receiver, Vec<Result<(), ReplError>>) {
+    pub fn stop(self) -> (Receiver<DurableTap>, Vec<Result<(), ReplError>>) {
         self.stop.store(true, std::sync::atomic::Ordering::Release);
         let _ = TcpStream::connect(self.addr);
         self.handle.join().expect("receiver thread")

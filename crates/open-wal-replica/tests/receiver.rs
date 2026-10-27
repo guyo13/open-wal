@@ -19,7 +19,10 @@ mod common;
 
 use std::time::Duration;
 
-use common::{FakePrimary, Got, SMALL, payload, read_all, read_dir, spawn_receiver};
+use common::{
+    DurableTap, FakePrimary, Got, SMALL, payload, read_all, read_dir, spawn_receiver,
+    spawn_receiver_tapped,
+};
 use open_wal::{Lsn, Wal};
 use open_wal_replica::wire::{self, ErrCode, Frame};
 use open_wal_replica::{ReceiverConfig, ReplError};
@@ -77,14 +80,26 @@ fn primary_log(ops: &[Op]) -> Vec<(Lsn, Vec<u8>)> {
 /// Ship `log` to a fresh replica in `chunk`-record writes and wait for the
 /// final ACK. Returns the replica's ACK sequence.
 fn ship_all(fp: &mut FakePrimary, log: &[(Lsn, Vec<u8>)], chunk: usize) -> Vec<u64> {
+    ship_all_checked(fp, log, chunk, None)
+}
+
+/// [`ship_all`], optionally checking every ACK against the independent R4
+/// oracle (the replica WAL's own `DurabilityObserver` tap).
+fn ship_all_checked(
+    fp: &mut FakePrimary,
+    log: &[(Lsn, Vec<u8>)],
+    chunk: usize,
+    tap: Option<&DurableTap>,
+) -> Vec<u64> {
     let d = fp.hello();
     fp.serving(d + 1);
     for c in log[d as usize..].chunks(chunk.max(1)) {
         fp.records(c);
     }
-    match log.last() {
-        Some((last, _)) => fp.await_ack(last.0),
-        None => Vec::new(),
+    match (log.last(), tap) {
+        (Some((last, _)), Some(tap)) => fp.await_ack_tapped(last.0, tap),
+        (Some((last, _)), None) => fp.await_ack(last.0),
+        (None, _) => Vec::new(),
     }
 }
 
@@ -102,7 +117,9 @@ fn assert_honest_acks(acks: &[u64], final_durable: u64) {
 proptest! {
     #![proptest_config(ProptestConfig { cases: 24, ..ProptestConfig::default() })]
 
-    /// §15.2 P1 — mirroring (R2) and byte fidelity (R9).
+    /// §15.2 P1 — mirroring (R2) and byte fidelity (R9). Every ACK is also
+    /// checked against the replica WAL's own durability tap at receipt (R4,
+    /// independent of anything the receiver reports about itself).
     #[test]
     fn p1_replica_is_byte_identical_with_mirrored_lsns(
         ops in proptest::collection::vec(op_strategy(), 0..60),
@@ -111,9 +128,9 @@ proptest! {
     ) {
         let log = primary_log(&ops);
         let rdir = tempfile::tempdir().unwrap();
-        let (addr, h) = spawn_receiver(rdir.path(), rx_cfg(batch), 1);
+        let (addr, h, tap) = spawn_receiver_tapped(rdir.path(), rx_cfg(batch), 1);
         let mut fp = FakePrimary::connect(addr);
-        let acks = ship_all(&mut fp, &log, chunk);
+        let acks = ship_all_checked(&mut fp, &log, chunk, Some(&tap));
         let rest = fp.finish();
         let (rx, results) = h.join().unwrap();
         prop_assert!(results[0].is_ok(), "{:?}", results[0]);
@@ -498,4 +515,127 @@ fn exhausted_lsn_space_is_its_own_error_not_poison() {
         results[0]
     );
     assert!(!rx.is_poisoned());
+}
+
+/// Review R3: dead-primary detection is ON by default. `None` would disable it
+/// (a primary that vanishes without FIN/RST would wedge the receiver forever).
+#[test]
+fn default_idle_timeout_detects_a_dead_primary() {
+    assert_eq!(
+        ReceiverConfig::new(SMALL).idle_timeout,
+        Some(Duration::from_secs(5))
+    );
+}
+
+/// Review R3: a half-open primary (power loss / partition: no FIN, no RST)
+/// must not wedge the replica. Under the **default** config the receiver gives
+/// up on the silent connection after `idle_timeout` and serves the restarted
+/// primary's new connection (R7).
+#[test]
+fn half_open_primary_does_not_wedge_the_replica() {
+    let rdir = tempfile::tempdir().unwrap();
+    let cfg = ReceiverConfig::new(SMALL); // the default idle_timeout under test
+    let (addr, h) = spawn_receiver(rdir.path(), cfg, 2);
+    // Primary #1 streams one record, sees the ACK, then goes silent with its
+    // socket still open (kept alive in `_silent` until the end of the test).
+    let mut silent = FakePrimary::connect(addr);
+    silent.hello();
+    silent.serving(1);
+    silent.record(1, b"before the outage");
+    silent.await_ack(1);
+    // The restarted primary connects; it must be served (HELLO) within the idle
+    // timeout plus slack — FakePrimary's own read timeout is 20 s, so a wedged
+    // receiver makes `hello()` panic.
+    let t = std::time::Instant::now();
+    let mut restarted = FakePrimary::connect(addr);
+    assert_eq!(
+        restarted.hello(),
+        1,
+        "served from the replica's durable_lsn"
+    );
+    assert!(t.elapsed() < Duration::from_secs(15), "{:?}", t.elapsed());
+    restarted.serving(2);
+    restarted.record(2, b"after the restart");
+    restarted.await_ack(2);
+    restarted.finish();
+    let (rx, results) = h.join().unwrap();
+    assert!(
+        matches!(&results[0], Err(ReplError::Io(e)) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)),
+        "the silent session ends by idle timeout: {:?}",
+        results[0]
+    );
+    assert!(results[1].is_ok(), "{:?}", results[1]);
+    assert_eq!(rx.durable_lsn(), Lsn(2));
+    drop(silent);
+}
+
+/// Review R5 / §7 step 5: EVERY poisoning commit is reported as
+/// `ERR(Poisoned)` — including one that fails with `WalError::Io` (not just
+/// `FsyncFailed`). Injected by planting the next segment's filename, so the
+/// commit-time roll's `O_EXCL` create fails after the first segment synced.
+#[test]
+fn io_commit_failure_is_reported_as_err_poisoned() {
+    let rdir = tempfile::tempdir().unwrap();
+    // 100-byte payloads frame to 120 B; a 4 KiB segment (64 B header) holds 33,
+    // so the commit-time roll creates the segment based at LSN 34.
+    let log: Vec<(Lsn, Vec<u8>)> = (1..=40).map(|l| (Lsn(l), payload(l, 100))).collect();
+    let (addr, h) = spawn_receiver(rdir.path(), rx_cfg(40), 2);
+    std::fs::write(rdir.path().join(format!("{:020}.wal", 34)), b"planted").unwrap();
+    let mut fp = FakePrimary::connect(addr);
+    assert_eq!(fp.hello(), 0);
+    fp.serving(1);
+    fp.records(&log);
+    let rest = fp.finish();
+    assert!(
+        rest.contains(&Got::Err(ErrCode::Poisoned)),
+        "a poisoning commit must send ERR(Poisoned): {rest:?}"
+    );
+    // The poisoned receiver refuses the next connection with ERR(Poisoned) too.
+    let mut fp = FakePrimary::connect(addr);
+    assert_eq!(fp.next(), Some(Got::Err(ErrCode::Poisoned)));
+    let (rx, results) = h.join().unwrap();
+    assert!(rx.is_poisoned());
+    assert!(
+        matches!(results[0], Err(ReplError::Wal(_))),
+        "{:?}",
+        results[0]
+    );
+}
+
+/// Review R5, the path that actually lost the ERR: the session ends on an
+/// in-band fault (here a contiguity violation) while records are still pending,
+/// and the end-of-session commit then fails with `WalError::Io` (the planted
+/// next-segment file makes the roll's `O_EXCL` create fail). The poisoning
+/// error replaces the pending one, so the primary must get `ERR(Poisoned)` —
+/// not silence.
+#[test]
+fn poisoning_end_of_session_commit_still_sends_err_poisoned() {
+    let rdir = tempfile::tempdir().unwrap();
+    let log: Vec<(Lsn, Vec<u8>)> = (1..=40).map(|l| (Lsn(l), payload(l, 100))).collect();
+    let mut cfg = rx_cfg(1000); // nothing commits until the session ends
+    cfg.batch_interval = Duration::from_secs(60);
+    let (addr, h) = spawn_receiver(rdir.path(), cfg, 1);
+    std::fs::write(rdir.path().join(format!("{:020}.wal", 34)), b"planted").unwrap();
+    let mut fp = FakePrimary::connect(addr);
+    assert_eq!(fp.hello(), 0);
+    fp.serving(1);
+    // 40 good records and a gap, in one write: all are read before any commit.
+    let mut bytes = Vec::new();
+    for (lsn, p) in &log {
+        wire::encode_record(&mut bytes, *lsn, p);
+    }
+    wire::encode_record(&mut bytes, Lsn(99), b"gap");
+    fp.send_raw(&bytes);
+    let rest = fp.finish();
+    assert!(
+        rest.contains(&Got::Err(ErrCode::Poisoned)),
+        "a poisoning end-of-session commit must send ERR(Poisoned): {rest:?}"
+    );
+    let (rx, results) = h.join().unwrap();
+    assert!(rx.is_poisoned());
+    assert!(
+        matches!(results[0], Err(ReplError::Wal(_))),
+        "{:?}",
+        results[0]
+    );
 }
