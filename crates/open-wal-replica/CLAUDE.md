@@ -21,8 +21,11 @@ destructive operation. The one property that makes v1 tractable: **a replica onl
 records ≤ the primary's `durable_lsn`, in order, so it is always a dense prefix of the primary
 and never needs to truncate.** Every design rule below exists to preserve that.
 
-Depends on open-wal **spec v7** (`WalConfig::initial_lsn`, `Wal::oldest_lsn()`, containing-segment
-`reader_from`). RM0–RM2 need none of it; **RM3+ waits for v7 to land.**
+Depends on open-wal **spec v7** — **landed** (#52 v7, #54 v7.1): the cold-start seed is the
+`Wal::options().seed(..)` builder (not a `WalConfig` field), plus `Wal::oldest_lsn()` and
+containing-segment `reader_from`; v7.1 adds `LsnExhausted` — **sequencing uses
+`Lsn::checked_next()`, never the saturating `next()`**. RM0–RM2 need none of v7. Tracker: issue
+#47.
 
 ---
 
@@ -44,7 +47,7 @@ Depends on open-wal **spec v7** (`WalConfig::initial_lsn`, `Wal::oldest_lsn()`, 
 - **R1 Never ahead.** A replica's durable set ⊆ the primary's durable set. The shipper MUST NOT
   send any record with `lsn > w` where `w` is the latest `commit() → Ok(w)`. A captured record
   whose commit has not returned is **not shippable** (the §15.1 visibility gap applied to the ring).
-- **R2 LSN mirroring.** Same LSN on primary and replica for every record (via `initial_lsn` +
+- **R2 LSN mirroring.** Same LSN on primary and replica for every record (via `Wal::options().seed(..)` +
   R3). After `wal.append(payload)` on the replica, the returned LSN MUST equal the shipped LSN.
 - **R3 Stream contiguity — hard check.** Receiver verifies `lsn == replica_wal.last_lsn() + 1`
   **before** `append`. Any other value ⇒ do NOT append, `ERR(Contiguity)`, close, re-HELLO.
@@ -123,7 +126,7 @@ Depend on the WAL via `open-wal = { path = "../..", version = "0.2" }`.
 | **RM1** | `Receiver`: own WAL, R3 hard check, group commit, R4 ack | §15.1, §15.2 P1–P2 |
 | **RM2** | `Shipper`: ring capture/release, per-replica net threads, overflow ⇒ `NeedsCatchUp`, R1 as Release/Acquire watermark | §15.2 P3–P4, §15.3 overflow, **§15.7 loom L1–L6 + all 7 mutations — GATE** |
 | **RM3** | catch-up (§9) *(needs WAL v7)* | §15.3, §15.2 P5 |
-| **RM4** | re-seed traits + `initial_lsn` cold start + reseed checkpoint guard | §15.3 |
+| **RM4** | re-seed traits + `options().seed(..)` cold start + reseed checkpoint guard | §15.3 |
 | **RM5** | checkpoint policy helper, promotion runbook, former-primary rejection | §15.3 |
 | **RM6** | model/oracle harness | §15.4 |
 | **RM7** | fault injection: LazyFS replica-never-ahead headline + negative control, split-batch, SIGKILL matrices, wire corruption, partition | §15.5 |
@@ -140,11 +143,13 @@ durability half of R1 is proven by the RM7 LazyFS headline (§15.7.6) — never 
 ## Environment & tooling
 
 - Rust stable, edition 2024, MSRV 1.85 (same as the WAL). Deps minimal: `open-wal`, `crc32c`;
-  `loom` under `[target.'cfg(loom)'.dev-dependencies]`; `proptest`, `tempfile`, `arbitrary`/
-  `cargo-fuzz` for tests.
+  `loom` under `[target.'cfg(loom)'.dependencies]` (NOT dev-deps — the lib itself is built with
+  `--cfg loom` as a regular dependency of `tests/loom_ring.rs`); `proptest`, `tempfile`,
+  `arbitrary`/`cargo-fuzz` for tests.
 - Always before declaring done: `cargo test -p open-wal-replica`,
   `cargo clippy -p open-wal-replica --all-targets -- -D warnings`, `cargo fmt --check`,
-  `RUSTFLAGS="--cfg loom" cargo test -p open-wal-replica --test loom_ring`, and the **root**
+  `RUSTFLAGS="--cfg loom" CARGO_TARGET_DIR=target/loom cargo test -p open-wal-replica --test
+  loom_ring --release`, and the **root**
   `cargo test` to prove `open-wal` is untouched.
 - Fault injection (RM7) needs the same LazyFS/FUSE Linux environment as the WAL's §14.4. If
   unavailable, say so and leave the gate open — never fake or skip it.
@@ -158,6 +163,149 @@ commit messages (e.g. "RM2: ring release watermark, R1 / loom L1"). If the desig
 underspecified, flag it and propose a fix — do not silently diverge.
 
 ## Project status (keep updated)
-- **Current milestone:** RM0 — not started
-- **RM2 loom gate:** NOT yet passed
-- **WAL v7 dependency (RM3+):** pending
+- **RM0 — DONE.** Workspace migration: root `Cargo.toml` gains `[workspace] members =
+  ["crates/open-wal-replica"], exclude = ["fuzz"]`; `open-wal` stays the root package and the
+  only default member, so every existing workflow/script invocation is byte-identical (verified:
+  root `cargo test` 137 passed and builds no replica code; root `clippy --all-targets`; MSRV
+  `cargo +1.85.0 check --all-targets --locked`; `cargo package --list` ships no `crates/` file;
+  `fuzz/` still resolves as its own workspace). `Cargo.lock` gained entries only (no existing
+  version moved). The root `lint` job's `cargo fmt --all -- --check` already covers members.
+  `publish.yml` now names `-p open-wal` for package+publish. New CI jobs (not edits to the
+  open-wal ones): `replica — test + clippy`, `replica — MSRV (1.85)`. Crate skeleton:
+  `ReplError` (§14, non-panicking, `#[non_exhaustive]`; adds `Remote{code,msg}` for a peer `ERR`),
+  `wire` codec (§6): `len:u32` counts type+body; pure, allocation-free `decode_frame` (bounded
+  `len` rejected from the prefix alone, unknown type / wrong fixed size / oversize payload /
+  unknown ERR code / non-UTF-8 msg ⇒ `Protocol`, RECORD CRC mismatch ⇒ `WireCrc`), plus a
+  bounded streaming `FrameReader` (keeps partial bytes across a read timeout). §15.1 codec tests
+  incl. every-bit-flip ⇒ `WireCrc` and an arbitrary-bytes proptest. `loom` is a
+  `[target.'cfg(loom)'.dependencies]` entry (NOT dev-deps: the lib itself is compiled with
+  `--cfg loom` as a regular dependency of `tests/loom_ring.rs`, where dev-deps are invisible).
+- **RM1 — DONE.** `Receiver<O: DurabilityObserver = NullObserver>` (§7): own WAL
+  (`open`/`open_with` — the observer variant serves §7.1 replica-hosted consumers, added after
+  PR #51; v7's `options().seed(..)` cold start is RM4), sends `HELLO{durable}`, accepts
+  `SERVING{from}` only if `from == last+1`, per RECORD: CRC (decoder) → **R3 hard check before
+  append** → append → R2 returned-LSN check; group commit on `batch_records`/`batch_interval`
+  (socket read timeout = the interval clock); `ACK{w}` with the value `commit` returned (R4).
+  On any error: commit+ACK what was validly appended, send `ERR(code)`, close (next HELLO then
+  has `durable == last`). Commit `Err` ⇒ `ERR(Poisoned)` and the receiver refuses all later
+  connections (reopen required). Tests (`tests/receiver.rs`, fake primary over loopback TCP):
+  P1 mirroring proptest (op-scripts on a 4 KiB-segment primary ⇒ rolls/splits; byte-identical,
+  same LSNs, ACKs survive reopen), P2 fault proptest (gap/dup/reorder/foreign/stale/bad-CRC ⇒
+  never appended, right `ERR`, reconnect converges), SERVING mismatch, batch_interval, heartbeat,
+  reseed, protocol/oversize, §7.1 observer-sees-only-committed. **Falsifiability shown:**
+  deleting the R3 check makes P2 fail (shrinks to `n=2, Gap`), then reverted. **Not tested
+  here:** the commit-failure ⇒ `ERR(Poisoned)` path (needs fault injection — §15.3 replica-poison
+  scenario, RM7).
+- **RM2 — DONE; the loom gate PASSES (L1–L6 green, all 7 mutations demonstrated to fail).**
+  `ring` (pub, SPMC, §8/§15.7): `Producer::capture` (memcpy into a preallocated slot; no I/O, no
+  syscall, no steady-state alloc; oversized payload grows its buffer once), `release(w)` (one
+  `Release` store + unpark per consumer, sends nothing, clamped to the last capture),
+  `Consumer::drain` (one `Acquire` load of `released` per pass, never emits past it), per-consumer
+  `Release` cursors with an `Acquire` **min** before in-place reuse, per-buffer generation tag +
+  reader pin (`tag<<8|readers`), eviction = tombstone CAS + spare buffer if pinned (never writes a
+  pinned buffer, never blocks, never drops the new capture) ⇒ `NeedsCatchUp`; writer-thread
+  `attach` (Ahead ⇒ §9 step 2 refusal, Behind ⇒ catch-up). Discontinuities are conservative
+  (re-capture after a failed commit tombstones the discarded tail — never resurrected; a
+  capture ≤ released writes nothing). All primitives via `src/sync.rs` (`cfg(loom)` swap).
+  `Shipper` (`#[cfg(not(loom))]`): `capture`/`on_commit`/`poll` on the writer thread; one network
+  thread per replica (+ an ack-reader) — connect/backoff, HELLO, join via the writer thread at
+  `durable+1` (R7), SERVING, RECORD stream, heartbeats, `ACK` ⇒ `replica_acked[id]` (an ack beyond
+  what was sent ends the connection), overflow ⇒ close + re-HELLO ⇒ rejoin if still in the ring
+  else `NeedsCatchUp` (held; RM3 serves it). `min_replica_acked_lsn` (never-acked counts as 0),
+  `replica_acked_lsn`, `replica_status`. **Tests:** ring unit tests; `tests/shipper.rs` — P3
+  never-ahead proptest (real WAL + shipper + receiver; `replica.last ≤ primary.durable`,
+  `acked ≤ replica.durable` at every step; converge byte-identical) **+ its negative control**
+  (release-on-capture misuse is detected by the same check), stalled-replica overflow (socket
+  really fills: ~34k records shipped, then `NeedsCatchUp` mid-stream and again on reconnect;
+  shipped prefix dense/no-dup/byte-identical; worst `capture` ≈ 0.2–3 ms, `on_commit` < 0.3 ms
+  vs a 30 s io_timeout), former-primary rejection, version mismatch, R7 primary restart;
+  `tests/ring_overflow.rs` — P4 proptest (tiny ring + simulated log catch-up: stream exactly
+  `1..=N`, no dup at any cutover; 273 `NeedsCatchUp` on a 2-slot ring). Disabling the consumer's
+  generation check makes P4 fail (shown, reverted).
+  **loom (`tests/loom_ring.rs`, imports the crate's ring):** L1 visibility, L2 never-ahead, L3
+  slot reuse, L4 eviction, L5 no lost wakeup, L6a/L6b SPMC; **L2b** never-emits-unreleased
+  (added at review). Bounds: L1/L2/L2b/L3/L5 exhaustive; **L4 bound 4** (raised at review — the
+  shallowest bound catching the `Relaxed`-pin regression, ~5 s); L6a bound 3; L6b bound 2 per-PR
+  (bound 3: 1.45M iterations, 669 s, green — now the scheduled `replica-loom-deep.yml` job). **Loom found a real bug**: `Relaxed` pins let the producer see a consumer's new
+  pin without its earlier unpin ⇒ "spare always free" invariant panicked (L4) ⇒ pins are now
+  `Release`. **Mutation results (each applied to `src/ring.rs`, run, reverted):**
+  | Mutation | Model | Result |
+  |---|---|---|
+  | `released.store` Release→Relaxed | L1 | FAIL — stale slot read ⇒ "NeedsCatchUp without overflow" |
+  | `released.load` Acquire→Relaxed | L1 | FAIL — same |
+  | remove min-cursor check before in-place reuse | L3 | FAIL — loom `Causality violation` (UnsafeCell) |
+  | free on ANY cursor (max) instead of min | L6b | FAIL — loom `Causality violation` |
+  | drop generation bump (tombstone) on eviction | L4 | FAIL — loom `Causality violation` |
+  | drop `unpark` in `release` | L5 | FAIL — loom deadlock (consumer parked forever) |
+  | re-read `released` mid-drain, send to new value | L2 | FAIL — "emitted N past its pass watermark" |
+  | *(review)* pin CAS `Release`→`Relaxed` (loom-found bug regressed) | L4 @ bound 4 | FAIL — "ring invariant: a spare buffer is always free" |
+  | *(review)* release-on-capture inside the ring (`released.store(lsn)` in `capture`, private watermark untouched) | L2b | FAIL — "R1: emitted a captured-but-unreleased record" |
+  Model-strength fixes made to get there (recorded in design §15.7.8): L1's first version did
+  not catch the two L1 mutations because loom's `unpark` synchronizes the target immediately —
+  non-L5 models now register no waker and do bounded drain passes (no spinning: a spin made the
+  max-branch limit, not a real catch, fail M4). Spec refinements flagged in §15.7.8 (pinning
+  instead of overwrite-then-detect for L4; park/unpark instead of Condvar for L5).
+- **RM2 review follow-up (2026-10-27, designer review on #53).** Merged `main` (v7 + v7.1, clean).
+  Required 1: L4 raised to preemption bound 4 so the `Relaxed`-pin regression fails per-PR.
+  Required 2: new L2b (unreleased tail never emitted, checked against the producer's log, not
+  `Drain.watermark`) + the release-on-capture-inside-the-ring mutation. All **nine** mutations
+  re-run at the per-PR bounds — all FAIL their model, `ring.rs` restored. Non-blocking: sequencing
+  `next()` → `checked_next()` in `receiver.rs`/`shipper.rs` with a dedicated
+  `ReplError::LsnExhausted` (not poison; `Receiver::run` treats it as fatal) + tests; `hold()`
+  heartbeats now carry the primary's `released` (§6), via a reporting-only
+  `Consumer::released()`; L6b bound 3 moved to a scheduled job. Note 3 (proptest case counts)
+  needed no change: `proptest!` runs every config through `contextualize_config`, so
+  `PROPTEST_CASES` already overrides `cases: N` (verified: P4 0.10 s → 7.5 s at 2000). Notes 2
+  (`MAX_LSN` vs `seed`, RM4) and 7 (0.3.0 bump must also bump this crate's `open-wal`
+  requirement) are tracked, not done here.
+- **RM2 review round 2 (2026-10-27, crate-wide review on #53; loom gate CONFIRMED by the
+  designer at `b72a2fd` — all 9 mutations re-derived independently).** Five fixes, each with a
+  regression test shown **failing on the unfixed code**, then passing:
+  - **R1 (major) honest ACKs killed sessions:** `stream_records` published `sent` only after
+    `write_all` returned, so a replica ACKing the front of a batch bigger than the socket buffers
+    tripped `ack_reader`'s `durable > sent` check. Fix: store `sent` **before** the write (every
+    receivable byte is already in `out`, so the R4 bound stays sound). Test
+    `acks_during_a_blocked_batch_write_keep_the_session` (512 × 60 KB records, `send_batch` 256,
+    real `Receiver` at `batch_records=1`): old ordering **144 sessions** ⇒ FAIL; fixed: 1 session,
+    acked == durable, byte-identical.
+  - **R2 (major) R4 had no independent oracle:** P3 compared acks with `ReplicaWatermarks.durable`,
+    which the receiver writes itself. Tests now open the replica via `open_with(DurableTap)` — a
+    `DurabilityObserver` the WAL fires inside `commit` after the sync — and assert every ACK is
+    `≤` the tap at receipt (P1 via `FakePrimary::await_ack_tapped`; P3 via `ReplicaServer.tap`).
+    **Mutation row (receiver, not ring):** `commit_and_ack` sends `ACK{last_lsn}` BEFORE
+    `wal.commit()` ⇒ P1 FAIL "R4: ACK 4 received while the replica WAL is durable only to 0", P3
+    FAIL (self-report check fired first). **Strong form** (also publish `watermarks.durable` early,
+    so the self-report agrees with the lie) ⇒ P3 FAIL on the tap alone: "R4: acked 5 > what the
+    replica WAL certified durable (0)". Reverted (file byte-compared).
+  - **R3 (major) a silent primary wedged the replica:** `ReceiverConfig::new` now defaults
+    `idle_timeout = Some(5 s)` (≥ 3× the 500 ms shipper heartbeat); `None` is documented as
+    disabling dead-primary detection. Tests `default_idle_timeout_detects_a_dead_primary` +
+    `half_open_primary_does_not_wedge_the_replica` (primary #1 acks then goes silent with its
+    socket open; the restarted primary's connection must be served): with `None` the second HELLO
+    never arrives ⇒ FAIL (20 s read timeout); fixed: served after ~5 s, resumes at durable 1.
+  - **R4 (minor) stale `acked` after wipe/re-seed:** on an accepted (not `JOIN_AHEAD`) HELLO the
+    shipper now `store`s the HELLO's `durable_lsn` into `acked` (doc comments updated). Test
+    `acked_drops_when_a_wiped_replica_says_hello`: old ⇒ `acked` stays 5 ⇒ FAIL; fixed ⇒ drops to 0.
+  - **R5 (minor) a poisoning commit could send no ERR:** `send_err` now sends `ERR(Poisoned)`
+    whenever the receiver is poisoned. Finding while writing the test: a mid-stream `Io` commit
+    failure was already reported as `Poisoned` (the end-of-session commit retry returns
+    `WalError::Poisoned`); the real hole is a session ending on an in-band fault (contiguity) whose
+    end-of-session commit then fails with `Io` — that error replaced the pending one and nothing
+    was sent. Test `poisoning_end_of_session_commit_still_sends_err_poisoned` (planted
+    next-segment file ⇒ the roll's `O_EXCL` create fails): old ⇒ `rest = []` ⇒ FAIL; fixed ⇒
+    `ERR(Poisoned)`. (`io_commit_failure_is_reported_as_err_poisoned` covers the batch-full path.)
+  - **Recommended, done:** reconnect backoff resets once a session reached Streaming, even if it
+    ends in `Err`; new `two_replicas_stream_independently` (each replica byte-identical, own acks,
+    each replica WAL's tap == w).
+  - **Deferred to RM3 (not fixed here):** `hold()` sends HEARTBEAT before SERVING; the real
+    `Receiver` answers that with `ERR(Protocol)`, so a held replica reconnect-loops. RM3's §9
+    catch-up replaces `hold()` — add a real-`Receiver` interop test then.
+  - Still tracked: ring `MAX_LSN` vs `seed` (RM4); the 0.3.0 commit must bump this crate's
+    `open-wal` requirement to `"0.3"`.
+  `ring.rs` untouched this round (all 9 loom mutation rows stand); loom gate 8/8 green; replica
+  suite 58/58 (×3 runs); root `cargo test` 174/0.
+- **Current milestone:** RM3 (catch-up) — **BLOCKED until the RM2 gate is re-reviewed** on #53.
+  (Implement the corrected §9 step 2: reject iff `d > durable_lsn`.)
+- **RM2 loom gate:** L1–L6 + L2b green, nine mutations fail — CONFIRMED by the designer at
+  `b72a2fd`; round-2 crate fixes awaiting re-review.
+- **WAL v7 dependency (RM3+):** landed (#52 v7, #54 v7.1).
