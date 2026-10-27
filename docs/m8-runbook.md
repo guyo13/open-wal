@@ -101,9 +101,11 @@ If the marker **survives**, the storage does not lose un-synced data — **STOP*
 H1 result on it would be vacuous. Label such targets "PLP-cache only" and do not
 make a durability claim for honest power loss on them.
 
-> The **automated** H1 rig runs this same probe as `storage_probe write-unsynced-marker`
-> / `verify-marker-gone` (a test-only binary that writes via the **WAL's own `write(2)`
-> path**, minus the sync — see "Automated rig" under H1). That is the authoritative
+> The **automated** H1 rig runs a stronger, **two-sided** form of this probe as the
+> `storage_probe` binary (`write-unsynced-marker` builds a durable pre-allocated file **and**
+> an un-synced positioned marker; `verify-marker-gone` returns 0=lost / 1=survived /
+> **2=INCONCLUSIVE when the durable file is missing or wrong-sized**, so an unmounted DUT is
+> never a vacuous pass — see "Automated rig" under H1). That binary is the authoritative
 > calibration instrument; the shell `storage-check.sh probe-*` above is the quick manual
 > equivalent. `storage-check.sh classify` remains the static FS/cache deny-by-default check.
 
@@ -299,25 +301,47 @@ scripts/m8/h1-cycle.sh cycle        # the ≥N-consecutive-PASS loop
 scripts/m8/h1-cycle.sh run          # (default) calibrate → cycle → emit §5 evidence
 ```
 
-**The calibration instrument is the `storage_probe` binary, not a shell `echo`.** §3.4 must
-prove the DUT loses un-synced data **on the same kernel write path the WAL uses**, so the
-marker is written by `storage_probe write-unsynced-marker` — a plain `write(2)` with **no
-`fdatasync`** (the WAL's data path minus the durability step). "Un-synced data lost here" then
-predicts "un-acked WAL record lost here." `storage-check.sh classify` still runs first as the
-deny-by-default FS/cache check, but the loss-probe is the binary. `verify-marker-gone` exits
-0 = gone (honest cut) / 1 = survived (vacuous). A surviving marker is a **HARD abort** (exit 3,
-`verdict=OPEN`, `h2_probe=FAIL(survived)`) — no cycle counts.
+**The calibration instrument is the `storage_probe` binary, not a shell `echo`, and it is
+two-sided.** §3.4 must prove the DUT loses un-synced data **on the same kernel write path the WAL
+uses**, so `storage_probe write-unsynced-marker` mirrors a record in a pre-allocated segment: it
+first builds a **durable** probe file (zero-fill to a fixed size → `fdatasync` → **dir `fsync`**,
+like `segment::create`), then does a **positioned write of a non-zero marker with no sync** (the
+at-risk, un-acked data). `storage-check.sh classify` still runs first as the deny-by-default
+FS/cache check, but the loss-probe is the binary. After the cut, `verify-marker-gone` is a
+**positive control**:
+- durable file **missing or wrong-sized** ⇒ exit **2 INCONCLUSIVE** (DUT didn't remount / FS
+  damaged — *never* read as a pass; this closes the hole where an unmounted DUT looked "gone");
+- marker region **all zero** ⇒ exit **0** (the un-synced write was lost while the durable part
+  survived — an honest cut);
+- any marker byte **present** ⇒ exit **1** (vacuous) ⇒ **HARD abort** (exit 3, `verdict=OPEN`,
+  `h2_probe=FAIL(survived)`), no cycle counts.
+
+Calibration also, after the reboot, **re-runs `classify`** and checks `df --output=source` still
+matches the pre-cut device (a `nofail` remount elsewhere ⇒ INCONCLUSIVE).
+
+**Every cut is PROVEN by `boot_id`.** `ssh` answering does not prove the box lost power, so both
+calibration and every cycle read `/proc/sys/kernel/random/boot_id` before the cut and after the
+boot-wait. An **unchanged boot_id** means the kernel did not reboot ⇒ the cut did not happen ⇒
+**INCONCLUSIVE** (exit 2 in calibration; a re-run, uncounted cycle in the loop) — **never** a PASS
+and, in calibration, never reported as "marker survived". The per-cycle `[before,after]` boot_id
+pairs are recorded in the §5 ledger, and `cut.valid` / `storage.h2_cut_confirmed` are **derived
+from them** (no longer hard-coded).
 
 **Distinct exit codes / verdicts** (each terminal cause is unmistakable, and the §5 ledger is
-written on **every** path): `0`=PASS, `1`=D1 FAIL (`verdict=FAIL`), `2`=INCONCLUSIVE/infra
-abort (`verdict=INCONCLUSIVE`), `3`=vacuous calibration (`verdict=OPEN`).
+written on **every** path): `0`=PASS, `1`=**D1 FAIL only** (`power_pull_verify` found an acked LSN
+missing; `verdict=FAIL`), `2`=INCONCLUSIVE/infra incl. an unproven cut (`verdict=INCONCLUSIVE`),
+`3`=vacuous calibration (`verdict=OPEN`), `4`=**HARNESS** (rig/config error — smart-plug HTTP,
+missing `socat`/bins/config; **not** a durability verdict, so it never wears the D1-FAIL code).
 
 **Loop guarantees (pin-downs).** `power_pull_verify` runs **on the target over ssh** against the
 recovered WAL; the controller `scp`s **that cycle's fresh capture** to the target first, after the
-post-reboot ssh-readiness wait. The collector capture is **per-cycle** (a fresh file), so a stale
-capture can't bleed into a later cycle. Each cycle resolves to exactly one of PASS (counts) /
-INCONCLUSIVE-or-infra (re-run, never counted; `H1_INFRA_FAIL_MAX` consecutive infra fails abort
-loudly — likely SD/OS corruption) / FAIL (stops the run).
+post-reboot ssh-readiness wait **and the boot_id cut-proof**. The collector capture is **per-cycle**
+(a fresh file), so a stale capture can't bleed into a later cycle. Each cycle resolves to exactly
+one of PASS (counts) / INCONCLUSIVE-or-infra (re-run, never counted) / FAIL (stops the run). An
+INCONCLUSIVE/infra cycle is **uncounted and does NOT reset** the consecutive-PASS streak (so an
+occasional failed boot doesn't make 50 unreachable), but it **does** count toward the
+`H1_INFRA_FAIL_MAX` consecutive-infra-fail ceiling, which aborts loudly (likely SD/OS corruption or
+a dead cut). *(This streak behaviour is the owner's call per the designer review; documented here.)*
 
 Config is via env (see `config` for the full list): `H1_TARGET_SSH`, `H1_WAL_DIR` (the DUT
 partition), `H1_DUT_MEDIUM`, `H1_CONTROLLER_IP`, `H1_PORT` (9099), `H1_PLUG_TYPE`/`H1_PLUG_IP`,

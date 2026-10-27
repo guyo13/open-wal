@@ -118,8 +118,9 @@ jobs:
       # uses DISTINCT exit codes so the cause is unmistakable in CI:
       #   0 = N consecutive PASS with H2 proven (verdict=PASS, green)
       #   1 = D1 FAIL — an acked LSN was lost (verdict=FAIL; most likely a lying device, §3.6)
-      #   2 = INCONCLUSIVE / infra abort (verdict=INCONCLUSIVE)
+      #   2 = INCONCLUSIVE / infra abort (verdict=INCONCLUSIVE; cut unproven / no boot / gap)
       #   3 = VACUOUS calibration — storage didn't lose un-synced data (verdict=OPEN; HARD abort)
+      #   4 = HARNESS — rig/config error (plug HTTP, missing socat/bins/config). NOT durability.
       # Anything non-zero reds the build (NOT a pass). The verdict is in the ledger.
       - name: H1 calibration + cycle loop
         if: steps.rig.outputs.available == 'true'
@@ -128,8 +129,9 @@ jobs:
           case "$rc" in
             0) echo "H1: ${H1_CYCLES} consecutive PASS with the §3.4 H2 probe proven (medium: ${H1_DUT_MEDIUM}).";;
             1) echo "::error title=H1 D1 FAIL::an ACKED LSN was absent after the cut (verdict=FAIL). Per §3.6 the most likely cause is a lying device on medium '${H1_DUT_MEDIUM}' — the ledger records which LSN. NOT a pass."; exit 1;;
-            2) echo "::error title=H1 INCONCLUSIVE::infra abort (target didn't return / side-channel gap, verdict=INCONCLUSIVE). NOT a pass — re-run after fixing the rig."; exit 1;;
-            3) echo "::error title=H1 VACUOUS::§3.4 calibration FAILED — storage did NOT lose un-synced data (verdict=OPEN). Any H1 here tests nothing; no cycles ran. Fix the DUT/mount/cut before retrying. NOT a pass."; exit 1;;
+            2) echo "::error title=H1 INCONCLUSIVE::infra abort — cut unproven (boot_id unchanged), target didn't return, or side-channel gap (verdict=INCONCLUSIVE). NOT a pass — re-run after fixing the rig."; exit 1;;
+            3) echo "::error title=H1 VACUOUS::§3.4 calibration FAILED — storage did NOT lose un-synced data across a boot_id-proven cut (verdict=OPEN). Any H1 here tests nothing; no cycles ran. Fix the DUT/mount/cut before retrying. NOT a pass."; exit 1;;
+            4) echo "::error title=H1 HARNESS error::rig/config failure (smart-plug HTTP, missing socat/bins/config) — NOT a durability verdict. Fix the rig and re-run."; exit 1;;
             *) echo "::error title=H1 unexpected::h1-cycle.sh run exited ${rc} — read the evidence ledger. NOT a pass."; exit 1;;
           esac
 

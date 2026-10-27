@@ -27,10 +27,18 @@
 #   run           (default) config-check -> calibrate -> cycle -> emit §5 evidence.
 #   config        print the resolved config and exit (no hardware touched).
 #
+# Exit codes (distinct per cause, so CI never misattributes a rig problem to durability):
+#   0 PASS   N consecutive PASS with the §3.4 H2 probe proven.
+#   1 FAIL   power_pull_verify found an acked LSN missing (D1 violation). ONLY this is "FAIL".
+#   2 INCONCLUSIVE  cut not proven (boot_id unchanged), target didn't return, or side-channel gap.
+#   3 VACUOUS  §3.4 calibration: the DUT did NOT lose un-synced data (verdict=OPEN). Hard abort.
+#   4 HARNESS  rig/config error (plug HTTP, missing socat/bins/config). Not a durability verdict.
+#
 # Honesty rails (M8 ground rules): the calibration GATE runs first and aborts loudly
-# if the DUT didn't lose un-synced data; INCONCLUSIVE never counts toward 50; a FAIL
-# stops the run; verdict=PASS is emitted ONLY when the H2 probe proved loss AND
-# fail==0 AND zero counted INCONCLUSIVE. Nothing here fakes green.
+# if the DUT didn't lose un-synced data; every cut is PROVEN via the target's boot_id
+# (an unchanged boot_id ⇒ the cut did not happen ⇒ INCONCLUSIVE, never PASS/"survived");
+# INCONCLUSIVE never counts toward 50; a FAIL stops the run; verdict=PASS is emitted ONLY
+# when the H2 probe proved loss AND fail==0 AND zero counted INCONCLUSIVE. Never fakes green.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -63,10 +71,15 @@ log()  { printf '\033[1;34m[m8/h1]\033[0m %s\n' "$*" >&2; }
 warn() { printf '\033[1;33m[m8/h1] WARN:\033[0m %s\n' "$*" >&2; }
 pass() { printf '\033[1;32m[m8/h1] PASS:\033[0m %s\n' "$*" >&2; }
 # die_code <exit-code> <msg…>: distinct exit codes make each terminal cause
-# unmistakable in CI. 1 = D1 FAIL (acked loss), 2 = INCONCLUSIVE/infra, 3 = VACUOUS
-# calibration (the loudest — storage did not lose un-synced data). die() = generic 1.
+# unmistakable in CI (mirrors dm-flakey.sh's HARNESS=4 convention):
+#   1 = D1 FAIL   — power_pull_verify reported an acked LSN missing (durability).
+#   2 = INCONCLUSIVE/infra — cut not proven, target didn't return, side-channel gap.
+#   3 = VACUOUS   — §3.4 calibration proved storage did NOT lose un-synced data.
+#   4 = HARNESS   — rig/config error (plug HTTP, missing socat/bins/config). NOT a durability verdict.
+# die() is a HARNESS error (4) — a tooling/config failure must NEVER wear the D1-FAIL code.
+# Only the cycle-loop verify-FAIL path uses die_code 1.
 die_code() { local c="$1"; shift; printf '\033[1;31m[m8/h1] ERROR:\033[0m %s\n' "$*" >&2; exit "$c"; }
-die()      { die_code 1 "$@"; }
+die()      { die_code 4 "$@"; }
 
 # --- §5 verdict (one ledger per run, on EVERY terminal path) -----------------
 # The §5 schema verdict is PASS | FAIL | INCONCLUSIVE | OPEN. We set VERDICT at each
@@ -102,10 +115,20 @@ ssh_target() {
     "$H1_TARGET_SSH" "$@"
 }
 
+# --- Cut proof (boot_id) ----------------------------------------------------
+# A switch toggle that silently no-ops is NOT caught by the boot-wait alone (ssh
+# answering does not prove the box rebooted). So every cut is PROVEN: read the
+# target's boot_id before the cut and after it comes back; if unchanged, the kernel
+# did not reboot ⇒ the cut did not happen ⇒ INCONCLUSIVE (never PASS, never "marker
+# survived"). boot_id is a fresh random UUID per boot (/proc/sys/kernel/random/boot_id).
+target_boot_id() { ssh_target 'cat /proc/sys/kernel/random/boot_id' 2>/dev/null | tr -d '[:space:]' || true; }
+# cut_happened <before> <after>: 0 (true) iff both are non-empty and differ.
+cut_happened() { [ -n "${1:-}" ] && [ -n "${2:-}" ] && [ "$1" != "$2" ]; }
+
 # --- Smart-plug driver (pluggable by endpoint) ------------------------------
 # shelly (Gen2/Gen3/Plus) share the RPC API; gen1 is the legacy /relay/0; tasmota
-# is /cm?cmnd=Power. A switch toggle that silently no-ops is caught downstream by
-# the post-cut boot-wait (the target must actually go away and come back).
+# is /cm?cmnd=Power. A silent no-op toggle is caught by the boot_id cut-proof above
+# (unchanged boot_id ⇒ INCONCLUSIVE), not by the plug call succeeding.
 plug_url() { # plug_url on|off
   local state="$1"
   case "$H1_PLUG_TYPE" in
@@ -213,32 +236,67 @@ cmd_calibrate() {
     finish "OPEN"
     die_code 3 "H2 static guard FAILED — the DUT is not a recognised durable block FS. Refusing a vacuous H1."
   fi
+  # Capture the DUT's block device BEFORE the cut so we can detect a post-reboot
+  # remount onto a different source (e.g. nofail fallback) that would confound verify.
+  local src_before; src_before="$(ssh_target "df --output=source '$H1_WAL_DIR' 2>/dev/null | tail -1 | tr -d ' '" 2>/dev/null || true)"
 
   # Empirical loss probe via storage_probe — shares the WAL write(2) path (the reason
-  # it's a binary, not the shell echo): un-synced data that is lost here predicts an
-  # un-acked WAL record lost here.
-  log "§3.4 calibration: writing an UN-SYNCED marker (WAL write path), then a REAL cut…"
+  # it's a binary, not the shell echo): durable pre-alloc (fdatasync+dir-fsync) plus an
+  # un-synced positioned marker, so loss here predicts an un-acked WAL record lost here.
+  log "§3.4 calibration: writing the durable pre-alloc + UN-SYNCED marker, then a REAL cut…"
   ssh_target "mkdir -p '$H1_WAL_DIR' && '$H1_BIN_DIR/storage_probe' write-unsynced-marker '$H1_WAL_DIR'"
+  local boot_before; boot_before="$(target_boot_id)"
   # Cut immediately (no chance for an unrelated writeback to flush the marker).
   plug_off
   sleep "$H1_OFF_SECS"
   plug_on
   if ! wait_ssh; then
-    H2_PROBE="FAIL(target did not return after calibration cut)"
+    H2_PROBE="INCONCLUSIVE(target did not return after calibration cut)"
     finish "INCONCLUSIVE"
     die_code 2 "calibration cut: target did not come back — fix the rig before running cycles."
   fi
-  # Marker MUST be gone. storage_probe exits 0 (gone ⇒ honest cut) / 1 (survived ⇒ vacuous).
-  if ssh_target "'$H1_BIN_DIR/storage_probe' verify-marker-gone '$H1_WAL_DIR'"; then
-    H2_PROBE="PASS(marker gone)"
-    pass "§3.4 calibration PASSED — the DUT genuinely loses un-synced data. Cycles are meaningful."
-  else
-    # HARD abort — the single most important thing this gate can discover. Distinct
-    # exit 3, evidence emitted with h2_probe=FAIL(survived) and verdict=OPEN.
-    H2_PROBE="FAIL(survived)"
-    finish "OPEN"
-    die_code 3 "§3.4 calibration FAILED (VACUOUS) — the un-synced marker SURVIVED the cut. Storage did NOT lose un-synced data ⇒ any H1 here tests nothing. NO cycles run. (Check mount opts / cut fidelity.)"
+  # PROVE the cut actually happened (boot_id changed). An unchanged boot_id means the
+  # plug no-op'd / the box never lost power — INCONCLUSIVE, NOT "marker survived".
+  local boot_after; boot_after="$(target_boot_id)"
+  if ! cut_happened "$boot_before" "$boot_after"; then
+    H2_PROBE="INCONCLUSIVE(cut did not happen; boot_id unchanged: ${boot_before:-?})"
+    finish "INCONCLUSIVE"
+    die_code 2 "calibration cut UNPROVEN — boot_id did not change (${boot_before:-?} == ${boot_after:-?}); the target did not reboot, so no real power cut occurred. Check the smart plug / wiring. (NOT a durability result.)"
   fi
+  CUT_VALID="true"   # the calibration cut is boot_id-proven real
+  # The DUT must come back as the SAME durable block device (re-classify + source match),
+  # else a post-cut remount/damage would let verify-marker-gone read a vacuous pass.
+  if ! ssh_target "'$H1_BIN_DIR/storage-check.sh' classify '$H1_WAL_DIR'"; then
+    H2_PROBE="INCONCLUSIVE(DUT not a durable block FS after the cut)"
+    finish "INCONCLUSIVE"
+    die_code 2 "post-cut re-classify FAILED — the DUT did not come back as a durable block FS (remount/fsck fallback?). INCONCLUSIVE; fix the rig."
+  fi
+  local src_after; src_after="$(ssh_target "df --output=source '$H1_WAL_DIR' 2>/dev/null | tail -1 | tr -d ' '" 2>/dev/null || true)"
+  if [ -n "$src_before" ] && [ "$src_before" != "$src_after" ]; then
+    H2_PROBE="INCONCLUSIVE(DUT device changed across the cut: ${src_before} -> ${src_after:-?})"
+    finish "INCONCLUSIVE"
+    die_code 2 "the DUT block device changed across the cut (${src_before} -> ${src_after:-?}) — the WAL dir remounted elsewhere; a marker result would be meaningless. INCONCLUSIVE."
+  fi
+  # Two-sided marker verify: 0 = gone (honest) / 1 = survived (vacuous) / 2 = INCONCLUSIVE
+  # (probe file missing or wrong size: wrong FS / not mounted / damaged — never a pass).
+  local rc=0
+  ssh_target "'$H1_BIN_DIR/storage_probe' verify-marker-gone '$H1_WAL_DIR'" || rc=$?
+  case "$rc" in
+    0)
+      H2_PROBE="PASS(marker gone)"
+      pass "§3.4 calibration PASSED — the DUT genuinely loses un-synced data (cut boot_id-proven). Cycles are meaningful." ;;
+    1)
+      # HARD abort — the single most important thing this gate can discover.
+      H2_PROBE="FAIL(survived)"
+      finish "OPEN"
+      die_code 3 "§3.4 calibration FAILED (VACUOUS) — the un-synced marker SURVIVED a boot_id-proven cut. Storage did NOT lose un-synced data ⇒ any H1 here tests nothing. NO cycles run. (Check mount opts / device cache honesty.)" ;;
+    2)
+      H2_PROBE="INCONCLUSIVE(probe file missing/wrong size after the cut)"
+      finish "INCONCLUSIVE"
+      die_code 2 "§3.4 calibration INCONCLUSIVE — the durable probe file was missing or wrong-sized after the cut (DUT remount/damage). NOT a pass; re-run after fixing the rig." ;;
+    *)
+      die_code 4 "storage_probe verify-marker-gone exited ${rc} (unexpected) — harness error." ;;
+  esac
 }
 
 # --- the cycle loop (§3.5) --------------------------------------------------
@@ -247,7 +305,14 @@ CYCLES_PASS=0
 FAIL_COUNT=0
 INCONCLUSIVE_RERUN=0
 PER_CYCLE=""                 # JSON array body, e.g. "0,0,2,0"
+CUT_VALID="false"            # cut.valid in §5: set true once the calibration cut is boot_id-proven
+BOOT_PAIRS=""                # per-cycle [before,after] boot_id pairs (JSON array body)
 append_per_cycle() { PER_CYCLE="${PER_CYCLE:+$PER_CYCLE,}$1"; }
+# record_boot_pair <before> <after>: append the cut-proof pair for the evidence ledger.
+record_boot_pair() {
+  local b="${1:-}" a="${2:-}"
+  BOOT_PAIRS="${BOOT_PAIRS:+$BOOT_PAIRS,}[\"${b:-unknown}\",\"${a:-unreachable}\"]"
+}
 
 # Run ONE trial. Echoes nothing; returns: 0 PASS, 1 FAIL, 2 INCONCLUSIVE/infra.
 run_one_cycle() {
@@ -263,6 +328,8 @@ run_one_cycle() {
     stop_collector; return 2
   fi
   sleep "$H1_WORKLOAD_SECS"   # let it commit + stream thousands of acked lines
+  # capture boot_id while the target is up (to prove the cut actually reboots it)
+  local boot_before; boot_before="$(target_boot_id)"
   # 5. CUT (real mains interrupt) — the workload dies with the board
   plug_off
   # 6. wait, then RESTORE
@@ -270,7 +337,15 @@ run_one_cycle() {
   plug_on
   stop_collector
   # 7. wait for boot
-  wait_ssh || return 2
+  if ! wait_ssh; then record_boot_pair "$boot_before" ""; return 2; fi
+  # PROVE the cut happened: boot_id must have changed. If not, the plug no-op'd / the
+  # box never lost power ⇒ INCONCLUSIVE (return 2), NOT a PASS on an intact log.
+  local boot_after; boot_after="$(target_boot_id)"
+  record_boot_pair "$boot_before" "$boot_after"
+  if ! cut_happened "$boot_before" "$boot_after"; then
+    warn "cycle: boot_id unchanged (${boot_before:-?}) — the target did NOT reboot ⇒ the cut did not happen. INCONCLUSIVE."
+    return 2
+  fi
   # 8. ship the off-box capture TO the target and verify against the recovered WAL
   local remote_cap="/tmp/h1_capture_$$.txt"
   scp -q "$cap" "${H1_TARGET_SSH}:${remote_cap}" || return 2
@@ -302,15 +377,17 @@ cmd_cycle() {
         finish "FAIL"
         die_code 1 "cycle #${n}: FAIL — an ACKED LSN was absent after the cut (D1 violation). STOPPING the run. Investigate per §3.6 (most likely a lying device on medium '${H1_DUT_MEDIUM}'; the evidence records which LSN and medium)." ;;
       2)
-        # INCONCLUSIVE / infra — never counts toward 50; reset the consecutive streak.
+        # INCONCLUSIVE / infra (cut unproven, target didn't return, or side-channel gap).
+        # Per the plan it is UNCOUNTED and re-run; it does NOT reset the consecutive PASS
+        # streak (a Pi that occasionally fails to boot shouldn't make 50 unreachable), but
+        # it does count toward the consecutive-infra-fail ABORT ceiling. Runbook documents this.
         INCONCLUSIVE_RERUN=$(( INCONCLUSIVE_RERUN + 1 ))
         append_per_cycle 2
-        CYCLES_PASS=0
         infra_fail=$(( infra_fail + 1 ))
-        warn "cycle #${n}: INCONCLUSIVE/infra (side-channel gap or target didn't return) — not counted; consecutive streak reset."
+        warn "cycle #${n}: INCONCLUSIVE/infra — not counted (streak kept at ${CYCLES_PASS}/${H1_CYCLES}); consecutive infra ${infra_fail}/${H1_INFRA_FAIL_MAX}."
         if [ "$infra_fail" -ge "$H1_INFRA_FAIL_MAX" ]; then
           finish "INCONCLUSIVE"
-          die_code 2 "${H1_INFRA_FAIL_MAX} consecutive infra failures — aborting (likely SD/OS corruption; re-flash, check the read-only overlay & wiring)."
+          die_code 2 "${H1_INFRA_FAIL_MAX} consecutive infra failures — aborting (likely SD/OS corruption or a dead cut; re-flash, check the read-only overlay, wiring & smart plug)."
         fi ;;
       *)
         finish "INCONCLUSIVE"
@@ -337,11 +414,13 @@ emit_evidence() {
     "target.uname=${uname}" "target.kernel=${kernel}" "target.host=${host}" \
     "storage.fs=${fstype}" "storage.block_device=${src}" \
     "storage.dut_medium=${H1_DUT_MEDIUM}" "storage.h2_probe=${H2_PROBE}" \
+    "storage.h2_cut_confirmed=${CUT_VALID}" \
     "cut.mechanism=smart-plug mains interrupt (${H1_PLUG_TYPE}@${H1_PLUG_IP:-n/a})" \
-    cut.valid=true \
+    "cut.valid=${CUT_VALID}" \
     "run.cycles_required=${H1_CYCLES}" "run.cycles_pass=${CYCLES_PASS}" \
     "run.fail=${FAIL_COUNT}" "run.inconclusive_rerun=${INCONCLUSIVE_RERUN}" \
     "run.per_cycle=@[${PER_CYCLE}]" \
+    "run.boot_id_pairs=@[${BOOT_PAIRS}]" \
     "verdict=${verdict}"
   log "evidence written: $WAL_M8_EVIDENCE"
 }
