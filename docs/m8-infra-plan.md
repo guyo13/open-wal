@@ -78,7 +78,7 @@ Why this split: the controller hosts the GitHub runner and must never be cut (a 
 - **Dedicated writable WAL partition = the DUT.** The only thing exposed to power-cut writes is the WAL under test, on its own ext4 partition. Provide for **three DUT media**, each a different device class: (a) a partition on the **microSD** (Pi), (b) the **USB-SSD** (Pi), (c) the **onboard eMMC** of the **BeagleBone Black**. Run the gate against each; record which. (eMMC is soldered, managed NAND with its own controller/cache — the most production-realistic embedded medium and the one whose flush honesty is most likely to surprise you, so it broadens the device-honesty coverage the rig produces.)
   - For the BeagleBone target, boot its **rootfs from microSD with the read-only overlay** (same cut-corruption protection as the Pi) and put the **WAL on a dedicated eMMC partition** as the DUT — so the eMMC is the thing under test and the OS isn't the thing 50 cuts corrupt. The BBB is ARMv7/battery-less with a single 5 V input, so it's a valid smart-plug cut target; it is **not** a controller candidate (32-bit → no GitHub runner), only a DUT.
 - **DUT media are consumables.** The boards themselves shrug off power cycling (effectively unlimited at these counts). The flash media is the wear surface, and the binding risk is **not** write-endurance — 50 cycles write only single-digit GB, orders of magnitude under any card's lifetime — but **sudden FTL (flash-translation-layer) corruption on a mid-write cut**, which can brick a whole card. The per-cut probability is low and *device-quality-dependent* (a cheap no-name microSD is the most exposed; the read-only overlay already protects the boot/OS card regardless). So: keep **one or two spares of each DUT medium**, keep a **pre-imaged OS/boot card** so a brick is a 5-minute re-flash rather than a re-setup, and treat a **mid-campaign card death as a recordable device-honesty finding** (that card is empirically not honest hardware — exactly the verdict the gate exists to render), not a rig failure. Record it in the evidence artifact and continue on a spare.
-- **Cross-compiled binaries**, built on the controller (`aarch64-unknown-linux-gnu`, MSRV 1.85, via `cross` or rustup target + linker) and `scp`'d to the Pi: `power_pull_workload`, `power_pull_verify`, and `storage_probe`. Do not build on the Pi (slow, and we want the runner to control versions).
+- **Cross-compiled binaries**, built on the controller (`aarch64-unknown-linux-gnu`, MSRV 1.85, via `cross` or rustup target + linker) and `scp`'d to the Pi: `power_pull_workload`, `power_pull_verify`, and `storage_probe`. Do not build on the Pi (slow, and we want the runner to control versions). `scripts/m8/h1-cycle.sh deploy` performs this `scp` (plus `storage-check.sh` for the static FS/cache classification).
 - Passwordless ssh from controller → Pi (key auth) for unattended cycling.
 
 ### 3.3 Controller setup
@@ -90,10 +90,11 @@ Why this split: the controller hosts the GitHub runner and must never be cut (a 
 
 ### 3.4 Cut-mechanism calibration + H2 gate — THE FIRST MILESTONE (before any cycle counts)
 
-Do **not** run the 50-cycle loop until this passes. On the exact DUT medium:
-1. `storage_probe write-unsynced-marker <wal_dir>` — write a marker **without** `fdatasync` (it must sit in the page cache / device cache, not on stable flash).
+Do **not** run the 50-cycle loop until this passes. On the exact DUT medium (this is the
+`h1-cycle.sh calibrate` step, run automatically as the first step of every `run`):
+1. `storage_probe write-unsynced-marker <wal_dir>` — write a marker **without** `fdatasync` (it must sit in the page cache / device cache, not on stable flash). `storage_probe` writes via the **same `write(2)` path the WAL uses** (minus the sync), so "un-synced data lost here" predicts "un-acked WAL record lost here" — a shell `echo` could differ subtly and mis-measure.
 2. Cut power via the smart plug; restore; wait for boot.
-3. `storage_probe verify-marker-gone <wal_dir>` — the marker **MUST be absent**.
+3. `storage_probe verify-marker-gone <wal_dir>` — the marker **MUST be absent** (exit 0 = gone; exit 1 = survived ⇒ vacuous, hard abort).
    - **Gone ⇒ the cut is real** (un-synced data is genuinely lost) ⇒ proceed.
    - **Survives ⇒ vacuous** (storage didn't lose un-synced data — e.g. mounted `sync`, or the probe accidentally flushed) ⇒ **abort, fail loudly**, do not run cycles. Investigate the mount / probe before continuing.
 

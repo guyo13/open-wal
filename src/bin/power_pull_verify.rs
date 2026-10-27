@@ -17,7 +17,12 @@
 //! recovered log legitimately may contain records BEYOND the high-water; the check
 //! is one-directional: every LSN ≤ high-water MUST be present. Extra is fine.
 //!
-//! Exit: 0 PASS · 1 FAIL (acked record lost/wrong — a D1 violation) · 2 INCONCLUSIVE.
+//! Exit: 0 PASS · 1 FAIL (acked record lost/wrong — a D1 violation) · 2 INCONCLUSIVE
+//! (side-channel gap/empty only) · 5 RECOVERY-FAIL (recovery REFUSED the log after the
+//! cut — TornMidLog/Corruption/BadSegmentHeader/ContiguityViolation/EIO). A recovery
+//! refusal is NOT infra: if acked records are now unreadable, that is a D1-class failure
+//! of the (WAL, device) pair (§3.6), so it gets its own code instead of panicking (exit
+//! 101) and being misfiled as INCONCLUSIVE by the harness.
 //!
 //! Usage: power_pull_verify <wal_dir> <capture_file>
 
@@ -96,7 +101,16 @@ fn main() {
 
     // 2. Recover the WAL and stream every record in dense order.
     let cfg = wal_config();
-    let (wal, report) = Wal::open(Path::new(dir), cfg).expect("open/recover WAL");
+    let (wal, report) = match Wal::open(Path::new(dir), cfg) {
+        Ok(ok) => ok,
+        Err(e) => {
+            // Recovery REFUSED the log after a (proven) cut. This is a durability FAIL for
+            // the (WAL, device) pair, not infra — if acked records are now unreadable they
+            // are lost (§3.6). Distinct code 5 so the harness files it as FAIL, not re-run.
+            eprintln!("[verify] FAIL: recovery refused the log after the cut: {e:?}");
+            std::process::exit(5);
+        }
+    };
     eprintln!(
         "[verify] recovered: oldest_lsn={} durable_lsn={}",
         report.oldest_lsn.0, report.durable_lsn.0
@@ -106,7 +120,15 @@ fn main() {
     let mut expected = report.oldest_lsn.0.max(1);
     let mut highest_seen = 0u64;
     while let Some(item) = reader.next() {
-        let (lsn, payload) = item.expect("recovered record must decode");
+        let (lsn, payload) = match item {
+            Ok(rec) => rec,
+            Err(e) => {
+                // A record below the acked watermark failed to decode during replay — the
+                // recovered log is damaged. Same class as an open refusal: RECOVERY-FAIL (5).
+                eprintln!("[verify] FAIL: recovery refused the log after the cut: {e:?}");
+                std::process::exit(5);
+            }
+        };
         if lsn.0 != expected {
             eprintln!(
                 "[verify] FAIL: recovered run not dense — expected LSN {expected}, got {}. \

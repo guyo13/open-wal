@@ -1,0 +1,9 @@
+# actionlint config — declare the repo's custom self-hosted runner labels so the
+# workflows that target dedicated boxes lint clean:
+#   - h1-rig:   the H1 power-pull controller laptop (.github/workflows/m8-h1.yml,
+#               runs-on: [self-hosted, h1-rig]); see docs/m8-runbook.md → controller setup.
+#   - fuzz-rig: the dedicated fuzzing box (.github/workflows/fuzz-gate.yml).
+self-hosted-runner:
+  labels:
+    - h1-rig
+    - fuzz-rig
