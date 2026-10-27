@@ -29,10 +29,17 @@
 #
 # Exit codes (distinct per cause, so CI never misattributes a rig problem to durability):
 #   0 PASS   N consecutive PASS with the §3.4 H2 probe proven.
-#   1 FAIL   power_pull_verify found an acked LSN missing (D1 violation). ONLY this is "FAIL".
-#   2 INCONCLUSIVE  cut not proven (boot_id unchanged), target didn't return, or side-channel gap.
+#   1 FAIL   verdict=FAIL — a durability failure of the (WAL, device) pair. Three sub-causes:
+#            (a) power_pull_verify found an acked LSN missing (D1, verify exit 1);
+#            (b) recovery REFUSED the log after a proven cut (verify exit 5 — acked records
+#                unreadable, §3.6) — the failing cycle's WAL dir is snapshotted to evidence;
+#            (c) the durable calibration probe was lost on a proven+matched device
+#                (storage_probe exit 3 — the medium lied about fdatasync/dir-fsync, §3.6).
+#   2 INCONCLUSIVE  cut not proven (boot_id unchanged), target didn't return, side-channel gap,
+#                   or the DUT didn't remount as the same device in a cycle. Re-run, uncounted.
 #   3 VACUOUS  §3.4 calibration: the DUT did NOT lose un-synced data (verdict=OPEN). Hard abort.
-#   4 HARNESS  rig/config error (plug HTTP, missing socat/bins/config). Not a durability verdict.
+#   4 HARNESS  rig/config error (plug HTTP, missing socat/bins/config, mountpoint as WAL dir,
+#              arch/medium mismatch). Not a durability verdict.
 #
 # Honesty rails (M8 ground rules): the calibration GATE runs first and aborts loudly
 # if the DUT didn't lose un-synced data; every cut is PROVEN via the target's boot_id
@@ -228,9 +235,30 @@ cmd_deploy() {
 H2_PROBE="not-run"
 cmd_calibrate() {
   require H1_TARGET_SSH; require H1_WAL_DIR
+  # R8: the cross-built bins must match the target's arch, and the DECLARED medium must
+  # match the box — a Pi run must not be filed as 'eMMC(BeagleBone)' and vice-versa.
+  TARGET_ARCH="$(ssh_target 'uname -m' 2>/dev/null | tr -d '[:space:]' || true)"
+  TARGET_DT_MODEL="$(ssh_target 'tr -d "\000" < /proc/device-tree/model 2>/dev/null' 2>/dev/null || true)"
+  [ -n "$TARGET_ARCH" ] || die_code 4 "cannot read the target's 'uname -m' — rig/ssh error (HARNESS)."
+  local want_arch
+  case "$H1_DUT_MEDIUM" in
+    'eMMC(BeagleBone)') want_arch=armv7l ;;
+    *)                  want_arch=aarch64 ;;
+  esac
+  [ "$TARGET_ARCH" = "$want_arch" ] || die_code 4 "arch/medium mismatch — target reports '$TARGET_ARCH' but medium '$H1_DUT_MEDIUM' expects '$want_arch'. Wrong bins deployed, or the medium label is wrong (a Pi run mis-filed as BeagleBone, or vice-versa). (HARNESS)"
+
+  # R7: H1_WAL_DIR must be a SUBDIRECTORY of the DUT mount, never the mountpoint itself
+  # (a per-cycle `rm -rf` of the mountpoint would wipe the partition + EBUSY). And it must
+  # be CREATED before classify, so a fresh/unformatted-then-formatted DUT whose dir doesn't
+  # exist yet is not mis-recorded as a non-durable (VACUOUS) medium.
+  if ssh_target "mountpoint -q '$H1_WAL_DIR'"; then
+    die_code 4 "H1_WAL_DIR ($H1_WAL_DIR) is itself a MOUNTPOINT — it must be a SUBDIRECTORY of the DUT mount so per-cycle cleanup can't wipe the partition. (HARNESS)"
+  fi
+  ssh_target "mkdir -p '$H1_WAL_DIR'" || die_code 4 "cannot create H1_WAL_DIR ($H1_WAL_DIR) on the target (HARNESS)."
+
   # Static deny-by-default FS/cache check (storage-check.sh). A non-durable FS is a
   # vacuous-class abort (exit 3) just like a surviving marker.
-  log "§3.4 calibration: static H2 classification of the DUT…"
+  log "§3.4 calibration: static H2 classification of the DUT… (arch ${TARGET_ARCH}, medium ${H1_DUT_MEDIUM})"
   if ! ssh_target "'$H1_BIN_DIR/storage-check.sh' classify '$H1_WAL_DIR'"; then
     H2_PROBE="FAIL(non-durable FS)"
     finish "OPEN"
@@ -238,7 +266,14 @@ cmd_calibrate() {
   fi
   # Capture the DUT's block device BEFORE the cut so we can detect a post-reboot
   # remount onto a different source (e.g. nofail fallback) that would confound verify.
+  # R7: an empty df source is INCONCLUSIVE (cannot establish the device), never a silent skip.
   local src_before; src_before="$(ssh_target "df --output=source '$H1_WAL_DIR' 2>/dev/null | tail -1 | tr -d ' '" 2>/dev/null || true)"
+  if [ -z "$src_before" ]; then
+    H2_PROBE="INCONCLUSIVE(could not determine DUT block device before the cut)"
+    finish "INCONCLUSIVE"
+    die_code 2 "could not determine the DUT block device before the cut (df --output=source was empty) — INCONCLUSIVE, not a silent skip."
+  fi
+  CAL_SRC="$src_before"   # per-cycle remount check (R7) compares against this
 
   # Empirical loss probe via storage_probe — shares the WAL write(2) path (the reason
   # it's a binary, not the shell echo): durable pre-alloc (fdatasync+dir-fsync) plus an
@@ -277,8 +312,12 @@ cmd_calibrate() {
     finish "INCONCLUSIVE"
     die_code 2 "the DUT block device changed across the cut (${src_before} -> ${src_after:-?}) — the WAL dir remounted elsewhere; a marker result would be meaningless. INCONCLUSIVE."
   fi
-  # Two-sided marker verify: 0 = gone (honest) / 1 = survived (vacuous) / 2 = INCONCLUSIVE
-  # (probe file missing or wrong size: wrong FS / not mounted / damaged — never a pass).
+  # Two-sided marker verify (reached only AFTER the cut is boot_id-proven, the DUT
+  # re-classifies as durable, and the block device matches $CAL_SRC):
+  #   0 = gone (honest cut) / 1 = survived (vacuous) /
+  #   3 = DURABLE-LOST (the durably-synced pre-alloc is gone ⇒ the medium lied about
+  #       fdatasync/dir-fsync — a device-honesty FAIL, §3.6) /
+  #   2 = INCONCLUSIVE (a real stat/open/read I/O error).
   local rc=0
   ssh_target "'$H1_BIN_DIR/storage_probe' verify-marker-gone '$H1_WAL_DIR'" || rc=$?
   case "$rc" in
@@ -290,10 +329,16 @@ cmd_calibrate() {
       H2_PROBE="FAIL(survived)"
       finish "OPEN"
       die_code 3 "§3.4 calibration FAILED (VACUOUS) — the un-synced marker SURVIVED a boot_id-proven cut. Storage did NOT lose un-synced data ⇒ any H1 here tests nothing. NO cycles run. (Check mount opts / device cache honesty.)" ;;
+    3)
+      # R6: on a proven+re-classified+source-matched device, a lost durable pre-alloc means
+      # the medium acked fdatasync/dir-fsync then lost it — a lying-device verdict (§3.6).
+      H2_PROBE="FAIL(durable probe lost on ${src_after:-$CAL_SRC}: device did not honor fdatasync/dir-fsync — §3.6; medium ${H1_DUT_MEDIUM})"
+      finish "FAIL"
+      die_code 1 "§3.4 calibration: DEVICE-HONESTY FAIL — the durably-synced probe (fdatasync + dir-fsync) was LOST across a boot_id-proven cut on ${src_after:-$CAL_SRC} (medium '${H1_DUT_MEDIUM}'). The medium lied about the flush (§3.6). This is a durability FAIL of the (WAL, device) pair, not infra — do NOT just re-run; the device is not honest hardware." ;;
     2)
-      H2_PROBE="INCONCLUSIVE(probe file missing/wrong size after the cut)"
+      H2_PROBE="INCONCLUSIVE(real I/O error reading the probe after the cut)"
       finish "INCONCLUSIVE"
-      die_code 2 "§3.4 calibration INCONCLUSIVE — the durable probe file was missing or wrong-sized after the cut (DUT remount/damage). NOT a pass; re-run after fixing the rig." ;;
+      die_code 2 "§3.4 calibration INCONCLUSIVE — a real I/O error while reading the durable probe after the cut. NOT a pass; re-run after fixing the rig." ;;
     *)
       die_code 4 "storage_probe verify-marker-gone exited ${rc} (unexpected) — harness error." ;;
   esac
@@ -307,24 +352,43 @@ INCONCLUSIVE_RERUN=0
 PER_CYCLE=""                 # JSON array body, e.g. "0,0,2,0"
 CUT_VALID="false"            # cut.valid in §5: set true once the calibration cut is boot_id-proven
 BOOT_PAIRS=""                # per-cycle [before,after] boot_id pairs (JSON array body)
+CAL_SRC=""                   # DUT block device captured at calibration (per-cycle remount check, R7)
+TARGET_ARCH="unknown"        # ssh 'uname -m' (R8)
+TARGET_DT_MODEL="unknown"    # /proc/device-tree/model (R8)
 append_per_cycle() { PER_CYCLE="${PER_CYCLE:+$PER_CYCLE,}$1"; }
 # record_boot_pair <before> <after>: append the cut-proof pair for the evidence ledger.
 record_boot_pair() {
   local b="${1:-}" a="${2:-}"
   BOOT_PAIRS="${BOOT_PAIRS:+$BOOT_PAIRS,}[\"${b:-unknown}\",\"${a:-unreachable}\"]"
 }
+# snapshot_wal_dir <remote_dir> <label>: tar the failing cycle's WAL dir off the target
+# into the evidence dir for forensics (R4 — a recovery refusal is a durability finding).
+snapshot_wal_dir() {
+  local rdir="$1" label="$2"
+  local out; out="$(dirname "$WAL_M8_EVIDENCE")/h1-waldir-${label}.tar.gz"
+  mkdir -p "$(dirname "$out")"
+  if ssh_target "tar czf - -C '$(dirname "$rdir")' '$(basename "$rdir")'" > "$out" 2>/dev/null; then
+    log "snapshotted the failing cycle WAL dir -> $out"
+  else
+    warn "could not snapshot the WAL dir $rdir (continuing; the verdict stands)."
+  fi
+}
 
-# Run ONE trial. Echoes nothing; returns: 0 PASS, 1 FAIL, 2 INCONCLUSIVE/infra.
+# Run ONE trial on a UNIQUE per-cycle WAL dir. Returns the raw verify code:
+#   0 PASS · 1 FAIL (acked loss) · 5 RECOVERY-FAIL · 2 INCONCLUSIVE/infra.
+# R5: each cycle uses its own fresh dir, so a device that rolls its FTL back to a prior
+# cycle's directory CANNOT verify as PASS — this cycle's dir is simply absent (empty log
+# ⇒ FAIL/RECOVERY-FAIL), and the old cycle's dir is never the path we verify.
 run_one_cycle() {
-  local cap="$1"
+  local cap="$1" cyc_dir="$2"
   # 1. target up
   wait_ssh || return 2
-  # 2. fresh WAL dir (independent durability trial; LSN space from 1)
-  ssh_target "rm -rf '$H1_WAL_DIR' && mkdir -p '$H1_WAL_DIR'" || return 2
+  # 2. fresh UNIQUE WAL dir for THIS cycle (independent trial; LSN space from 1)
+  ssh_target "mkdir -p '$cyc_dir'" || return 2
   # 3. fresh collector
   start_collector "$cap"
   # 4. launch the committing workload (network sink; unbounded; batch 64; 64B payload)
-  if ! ssh_target "nohup '$H1_BIN_DIR/power_pull_workload' '$H1_WAL_DIR' 'tcp:${H1_CONTROLLER_IP}:${H1_PORT}' 0 64 64 >/dev/null 2>&1 & echo started"; then
+  if ! ssh_target "nohup '$H1_BIN_DIR/power_pull_workload' '$cyc_dir' 'tcp:${H1_CONTROLLER_IP}:${H1_PORT}' 0 64 64 >/dev/null 2>&1 & echo started"; then
     stop_collector; return 2
   fi
   sleep "$H1_WORKLOAD_SECS"   # let it commit + stream thousands of acked lines
@@ -346,11 +410,23 @@ run_one_cycle() {
     warn "cycle: boot_id unchanged (${boot_before:-?}) — the target did NOT reboot ⇒ the cut did not happen. INCONCLUSIVE."
     return 2
   fi
-  # 8. ship the off-box capture TO the target and verify against the recovered WAL
+  # R7: the DUT must remount as the SAME durable block device before we trust a verify.
+  # A DUT that didn't remount (or came back as a different source) is INCONCLUSIVE infra,
+  # NEVER a D1 FAIL (we must not read a wiped/absent log as acked-loss).
+  if ! ssh_target "'$H1_BIN_DIR/storage-check.sh' classify '$H1_WAL_DIR'"; then
+    warn "cycle: the DUT did not re-classify as a durable block FS after the cut — INCONCLUSIVE."
+    return 2
+  fi
+  local src_now; src_now="$(ssh_target "df --output=source '$H1_WAL_DIR' 2>/dev/null | tail -1 | tr -d ' '" 2>/dev/null || true)"
+  if [ -n "$CAL_SRC" ] && [ "$src_now" != "$CAL_SRC" ]; then
+    warn "cycle: DUT block device changed across the cut (${CAL_SRC} -> ${src_now:-?}) — INCONCLUSIVE, not a D1 FAIL."
+    return 2
+  fi
+  # 8. ship the off-box capture TO the target and verify against THIS cycle's recovered WAL
   local remote_cap="/tmp/h1_capture_$$.txt"
   scp -q "$cap" "${H1_TARGET_SSH}:${remote_cap}" || return 2
   local rc=0
-  ssh_target "'$H1_BIN_DIR/power_pull_verify' '$H1_WAL_DIR' '$remote_cap'" || rc=$?
+  ssh_target "'$H1_BIN_DIR/power_pull_verify' '$cyc_dir' '$remote_cap'" || rc=$?
   ssh_target "rm -f '$remote_cap'" 2>/dev/null || true
   return "$rc"
 }
@@ -358,33 +434,50 @@ run_one_cycle() {
 cmd_cycle() {
   require H1_TARGET_SSH; require H1_WAL_DIR; require H1_CONTROLLER_IP
   local capdir; capdir="$(mktemp -d)"
-  local infra_fail=0 n=0
+  local infra_fail=0 n=0 prev_dir=""
   log "starting H1 cycle loop — need ${H1_CYCLES} CONSECUTIVE PASS (medium: ${H1_DUT_MEDIUM})."
   while [ "$CYCLES_PASS" -lt "$H1_CYCLES" ]; do
     n=$(( n + 1 ))
     local cap="${capdir}/capture_${n}.txt"
-    log "cycle attempt #${n} (consecutive PASS so far: ${CYCLES_PASS}/${H1_CYCLES})"
+    # R5: a UNIQUE dir per cycle, nonce from the controller, under the DUT mount.
+    local nonce; nonce="$(date +%s%N)-${RANDOM}${RANDOM}"
+    local cyc_dir="${H1_WAL_DIR}/cycle-${n}-${nonce}"
+    log "cycle attempt #${n} (consecutive PASS so far: ${CYCLES_PASS}/${H1_CYCLES}; dir: cycle-${n}-…)"
     local rc=0
-    run_one_cycle "$cap" || rc=$?
+    run_one_cycle "$cap" "$cyc_dir" || rc=$?
     case "$rc" in
       0)
         CYCLES_PASS=$(( CYCLES_PASS + 1 )); infra_fail=0
         append_per_cycle 0
-        pass "cycle #${n}: PASS (${CYCLES_PASS}/${H1_CYCLES})" ;;
+        pass "cycle #${n}: PASS (${CYCLES_PASS}/${H1_CYCLES})"
+        # R5: drop the PREVIOUS cycle's dir only now that THIS cycle's verify is done.
+        if [ -n "$prev_dir" ]; then ssh_target "rm -rf '$prev_dir'" 2>/dev/null || true; fi
+        prev_dir="$cyc_dir" ;;
       1)
         FAIL_COUNT=$(( FAIL_COUNT + 1 )); infra_fail=0
         append_per_cycle 1
+        snapshot_wal_dir "$cyc_dir" "cycle${n}-FAIL"
         finish "FAIL"
-        die_code 1 "cycle #${n}: FAIL — an ACKED LSN was absent after the cut (D1 violation). STOPPING the run. Investigate per §3.6 (most likely a lying device on medium '${H1_DUT_MEDIUM}'; the evidence records which LSN and medium)." ;;
+        die_code 1 "cycle #${n}: FAIL — an ACKED LSN was absent after the cut (D1 violation). STOPPING the run. Investigate per §3.6 (most likely a lying device on medium '${H1_DUT_MEDIUM}'; the snapshot + ledger record which LSN and medium)." ;;
+      5)
+        # R4: recovery REFUSED the log after a proven cut ⇒ acked records unreadable ⇒
+        # a D1-class FAIL (§3.6), NOT infra. Record it and snapshot for forensics.
+        FAIL_COUNT=$(( FAIL_COUNT + 1 )); infra_fail=0
+        append_per_cycle 5
+        snapshot_wal_dir "$cyc_dir" "cycle${n}-RECOVERY-FAIL"
+        finish "FAIL"
+        die_code 1 "cycle #${n}: RECOVERY-FAIL — recovery REFUSED the post-cut log (power_pull_verify exit 5). If acked records are now unreadable they are LOST: a D1-class failure of the (WAL, device) pair on medium '${H1_DUT_MEDIUM}' (§3.6), not infra. STOPPING the run; the WAL dir is snapshotted to the evidence dir." ;;
       2)
-        # INCONCLUSIVE / infra (cut unproven, target didn't return, or side-channel gap).
-        # Per the plan it is UNCOUNTED and re-run; it does NOT reset the consecutive PASS
-        # streak (a Pi that occasionally fails to boot shouldn't make 50 unreachable), but
-        # it does count toward the consecutive-infra-fail ABORT ceiling. Runbook documents this.
+        # INCONCLUSIVE / infra (cut unproven, target didn't return, DUT didn't remount, or a
+        # side-channel gap). UNCOUNTED and re-run; it does NOT reset the consecutive PASS streak
+        # (a Pi that occasionally fails to boot shouldn't make 50 unreachable), but it DOES count
+        # toward the consecutive-infra-fail ABORT ceiling. Runbook documents this.
         INCONCLUSIVE_RERUN=$(( INCONCLUSIVE_RERUN + 1 ))
         append_per_cycle 2
         infra_fail=$(( infra_fail + 1 ))
         warn "cycle #${n}: INCONCLUSIVE/infra — not counted (streak kept at ${CYCLES_PASS}/${H1_CYCLES}); consecutive infra ${infra_fail}/${H1_INFRA_FAIL_MAX}."
+        if [ -n "$prev_dir" ]; then ssh_target "rm -rf '$prev_dir'" 2>/dev/null || true; fi
+        prev_dir="$cyc_dir"
         if [ "$infra_fail" -ge "$H1_INFRA_FAIL_MAX" ]; then
           finish "INCONCLUSIVE"
           die_code 2 "${H1_INFRA_FAIL_MAX} consecutive infra failures — aborting (likely SD/OS corruption or a dead cut; re-flash, check the read-only overlay, wiring & smart plug)."
@@ -409,14 +502,19 @@ emit_evidence() {
   host="$(ssh_target 'hostname' 2>/dev/null || echo unknown)"
   fstype="$(ssh_target "df --output=fstype '$H1_WAL_DIR' 2>/dev/null | tail -1 | tr -d ' '" 2>/dev/null || echo unknown)"
   src="$(ssh_target "df --output=source '$H1_WAL_DIR' 2>/dev/null | tail -1 | tr -d ' '" 2>/dev/null || echo unknown)"
+  # Optional: a run with fewer than the full 50 cycles is a "smoke" run, not a gate.
+  local mode="gate"
+  if [ "${H1_CYCLES:-50}" -lt 50 ] 2>/dev/null; then mode="smoke"; fi
   WAL_M8_EVIDENCE="$WAL_M8_EVIDENCE" "${REPO_ROOT}/scripts/m8/evidence.sh" emit \
     gate=H1 \
     "target.uname=${uname}" "target.kernel=${kernel}" "target.host=${host}" \
+    "target.arch=${TARGET_ARCH:-unknown}" "target.device_tree_model=${TARGET_DT_MODEL:-unknown}" \
     "storage.fs=${fstype}" "storage.block_device=${src}" \
     "storage.dut_medium=${H1_DUT_MEDIUM}" "storage.h2_probe=${H2_PROBE}" \
     "storage.h2_cut_confirmed=${CUT_VALID}" \
     "cut.mechanism=smart-plug mains interrupt (${H1_PLUG_TYPE}@${H1_PLUG_IP:-n/a})" \
     "cut.valid=${CUT_VALID}" \
+    "run.mode=${mode}" \
     "run.cycles_required=${H1_CYCLES}" "run.cycles_pass=${CYCLES_PASS}" \
     "run.fail=${FAIL_COUNT}" "run.inconclusive_rerun=${INCONCLUSIVE_RERUN}" \
     "run.per_cycle=@[${PER_CYCLE}]" \

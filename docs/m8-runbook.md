@@ -104,8 +104,9 @@ make a durability claim for honest power loss on them.
 > The **automated** H1 rig runs a stronger, **two-sided** form of this probe as the
 > `storage_probe` binary (`write-unsynced-marker` builds a durable pre-allocated file **and**
 > an un-synced positioned marker; `verify-marker-gone` returns 0=lost / 1=survived /
-> **2=INCONCLUSIVE when the durable file is missing or wrong-sized**, so an unmounted DUT is
-> never a vacuous pass — see "Automated rig" under H1). That binary is the authoritative
+> **3=DURABLE-LOST when the durably-synced file is missing or wrong-sized** (a lying-device FAIL,
+> since the rig reaches it only after proving the cut + re-classify + device match) / 2=INCONCLUSIVE
+> on a genuine I/O error — see "Automated rig" under H1). That binary is the authoritative
 > calibration instrument; the shell `storage-check.sh probe-*` above is the quick manual
 > equivalent. `storage-check.sh classify` remains the static FS/cache deny-by-default check.
 
@@ -308,40 +309,65 @@ first builds a **durable** probe file (zero-fill to a fixed size → `fdatasync`
 like `segment::create`), then does a **positioned write of a non-zero marker with no sync** (the
 at-risk, un-acked data). `storage-check.sh classify` still runs first as the deny-by-default
 FS/cache check, but the loss-probe is the binary. After the cut, `verify-marker-gone` is a
-**positive control**:
-- durable file **missing or wrong-sized** ⇒ exit **2 INCONCLUSIVE** (DUT didn't remount / FS
-  damaged — *never* read as a pass; this closes the hole where an unmounted DUT looked "gone");
+**positive control** reached only after the cut is boot_id-proven, the DUT re-classifies as a
+durable block FS, and the block device matches the pre-cut one:
 - marker region **all zero** ⇒ exit **0** (the un-synced write was lost while the durable part
   survived — an honest cut);
-- any marker byte **present** ⇒ exit **1** (vacuous) ⇒ **HARD abort** (exit 3, `verdict=OPEN`,
-  `h2_probe=FAIL(survived)`), no cycle counts.
+- any marker byte **present** ⇒ exit **1** (vacuous) ⇒ **HARD abort** (`verdict=OPEN`,
+  `h2_probe=FAIL(survived)`), no cycle counts;
+- durable file **missing or wrong-sized** ⇒ exit **3 DURABLE-LOST** ⇒ a **device-honesty FAIL**
+  (`verdict=FAIL`): the medium acknowledged `fdatasync`/dir-`fsync` and then lost the durable
+  pre-alloc — a lying device (§3.6). It names `H1_DUT_MEDIUM` and does **not** retry (not infra);
+- a genuine stat/open/read **I/O error** ⇒ exit **2 INCONCLUSIVE**.
 
-Calibration also, after the reboot, **re-runs `classify`** and checks `df --output=source` still
-matches the pre-cut device (a `nofail` remount elsewhere ⇒ INCONCLUSIVE).
+Calibration also, after the reboot, **re-runs `classify`** and requires `df --output=source` to
+still match the pre-cut device (a `nofail` remount elsewhere ⇒ INCONCLUSIVE). An **empty** pre-cut
+`df` source is INCONCLUSIVE, never a silent skip.
 
 **Every cut is PROVEN by `boot_id`.** `ssh` answering does not prove the box lost power, so both
 calibration and every cycle read `/proc/sys/kernel/random/boot_id` before the cut and after the
 boot-wait. An **unchanged boot_id** means the kernel did not reboot ⇒ the cut did not happen ⇒
-**INCONCLUSIVE** (exit 2 in calibration; a re-run, uncounted cycle in the loop) — **never** a PASS
-and, in calibration, never reported as "marker survived". The per-cycle `[before,after]` boot_id
-pairs are recorded in the §5 ledger, and `cut.valid` / `storage.h2_cut_confirmed` are **derived
-from them** (no longer hard-coded).
+**INCONCLUSIVE** — **never** a PASS and, in calibration, never reported as "marker survived". The
+per-cycle `[before,after]` boot_id pairs are recorded in the §5 ledger, and `cut.valid` /
+`storage.h2_cut_confirmed` are **derived from them** (no longer hard-coded).
 
 **Distinct exit codes / verdicts** (each terminal cause is unmistakable, and the §5 ledger is
-written on **every** path): `0`=PASS, `1`=**D1 FAIL only** (`power_pull_verify` found an acked LSN
-missing; `verdict=FAIL`), `2`=INCONCLUSIVE/infra incl. an unproven cut (`verdict=INCONCLUSIVE`),
-`3`=vacuous calibration (`verdict=OPEN`), `4`=**HARNESS** (rig/config error — smart-plug HTTP,
-missing `socat`/bins/config; **not** a durability verdict, so it never wears the D1-FAIL code).
+written on **every** path):
+- `0` = **PASS** — N consecutive PASS with the H2 probe proven.
+- `1` = **FAIL** (`verdict=FAIL`) — a durability failure of the (WAL, device) pair, from any of:
+  an acked LSN missing (`power_pull_verify` exit 1, D1); **recovery REFUSING the post-cut log**
+  (`power_pull_verify` exit **5** — acked records unreadable, §3.6; the failing cycle's WAL dir is
+  `tar`-snapshotted into the evidence dir); or the **durable calibration probe lost** on a
+  proven+matched device (`storage_probe` exit 3, the medium lied about the flush).
+- `2` = **INCONCLUSIVE** — cut unproven, target didn't return, a side-channel gap, or a cycle where
+  the DUT didn't remount as the same device. Re-run, uncounted.
+- `3` = **VACUOUS** calibration (`verdict=OPEN`) — the DUT did not lose un-synced data. Hard abort.
+- `4` = **HARNESS** — rig/config (smart-plug HTTP, missing `socat`/bins/config, `H1_WAL_DIR` is a
+  mountpoint, or an arch/medium mismatch). Not a durability verdict.
 
 **Loop guarantees (pin-downs).** `power_pull_verify` runs **on the target over ssh** against the
 recovered WAL; the controller `scp`s **that cycle's fresh capture** to the target first, after the
-post-reboot ssh-readiness wait **and the boot_id cut-proof**. The collector capture is **per-cycle**
-(a fresh file), so a stale capture can't bleed into a later cycle. Each cycle resolves to exactly
-one of PASS (counts) / INCONCLUSIVE-or-infra (re-run, never counted) / FAIL (stops the run). An
+post-reboot ssh-readiness wait, the **boot_id cut-proof**, and a **per-cycle re-`classify` + device
+match** (a DUT that didn't remount is INCONCLUSIVE, never a D1 FAIL). **Each cycle runs on its own
+fresh `"$H1_WAL_DIR/cycle-<n>-<nonce>"` directory** (R5): payloads are the deterministic
+`rec-{lsn:016}`, so a reused dir would let a device whose FTL **rolls back** to a previous cycle's
+state verify as a vacuous PASS — a unique per-cycle dir makes a rolled-back device present an absent
+log (FAIL/RECOVERY-FAIL) instead. The previous cycle's dir is removed only **after** the current
+cycle's verify (so a FAIL leaves it for forensics). The collector capture is **per-cycle** too. An
 INCONCLUSIVE/infra cycle is **uncounted and does NOT reset** the consecutive-PASS streak (so an
 occasional failed boot doesn't make 50 unreachable), but it **does** count toward the
-`H1_INFRA_FAIL_MAX` consecutive-infra-fail ceiling, which aborts loudly (likely SD/OS corruption or
-a dead cut). *(This streak behaviour is the owner's call per the designer review; documented here.)*
+`H1_INFRA_FAIL_MAX` consecutive-infra-fail ceiling, which aborts loudly. *(The streak behaviour is
+the owner's call per the designer review; documented here.)*
+
+**`H1_WAL_DIR` must be a subdirectory of the DUT mount, not the mountpoint** — the rig refuses a
+mountpoint (`mountpoint -q` ⇒ exit 4) so a per-cycle cleanup can never wipe the partition, and it
+**creates `H1_WAL_DIR` before the first `classify`** so a freshly-formatted DUT isn't mis-recorded
+as a non-durable (VACUOUS) medium. **Arch/medium are cross-checked:** before calibration the rig
+reads `uname -m` and requires `armv7l` for `eMMC(BeagleBone)` / `aarch64` otherwise (mismatch ⇒
+exit 4 HARNESS), and records `target.arch` + `/proc/device-tree/model` in the ledger — so a Pi run
+can't be mis-filed as a BeagleBone run, and vice-versa. The CI workflow cross-compiles the matching
+Rust target per medium (`armv7-unknown-linux-gnueabihf` for the BeagleBone, `aarch64-unknown-linux-gnu`
+otherwise).
 
 Config is via env (see `config` for the full list): `H1_TARGET_SSH`, `H1_WAL_DIR` (the DUT
 partition), `H1_DUT_MEDIUM`, `H1_CONTROLLER_IP`, `H1_PORT` (9099), `H1_PLUG_TYPE`/`H1_PLUG_IP`,

@@ -26,10 +26,13 @@
 //! the bytes never reach the page/device cache — the wrong model).
 //!
 //! `verify-marker-gone` is **two-sided** (a positive control): a missing or
-//! wrong-sized probe file is NOT "gone", it is INCONCLUSIVE (wrong FS / not mounted
-//! / FS damaged after the cut) — otherwise a DUT that fails to remount post-cut
-//! would read as a vacuous PASS. Only the durable file present at its exact size
-//! with the marker region **zeroed** proves honest loss.
+//! wrong-sized durable file is NOT "gone". The durable part was `fdatasync`'d and the
+//! directory `fsync`'d, so if it is absent/truncated after the cut the device did not
+//! honor the flush — a **lying-device finding** (exit 3 = DURABLE-LOST, §3.6), which
+//! the caller treats as a device-honesty FAIL (it has already boot_id-proven the cut,
+//! re-classified the FS and matched the block device). Only a genuine stat/open/read
+//! I/O error is INCONCLUSIVE (exit 2). Only the durable file present at its exact size
+//! with the marker region **zeroed** proves honest loss (exit 0).
 //!
 //! Usage (run on the DUT, over ssh from the controller's `h1-cycle.sh calibrate`):
 //!   storage_probe write-unsynced-marker <dir>   # durable pre-alloc + un-synced marker; exit 0
@@ -37,8 +40,9 @@
 //!   storage_probe verify-marker-gone   <dir>
 //!     exit 0 = marker region GONE/zeroed (honest cut; un-synced data was lost)
 //!     exit 1 = marker SURVIVED (vacuous; storage did not lose un-synced data)
-//!     exit 2 = INCONCLUSIVE (probe file missing or wrong size: wrong FS / unmounted / damaged)
-//!     exit 2 is ALSO the usage-error code.
+//!     exit 3 = DURABLE-LOST (the durably-synced pre-alloc is MISSING or wrong-sized ⇒ the
+//!              device did not honor fdatasync/dir-fsync: a lying-device finding, §3.6)
+//!     exit 2 = INCONCLUSIVE (a real stat/open/read I/O error) — also the usage-error code.
 
 use std::io::Write;
 use std::os::unix::fs::FileExt;
@@ -149,22 +153,28 @@ fn write_unsynced_marker(dir: &Path) -> ExitCode {
 }
 
 /// After the cut+reboot: the durable file must still be there at full size (else
-/// INCONCLUSIVE), and the marker region must be zero (gone) — anything else vacuous.
+/// DURABLE-LOST = the device didn't honor the flush), and the marker region must be
+/// zero (gone). Only a genuine I/O error is INCONCLUSIVE.
 fn verify_marker_gone(dir: &Path) -> ExitCode {
     let marker = dir.join(PROBE_NAME);
     let meta = match std::fs::symlink_metadata(&marker) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // The pre-alloc was fdatasync'd + dir-fsync'd before the cut. If it is gone,
+            // the device did not honor the flush ⇒ DURABLE-LOST (lying device, §3.6),
+            // NOT infra. (The caller has already proven the cut + re-classified + matched
+            // the block device, so this is not a remount artifact.)
             eprintln!(
-                "storage_probe: INCONCLUSIVE — probe file {} is MISSING after the cut. The DUT \
-                 likely failed to remount (wrong FS / not mounted / FS damaged). NOT a pass; re-run.",
+                "storage_probe: DURABLE-LOST — the durably-synced probe file {} is MISSING after the \
+                 cut. The device acknowledged fdatasync/dir-fsync and then lost it: a lying-device \
+                 finding (§3.6). This is a device-honesty FAIL, not infra.",
                 marker.display()
             );
-            return ExitCode::from(2);
+            return ExitCode::from(3);
         }
         Err(e) => {
             eprintln!(
-                "storage_probe: INCONCLUSIVE — cannot stat {} ({e}).",
+                "storage_probe: INCONCLUSIVE — a real I/O error stat-ing {} ({e}).",
                 marker.display()
             );
             return ExitCode::from(2);
@@ -172,13 +182,14 @@ fn verify_marker_gone(dir: &Path) -> ExitCode {
     };
     if meta.len() != PROBE_SIZE {
         eprintln!(
-            "storage_probe: INCONCLUSIVE — probe file {} is {} bytes, expected {} (durable \
-             pre-alloc did not survive intact: FS damaged / wrong FS). NOT a pass; re-run.",
+            "storage_probe: DURABLE-LOST — probe file {} is {} bytes, expected {} (the durably-synced \
+             pre-alloc did not survive the cut intact). The device did not honor fdatasync/dir-fsync: \
+             a lying-device finding (§3.6). Device-honesty FAIL, not infra.",
             marker.display(),
             meta.len(),
             PROBE_SIZE
         );
-        return ExitCode::from(2);
+        return ExitCode::from(3);
     }
 
     let f = match std::fs::File::open(&marker) {
