@@ -7,7 +7,10 @@
 **Crate name:** `open-wal-replica` (owner's call; the name is not load-bearing).
 **Revisions:** 2026-10-27 — §9 step 2 off-by-one fixed: the "ahead of the primary" test is
 `d > durable_lsn` (as §12.2 always said), not `d + 1 > durable_lsn`, which rejected every
-fully caught-up replica as a former primary.
+fully caught-up replica as a former primary. 2026-10-27 (RM3 prep) — §9 step 3 now requires
+**bounded, chunked** catch-up (§9.1) with an explicit cutover rule and ring-sizing constraint
+(§9.2). The old step 3 copied the whole lag range in one writer-thread call, an unbounded
+writer stall and memory spike for a replica gigabytes behind.
 
 This is a build contract in the same style as the WAL spec: invariants are normative,
 tests are co-equal deliverables, and **the crate is "done" only when its fault-injection tests
@@ -322,15 +325,55 @@ overflow). On the **writer thread** (it needs `&Wal`):
    never the saturating `next()` — `d` arrives off the wire. `None` means `d == u64::MAX`:
    either it is ahead (step 2) or the primary's LSN space is exhausted too and there is
    nothing to serve; never wrap or saturate it into a `from`.
-3. Else: send `SERVING{from = d+1}`; open `wal.reader_from(Lsn(d+1))`; for each record with
-   `lsn ≤ wal.durable_lsn()` (re-read the watermark — never read past it, R1), copy to the
-   network thread's queue. Stop at the watermark; the replica's cursor now joins the live ring
-   at `watermark + 1`. Records that land in the ring *during* catch-up are already ≥ the
-   cutover point, so no gap and no duplicate — assert this at cutover (R3 on the sending side).
+3. Else: send `SERVING{from = d+1, primary_oldest = wal.oldest_lsn()}`, serve `d+1..` from
+   the log in **bounded chunks** (§9.1), then cut the replica over to the live ring (§9.2).
+   Every record served satisfies `lsn ≤ wal.durable_lsn()` re-read at the time it is served
+   (R1). No gap and no duplicate across the cutover — asserted on the sending side (R3).
 
-Catch-up is O(one segment scan + range) with the v7 containing-segment `reader_from`. It runs
-on the writer thread and is a latency hiccup proportional to the lag — acceptable for a rare
-event in v1; v2 moves it off-thread (§16).
+### 9.1 Bounded, chunked catch-up (NORMATIVE — RM3)
+A lagging replica may be gigabytes behind. Copying the whole range in one writer-thread call
+would stall the writer for the whole lag and buffer it in memory. Therefore:
+- Catch-up runs **only** inside an explicit writer-thread call that is handed `&Wal` (e.g.
+  `Shipper::poll(&mut self, wal)`). It never runs inside `on_commit`, which stays a release
+  plus one wake (§4.2), and never on a network thread (`Wal` is `!Sync`).
+- Each call serves **at most one chunk per lagging replica**:
+  - Open `wal.reader_from(cursor)`. A `Reader` borrows the `Wal`, so it cannot outlive the
+    call and is reopened per chunk. The cost is one containing-segment scan plus the chunk.
+  - Read records while `lsn ≤ wal.durable_lsn()` and within the chunk budget
+    (`catchup_chunk_bytes`), and enqueue them on that replica's catch-up queue.
+  - Advance `cursor`.
+- The queue is bounded. The writer **never blocks** on it: a full queue ends the chunk.
+- The writer's stall per call is bounded by the chunk budget times the number of lagging
+  replicas.
+- If `reader_from(cursor)` fails with the below-oldest gap error, the integrator checkpointed
+  past the replica mid-catch-up. Stop, and send `RESEED_REQUIRED{oldest}` after the records
+  already queued (R6). Never skip.
+- Any other read error ends that replica's session. Never skip a record.
+
+### 9.2 Cutover to the live ring (NORMATIVE — RM3)
+- **When to cut over.** At the end of a chunk, if `cursor ≥ ring.oldest_valid()` and
+  `cursor ≤ released + 1`, the writer attaches the replica's ring consumer at `cursor` and
+  ends catch-up for it. At that moment every record `< cursor` is in the catch-up queue, and
+  every record `≥ cursor` is in the ring or not yet captured.
+- **Ordering on the wire.** The network thread MUST send every queued catch-up record before
+  the first ring record. It MUST assert that the first ring record's LSN equals the last
+  catch-up LSN + 1, or `d + 1` if catch-up served nothing. A violation closes the session
+  loudly (R3 on the sending side).
+- **Eviction before the first drain.** If the ring evicts the cutover point before the
+  consumer drains it (`NeedsCatchUp`), the session ends and the replica re-HELLOs (R7).
+  Catch-up then restarts from its `durable_lsn`. Nothing is lost or duplicated; repeated
+  fall-behind is observable (`catch_up_events`).
+- **Sizing (liveness, not safety).** Cutover requires the ring to still hold `durable + 1`
+  when the chunk ends. The ring must therefore retain every capture since the last commit:
+  size `ring_bytes / slot_bytes ≥` the largest commit batch. A smaller ring cannot even keep a
+  caught-up replica streaming (§8.3), and a lagging one live-locks in catch-up.
+- **Retention.** During catch-up the replica's `acked` is its HELLO `durable_lsn` (RM2 R4), so
+  the §11 policy's `min_replica_acked_lsn` term protects the catch-up range from
+  `checkpoint`. An integrator that checkpoints past it gets R6, which is loud.
+
+Cost per chunk is one containing-segment scan plus the chunk (v7 `reader_from`). The writer
+stall per call is bounded; total catch-up time is proportional to the lag. v2 moves catch-up
+off the writer thread entirely (§16).
 
 ---
 
