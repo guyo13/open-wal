@@ -137,9 +137,16 @@ The entire value of this component is **correct behavior under crashes and fault
     - the payload-only chunk budget was unbounded for empty payloads ⇒ the budget now counts `+32` per record;
     - L8 could not drive `shipper.rs`, which is not built under loom ⇒ the slot module exports `post`/`answer`/`abandon`.
   - **Kickoff C now has:** T1–T14, L7/L7b/L8 with measured mutation shapes, an anti-vacuity rule, a forwarding-proxy oracle, and the one RM2 test to rewrite.
-  - Commits `1c38c45` and `e2e6f37`. Round 3 is running.
+  - **Round 3:** a third critique produced 32 findings.
+    - **Blocker** (all three reviewers): `poll(&wal)` breaks seven RM2 tests the kickoff protected ⇒ an explicit migration allowance.
+    - **Measured:** the writer stall is **per record**, two `pread`s each. A full 32 MiB segment rescan costs 19.6 ms / 284 ms / **1.34 s** for 4 KiB / 100 B / 0 B payloads ⇒ the stall bound is now stated in syscalls, plus a `catchup_chunk_records` cap and segment sizing by record count.
+    - The shipped `abandon` must never give up (else the stale attach returns) ⇒ the waker lives in the slot; no exit before `DONE`.
+    - Stickiness covers data-level failures only.
+    - New tests T15–T17, U1 and L8b.
+  - Commits `1c38c45`, `e2e6f37`, `01a8a00`.
+  - **RM3 is now blocked on two things:** #53's merge, and the owner's decision on decision 1 below. A fourth critique round will run on the dispatch version.
   - **Owner decisions raised (§16):**
-    1. A resumable WAL reader position, e.g. `Wal::reader_resume(token)` or `segment_bases()`. It is the only way to remove the O(segment_size) rescan per catch-up chunk; until then, replicated WALs should use `segment_size ≤ 32 MiB`.
+    1. **Designer recommends before RM3:** a resumable WAL reader position (WAL v7.2, additive and read-only), `Reader::position()` plus `Wal::reader_at(pos)`, validated against the live segments with a CRC + `lsn == next_lsn` check, falling back to `reader_from`. It is the only way to make the writer stall O(chunk) rather than O(segment records), which was measured at up to 1.34 s. Without it, RM3 ships the documented bound and the record-count segment sizing.
     2. A v1.x HELLO record-`d` CRC heuristic for former-primary detection past the step-2 tripwire.
 - **LATEST (2026-10-27, round 3b): #22 APPROVED at `e19806d` — ready for the owner to merge; H1 itself stays OPEN pending the owner's run on the rig.** Required 4–8 were verified by execution on a build of the head:
   - **R4:** `power_pull_verify` returns **5 = RECOVERY-FAIL** instead of panicking; it is counted as FAIL and the cycle dir is snapshotted, so it can no longer reach the INCONCLUSIVE arm.
