@@ -65,6 +65,99 @@ jobs:
       - name: check
         run: cargo check --all-targets --locked
 
+  fuzz-smoke:
+    # M9 (§14.5): a SHORT per-PR smoke of the fuzz targets (F1 recovery, F2
+    # decoder, F3 structure-aware classifier, F4 op-script oracle). This lane is
+    # real and BLOCKING — a reproducible crash here is a genuine D1–D11 bug and
+    # must red the PR (not advisory). It is distinct from the time-boxed nightly
+    # fuzz lane (fuzz.yml) and from any H1 sign-off: M9 fuzz findings gate
+    # M9-relevant PRs; they never red an H1 dispatch run. The full N-CPU-hour
+    # §14.13 release gate runs on a dedicated runner, not here.
+    name: fuzz smoke (F1/F2/F3/F4)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            fuzz
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      # Pin the gnu target explicitly: some cargo-fuzz builds default to the musl
+      # target on Linux, where the static libc is incompatible with the sanitizer
+      # (and musl std is not installed) — gnu has full ASan support.
+      - name: Build fuzz targets
+        run: cargo +nightly fuzz build --target x86_64-unknown-linux-gnu
+      - name: F1 recovery smoke (bounded; a crash reds the PR)
+        run: cargo +nightly fuzz run recovery --target x86_64-unknown-linux-gnu -- -runs=20000 -rss_limit_mb=4096
+      - name: F2 decode smoke (bounded; a crash reds the PR)
+        run: cargo +nightly fuzz run decode --target x86_64-unknown-linux-gnu -- -runs=40000 -rss_limit_mb=4096
+      - name: F3 structure smoke (bounded; a crash reds the PR)
+        run: cargo +nightly fuzz run structure --target x86_64-unknown-linux-gnu -- -runs=8000 -rss_limit_mb=4096
+      # F4 drives the real Wal with a real fdatasync per Commit, so it is the
+      # slowest target; keep the per-PR smoke small (the time-boxed depth is in
+      # the nightly fuzz.yml lane).
+      - name: F4 model smoke (bounded; a crash reds the PR)
+        run: cargo +nightly fuzz run model --target x86_64-unknown-linux-gnu -- -runs=3000 -rss_limit_mb=4096
+
+  miri:
+    # M9 §14.6: Miri on the FS-free codec/value subset (record/crc/lsn/config) —
+    # UB / uninitialized-read / provenance checking. The crate has zero `unsafe`
+    # and no zero-copy pointer casts, so this is a REGRESSION GUARD against future
+    # UB, not a current bug hunt. The file-backed recovery/segment/wal paths call
+    # foreign syscalls (fallocate, fsync, flock) Miri cannot execute, so they are
+    # out of Miri scope — their bounded-parsing/D11 surface is covered by the ASan
+    # fuzz targets (§14.5) instead. We run `-Zmiri-strict-provenance` but NOT
+    # `-Zmiri-symbolic-alignment-check`: the `crc32c` dependency's word-at-a-time
+    # software path trips that worst-case-alignment assumption while being
+    # alignment-correct at runtime (the default checker passes), and this crate has
+    # no pointer alignment of its own to verify.
+    # REVISIT IF `unsafe` IS EVER INTRODUCED into this crate: at that point Miri
+    # becomes a genuine bug hunt, not just a regression guard — widen the suite
+    # beyond the codec subset, run `-Zmiri-symbolic-alignment-check` (and fix or
+    # justify any zero-copy alignment it flags), and drop the "no current bug hunt"
+    # framing in §14.6 / §14.13.
+    name: Miri (codec subset)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly toolchain + miri
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@v2
+      - name: miri test (in-memory codec/value subset)
+        env:
+          MIRIFLAGS: -Zmiri-strict-provenance
+        run: |
+          cargo +nightly miri test --lib -- record:: crc:: lsn:: config::
+
+  differential:
+    # §14.9 — differential / reference-parser tester. An independent, spec-derived
+    # reference segment parser (`tests/differential.rs`) is run alongside the
+    # production `recover_segment` classifier over a deterministic scenario matrix
+    # AND the committed fuzz corpora; any divergence in classification is a real
+    # recovery-classifier bug and reds the PR (same posture as the fuzz smoke,
+    # never gates an H1 dispatch). Fast (~6 s over the minimized corpus), so it
+    # runs per-PR. Needs `--features fuzzing` for the `recover_segment_classify`
+    # accessor (test-only, zero release impact).
+    name: differential (§14.9)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: differential reference-parser check
+        run: cargo test --features fuzzing --test differential
+
   dirfsync-presence:
     # M8 §14.4d Tier 1 (PRIMARY): the deterministic, FS-independent regression
     # guard for the roll-time directory fsync (§7.4 step 5). It straces the roll
@@ -85,3 +178,20 @@ jobs:
         run: sudo apt-get update -y && sudo apt-get install -y strace
       - name: dir-fsync presence (correct issues it per roll; inject does not)
         run: scripts/m8/dirfsync-presence.sh
+
+  book:
+    # User-facing documentation (book/). `mdbook build` catches broken SUMMARY
+    # entries and malformed chapters; the *code* in the book is verified
+    # separately — every example is mirrored as a compiled test in
+    # tests/book_examples.rs, which the `test` job runs (the book's code blocks
+    # are `rust,ignore` because rustdoc cannot link the crate from mdbook).
+    name: book (mdbook build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install mdbook
+        uses: peaceiris/actions-mdbook@v2
+        with:
+          mdbook-version: "0.5.3"
+      - name: mdbook build
+        run: mdbook build book

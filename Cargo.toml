@@ -1,6 +1,6 @@
 [package]
 name = "open-wal"
-version = "0.1.0"
+version = "0.2.1"
 edition = "2024"
 # Minimum supported Rust version: the floor implied by edition 2024. No feature
 # beyond this is used; bump deliberately if a later milestone needs a newer API.
@@ -9,11 +9,32 @@ description = "An embedded Write-Ahead Log (WAL) library for Rust."
 license = "BSD-3-Clause"
 repository = "https://github.com/guyo13/open-wal"
 readme = "README.md"
-# `src/bin/crash_child.rs` is a test-only helper spawned by
-# `tests/process_crash.rs` (§14.4a). It is built locally/in CI for the tests but
-# MUST NOT ship to crates.io consumers, so exclude it from the published package.
-# (Excluding only affects packaging; local `cargo test` still builds the bin.)
-exclude = ["src/bin"]
+# Keep the published package to the library a consumer actually needs. Excluding
+# only affects packaging — local `cargo test`/CI still build everything.
+#   - src/bin        : test-only helpers spawned by tests/process_crash.rs et al.
+#                      (§14.4a, power-pull, dirfsync-cut). Not library code.
+#   - CLAUDE.md      : internal build-agent operating guide, not for consumers.
+#   - docs/          : design contract + M8 infra plan/runbook (internal, ~180K).
+#   - scripts/       : LazyFS / dm-flakey / power-pull / perf fault-injection and
+#                      CI harnesses (shell + a C LD_PRELOAD shim). Dev/CI only.
+#   - .github/       : CI/nightly workflows. Not needed off the repo.
+#   - fuzz/          : a separate cargo-fuzz crate; already skipped as it has its
+#                      own Cargo.toml, listed here for intent.
+#   - tests/         : integration + fault-injection harnesses (LazyFS, crash,
+#                      soak, differential; ~224K incl. a C shim). Never built for
+#                      downstream consumers, so they only bloat the package.
+#   - benches/       : criterion perf benches. Dev-only; the `[[bench]]` target
+#                      below still lets them run from the repo.
+exclude = [
+    "src/bin",
+    "CLAUDE.md",
+    "docs",
+    "scripts",
+    ".github",
+    "fuzz",
+    "tests",
+    "benches",
+]
 
 [features]
 # Test-only NEGATIVE CONTROL for §14.4d (M8): build the writer to deliberately
@@ -26,6 +47,14 @@ exclude = ["src/bin"]
 # was deferred from M4 to M8's dm-flakey/power-pull tooling. NEVER enable in a real
 # build. See docs/m8-runbook.md §14.4d.
 inject_no_dir_fsync = []
+
+# M9 (§14.5): expose the internal parse entry points (the `fuzzing` module in
+# `src/lib.rs`) and compile in the bounded-forward-scan instrumentation (the
+# thread-local scan probe + in-loop `assert!` in `src/recovery.rs`) for the
+# cargo-fuzz targets in `fuzz/`. Test/fuzz-only and zero-cost when off — the
+# probe and the `#[doc(hidden)]` module compile out of a normal build. NEVER
+# enable in a real build.
+fuzzing = []
 
 [dependencies]
 # Castagnoli CRC-32C (hardware-accelerated, software fallback). NOT crc32fast,
@@ -59,6 +88,13 @@ criterion = { version = "0.5", default-features = false, features = ["cargo_benc
 # so the commit-latency group records per-iteration timings here and emits the
 # tails itself.
 hdrhistogram = "7"
+# §14.6 `!Sync` compile-fail proof (`tests/ui.rs` + `tests/ui/*.rs`): asserts that
+# sharing the single-writer `Wal` handle across threads does not compile. The
+# pinned `.stderr` is toolchain-sensitive — regenerate with
+# `TRYBUILD=overwrite cargo test --test ui` after a rustc bump that changes the
+# diagnostic wording (the test only runs in the per-PR `test` job on stable; the
+# MSRV job is `cargo check`, which does not execute it).
+trybuild = "1"
 
 # §14.7 perf benches. `harness = false` ⇒ criterion provides `main`. NIGHTLY/manual
 # tier (§14.11); per-PR CI only compile-checks them (`cargo bench --no-run`).

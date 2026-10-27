@@ -80,7 +80,9 @@ pub(crate) fn recover_segment(
     };
     let mut buf = Vec::new();
     let mut offset = HEADER_SIZE;
-    let mut expected = base_lsn;
+    // `None` once a `u64::MAX` record has been accepted: the LSN space is
+    // exhausted and only the end-of-records sentinel may follow (v7.1, §8.2).
+    let mut expected = Some(base_lsn);
     // `base_lsn >= 1` (header-validated), so this does not underflow.
     let mut last_valid = Lsn(base_lsn.0 - 1);
 
@@ -89,16 +91,23 @@ pub(crate) fn recover_segment(
             ScanOutcome::Record {
                 lsn, framed_len, ..
             } => {
-                if lsn != expected {
+                let Some(want) = expected else {
+                    // A valid-looking record after `u64::MAX` (e.g. a duplicate
+                    // `u64::MAX`): no writer can produce it (§7.1 refuses to
+                    // append past `u64::MAX`), so it is corruption — never a
+                    // torn tail and never accepted (v7.1, D2/D6).
+                    return Err(after_exhaustion(&ctx, offset));
+                };
+                if lsn != want {
                     // An LSN mismatch is an invalid record at this offset
                     // (§8.2 step 4) — classify it as tail vs corruption.
-                    return classify(file, &ctx, offset, expected, last_valid, &mut buf);
+                    return classify(file, &ctx, offset, want, last_valid, &mut buf);
                 }
                 // A valid, in-order record (§8.2 step 6): advance. No payload is
                 // retained (§8.5).
                 last_valid = lsn;
                 offset += framed_len as u64;
-                expected = lsn.next();
+                expected = lsn.checked_next();
             }
             ScanOutcome::CleanEnd => {
                 // End of records (§8.2 step 1): a clean tail, no zeroing needed.
@@ -109,10 +118,71 @@ pub(crate) fn recover_segment(
                 });
             }
             ScanOutcome::Invalid => {
-                return classify(file, &ctx, offset, expected, last_valid, &mut buf);
+                let Some(want) = expected else {
+                    // After a `u64::MAX` record. A genuine tail there is all-zero
+                    // (pre-allocation / §8.2.1 zeroing), so non-zero bytes are
+                    // corruption; the forward scan does not apply at capacity
+                    // (v7.1, §8.2). The one exception is a physically truncated
+                    // file whose remaining bytes are all zero (§14.4f / a partial
+                    // §15.6 backup copy) — that is the zero region cut short, and
+                    // is handled exactly like truncation at any other LSN.
+                    return at_capacity_invalid(file, &ctx, offset, last_valid);
+                };
+                return classify(file, &ctx, offset, want, last_valid, &mut buf);
             }
         }
     }
+}
+
+/// The v7.1 at-capacity rule (§8.2): after a `u64::MAX` record only the
+/// all-zero sentinel / end of segment may follow; anything else at `offset` is
+/// fatal corruption (active or sealed alike).
+fn after_exhaustion(ctx: &RecoverCtx, offset: u64) -> WalError {
+    WalError::Corruption {
+        segment: ctx.base_lsn,
+        offset,
+        detail: "data after the last LSN (u64::MAX)",
+    }
+}
+
+/// `Invalid` at `offset` right after a `u64::MAX` record (v7.1, §8.2).
+///
+/// - Fewer than a record header's worth of bytes remain **physically** and all of
+///   them are zero: the all-zero sentinel region was cut short by a physical
+///   truncation (§14.4f) or a partial backup copy (§15.6). Classified exactly as
+///   truncation is at any other LSN: active ⇒ torn tail at `offset` (durably
+///   zero-extended, §8.2.1), sealed ⇒ fatal `Corruption` (a sealed segment is
+///   never truncated). No forward scan.
+/// - Anything else — non-zero bytes after the last LSN — is fatal `Corruption`.
+///
+/// Reads at most `RECORD_HEADER_SIZE − 1` bytes (D11).
+fn at_capacity_invalid(
+    file: &File,
+    ctx: &RecoverCtx,
+    offset: u64,
+    last_valid: Lsn,
+) -> Result<SegmentRecovery> {
+    use std::os::unix::fs::FileExt;
+    let len = file.metadata()?.len();
+    let header = crate::record::RECORD_HEADER_SIZE as u64;
+    if len >= offset.saturating_add(header) || !ctx.is_active {
+        return Err(after_exhaustion(ctx, offset));
+    }
+    let mut tail = [0u8; crate::record::RECORD_HEADER_SIZE];
+    let n = len.saturating_sub(offset) as usize; // < RECORD_HEADER_SIZE
+    file.read_exact_at(&mut tail[..n], offset)?;
+    if tail[..n].iter().any(|&b| b != 0) {
+        return Err(after_exhaustion(ctx, offset));
+    }
+    segment::zero_to_eof(file, offset, ctx.segment_size)?;
+    Ok(SegmentRecovery {
+        max_lsn: last_valid,
+        write_offset: offset,
+        tail_state: TailState::TruncatedAt {
+            segment_base: ctx.base_lsn,
+            offset,
+        },
+    })
 }
 
 /// Classify an invalid record at offset `x` (§8.2 step 5). On a torn tail this
@@ -182,13 +252,33 @@ fn forward_scan_finds_valid(
     expected: Lsn,
     buf: &mut Vec<u8>,
 ) -> Result<bool> {
-    let bound = u64::from(ctx.max_record_size) + 28;
+    let bound = scan_bound(ctx.max_record_size);
     // Inclusive: candidate start offsets are `X+8 .. X+8+bound`, i.e. distance
     // ≤ `max_record_size + 28` from `X+8` — the largest a single record's frame
     // can be, so the next genuine record (if any) starts within this window.
-    let end = x.saturating_add(8).saturating_add(bound);
-    let mut p = x.saturating_add(8);
+    let start = x.saturating_add(8);
+    let end = start.saturating_add(bound);
+    let mut p = start;
     while p <= end {
+        // M9 F1 / D11 — bounded-scan instrumentation. The §14.13 release gate is
+        // "the bounded-scan counter never exceeds the bound". The probe and the
+        // tripwire run on the REAL production loop (not a harness copy) and are
+        // asserted against `scan_bound(..)` — the SAME symbol that bounds `end`
+        // above — so a future change that let the loop scan past the bound trips
+        // the `assert!` here even if the local `bound`/`end` were edited. Compiled
+        // out of a normal build by the `fuzzing` feature gate (zero release cost).
+        #[cfg(feature = "fuzzing")]
+        {
+            let distance = p - start;
+            scan_probe::record(distance);
+            assert!(
+                distance <= scan_bound(ctx.max_record_size),
+                "forward scan exceeded its bound: distance {distance} > {} \
+                 (max_record_size {})",
+                scan_bound(ctx.max_record_size),
+                ctx.max_record_size,
+            );
+        }
         if let ScanOutcome::Record { lsn, .. } =
             segment::read_record_at(file, p, ctx.segment_size, ctx.max_record_size, buf)?
         {
@@ -199,6 +289,53 @@ fn forward_scan_finds_valid(
         p += 8;
     }
     Ok(false)
+}
+
+/// The bounded forward-scan distance limit (§8.2 step 5): the largest frame a
+/// single record can occupy — `max_record_size` payload + the 20-byte record
+/// header + up to 7 padding bytes + 1 — so the next genuine record after a gap
+/// must begin within this many bytes of `X+8`. Hoisted into one symbol so the
+/// scan loop's window (`end`) and the M9 fuzz instrumentation's assertion share
+/// a **single source of truth** and cannot drift under a future bound change
+/// (M9 F1 / D11).
+#[inline]
+pub(crate) fn scan_bound(max_record_size: u32) -> u64 {
+    u64::from(max_record_size) + 28
+}
+
+/// Thread-local instrumentation of the bounded forward scan, compiled in only
+/// under the `fuzzing` feature for the M9 F1 cargo-fuzz target (§14.5). Records
+/// the peak scan distance (bytes from `X+8`) so a fuzz harness can assert it
+/// never exceeds [`scan_bound`] after driving the real recovery path. The
+/// in-loop `assert!` in [`forward_scan_finds_valid`] is the primary tripwire;
+/// this peak is the harness-readable corroboration. Single-writer recovery is
+/// single-threaded, so a thread-local is sufficient and lock-free.
+#[cfg(feature = "fuzzing")]
+pub(crate) mod scan_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static PEAK: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// Reset the peak before a recovery run the harness wants to bound-check.
+    pub(crate) fn reset() {
+        PEAK.with(|p| p.set(0));
+    }
+
+    /// The largest scan distance observed since the last [`reset`].
+    pub(crate) fn peak() -> u64 {
+        PEAK.with(Cell::get)
+    }
+
+    /// Record one observed scan distance, keeping the running maximum.
+    pub(crate) fn record(distance: u64) {
+        PEAK.with(|p| {
+            if distance > p.get() {
+                p.set(distance);
+            }
+        });
+    }
 }
 
 #[cfg(test)]
@@ -545,6 +682,57 @@ mod tests {
     }
 
     #[test]
+    fn rec_type_zeroed_interior_is_fatal_tornmidlog() {
+        // issue #26 (D3/D5): a single-bit corruption of an INTERIOR record's
+        // `rec_type` byte (1→0) must NOT be mistaken for the end-of-records
+        // sentinel. The CRC covers `rec_type`, so the record fails the CRC check;
+        // with a valid record still after it, recovery is fatal `TornMidLog` —
+        // never a silent truncation that would drop the following acked records.
+        // (The sentinel is recognized only by an all-zero header, not `rec_type==0`
+        // alone — that short-circuit was the D3/D5 hole F3 found.)
+        let dir = tempfile::tempdir().unwrap();
+        let file = fresh_segment(dir.path(), Lsn(1));
+        write_dense(&file, Lsn(1), &[b"one", b"two", b"three"]);
+        // Offset of the SECOND record (LSN 2); record 3 stays valid after it.
+        let x = HEADER_SIZE + record::framed_size(3) as u64;
+        // Zero the rec_type byte WITHOUT recomputing the CRC ⇒ crc ≠ 0 (models the
+        // single-bit flip; the header is NOT all-zero, so it is not a sentinel).
+        file.write_all_at(&[0u8], x + 16).unwrap();
+        file.sync_data().unwrap();
+
+        let err = recover_segment(&file, Lsn(1), true, SEGMENT_SIZE, MAX_RECORD_SIZE).unwrap_err();
+        assert!(
+            matches!(err, WalError::TornMidLog { segment, offset } if segment == Lsn(1) && offset == x),
+            "interior rec_type→0 corruption must be fatal TornMidLog at {x}, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn rec_type_zeroed_at_tail_is_torn_tail_and_zeroed() {
+        // issue #26 (D4/D10): the same `rec_type`→0 corruption on the LAST record
+        // is a torn tail — truncate at its offset, durable LSN at the prior record,
+        // and the region is durably zeroed so a reopen is clean and idempotent.
+        let dir = tempfile::tempdir().unwrap();
+        let file = fresh_segment(dir.path(), Lsn(1));
+        write_dense(&file, Lsn(1), &[b"first", b"second"]);
+        // Offset of the SECOND (last) record (LSN 2).
+        let x = HEADER_SIZE + record::framed_size(5) as u64;
+        file.write_all_at(&[0u8], x + 16).unwrap();
+        file.sync_data().unwrap();
+
+        let rec = recover_segment(&file, Lsn(1), true, SEGMENT_SIZE, MAX_RECORD_SIZE).unwrap();
+        assert_eq!(rec.max_lsn, Lsn(1));
+        assert_eq!(rec.write_offset, x);
+        assert!(matches!(rec.tail_state, TailState::TruncatedAt { offset, .. } if offset == x));
+
+        // D10: the tail was durably zeroed ⇒ a second recovery is clean and stable.
+        let again = recover_segment(&file, Lsn(1), true, SEGMENT_SIZE, MAX_RECORD_SIZE).unwrap();
+        assert_eq!(again.max_lsn, Lsn(1));
+        assert_eq!(again.write_offset, x);
+        assert_eq!(again.tail_state, TailState::Clean);
+    }
+
+    #[test]
     fn arbitrary_bytes_never_panic_and_terminate() {
         // Interim D11 coverage (the libFuzzer F1 target is M9): overwrite the
         // record region with deterministic pseudo-random bytes and assert
@@ -568,5 +756,163 @@ mod tests {
             // Must not panic; either classification or a fatal error is fine.
             let _ = recover_segment(&file, base, true, SEGMENT_SIZE, MAX_RECORD_SIZE);
         }
+    }
+
+    // ----- v7.1: LSN exhaustion — nothing may follow a `u64::MAX` record -----
+
+    const MAX: Lsn = Lsn(u64::MAX);
+
+    /// Offset just past one framed record with `payload` written at `offset`.
+    fn next_off(offset: u64, payload: &[u8]) -> u64 {
+        let mut b = Vec::new();
+        offset + record::encode_into(&mut b, Lsn(1), payload) as u64
+    }
+
+    #[test]
+    fn v71_max_record_then_sentinel_is_clean() {
+        // [MAX][all-zero sentinel] ⇒ Ok, clean, max_lsn == MAX — active and sealed,
+        // as a sole record (base MAX) and at the end of a run (base MAX − 1).
+        for is_active in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let f = fresh_segment(dir.path(), MAX);
+            write_record_at(&f, HEADER_SIZE, MAX, b"last");
+            let rec = recover_segment(&f, MAX, is_active, SEGMENT_SIZE, MAX_RECORD_SIZE).unwrap();
+            assert_eq!(rec.max_lsn, MAX);
+            assert_eq!(rec.tail_state, TailState::Clean);
+            assert_eq!(rec.write_offset, next_off(HEADER_SIZE, b"last"));
+
+            let base = Lsn(u64::MAX - 1);
+            let d2 = tempfile::tempdir().unwrap();
+            let f = fresh_segment(d2.path(), base);
+            let end = write_dense(&f, base, &[b"a", b"b"]);
+            let rec = recover_segment(&f, base, is_active, SEGMENT_SIZE, MAX_RECORD_SIZE).unwrap();
+            assert_eq!((rec.max_lsn, rec.write_offset), (MAX, end));
+            assert_eq!(rec.tail_state, TailState::Clean);
+        }
+    }
+
+    #[test]
+    fn v71_duplicate_max_record_is_fatal_corruption() {
+        // THE regression test for the duplicate-LSN hole: [MAX][MAX] used to be
+        // accepted (saturating `next()` made the duplicate look in-order). It is
+        // now fatal `Corruption` at the second record's offset — active (no torn-
+        // tail truncation, no zeroing) and sealed alike.
+        for is_active in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let f = fresh_segment(dir.path(), MAX);
+            write_record_at(&f, HEADER_SIZE, MAX, b"first");
+            let second = next_off(HEADER_SIZE, b"first");
+            write_record_at(&f, second, MAX, b"duplicate");
+            let err =
+                recover_segment(&f, MAX, is_active, SEGMENT_SIZE, MAX_RECORD_SIZE).unwrap_err();
+            assert!(
+                matches!(err, WalError::Corruption { segment, offset, .. }
+                    if segment == MAX && offset == second),
+                "is_active={is_active}: {err:?}"
+            );
+            // Fatal ⇒ nothing was truncated/zeroed: the duplicate is still on disk.
+            let mut b = [0u8; 1];
+            f.read_exact_at(&mut b, second + 4).unwrap();
+            assert_ne!(b, [0u8; 1], "a fatal error must not zero the tail");
+        }
+    }
+
+    #[test]
+    fn v71_wrapped_lsn_after_max_is_fatal_corruption() {
+        // A CRC-valid record "continuing" past MAX with any other LSN (here a
+        // wrapped Lsn(1)) is equally impossible from a writer ⇒ Corruption.
+        let dir = tempfile::tempdir().unwrap();
+        let f = fresh_segment(dir.path(), MAX);
+        write_record_at(&f, HEADER_SIZE, MAX, b"x");
+        let second = next_off(HEADER_SIZE, b"x");
+        write_record_at(&f, second, Lsn(1), b"wrapped");
+        let err = recover_segment(&f, MAX, true, SEGMENT_SIZE, MAX_RECORD_SIZE).unwrap_err();
+        assert!(matches!(err, WalError::Corruption { offset, .. } if offset == second));
+    }
+
+    #[test]
+    fn v71_garbage_after_max_is_fatal_corruption_not_torn_tail() {
+        // [MAX][garbage] ⇒ fatal Corruption at the garbage offset — NOT a torn
+        // tail (no forward scan, no truncation/zeroing) on the active segment.
+        for is_active in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let f = fresh_segment(dir.path(), MAX);
+            write_record_at(&f, HEADER_SIZE, MAX, b"x");
+            let at = next_off(HEADER_SIZE, b"x");
+            f.write_all_at(&[0xABu8; 48], at).unwrap();
+            let err =
+                recover_segment(&f, MAX, is_active, SEGMENT_SIZE, MAX_RECORD_SIZE).unwrap_err();
+            assert!(
+                matches!(err, WalError::Corruption { segment, offset, .. }
+                    if segment == MAX && offset == at),
+                "is_active={is_active}: {err:?}"
+            );
+            let mut b = [0u8; 48];
+            f.read_exact_at(&mut b, at).unwrap();
+            assert_eq!(b, [0xABu8; 48], "garbage must be left intact (no zeroing)");
+        }
+    }
+
+    #[test]
+    fn v71_torn_max_record_itself_is_still_a_torn_tail() {
+        // The rule applies only AFTER an accepted MAX record: a torn MAX record
+        // at the tail is a normal torn tail (truncated + zeroed), max = MAX − 1.
+        let base = Lsn(u64::MAX - 1);
+        let dir = tempfile::tempdir().unwrap();
+        let f = fresh_segment(dir.path(), base);
+        let x = write_dense(&f, base, &[b"ok"]);
+        write_torn_at(&f, x, MAX, b"torn-max-record");
+        let rec = recover_segment(&f, base, true, SEGMENT_SIZE, MAX_RECORD_SIZE).unwrap();
+        assert_eq!(rec.max_lsn, base);
+        assert!(matches!(rec.tail_state, TailState::TruncatedAt { offset, .. } if offset == x));
+    }
+
+    #[test]
+    fn v71_physically_truncated_zero_tail_after_max_is_a_torn_tail() {
+        // A file that physically ends right after the u64::MAX record — or after
+        // fewer than 20 zero bytes — is the zero region cut short (§14.4f / a
+        // partial §15.6 backup copy), NOT data after the last LSN: active ⇒ torn
+        // tail at that offset (durably zero-extended, then clean on reopen);
+        // sealed ⇒ Corruption, as truncation of a sealed segment always is.
+        for extra in [0usize, 1, 7, 19] {
+            for is_active in [true, false] {
+                let dir = tempfile::tempdir().unwrap();
+                let f = fresh_segment(dir.path(), MAX);
+                write_record_at(&f, HEADER_SIZE, MAX, b"x");
+                let at = next_off(HEADER_SIZE, b"x");
+                f.set_len(at + extra as u64).unwrap(); // zero-filled by the FS
+                let res = recover_segment(&f, MAX, is_active, SEGMENT_SIZE, MAX_RECORD_SIZE);
+                if is_active {
+                    let rec = res.unwrap();
+                    assert_eq!(rec.max_lsn, MAX, "extra={extra}");
+                    assert_eq!(rec.write_offset, at);
+                    assert!(
+                        matches!(rec.tail_state, TailState::TruncatedAt { offset, .. } if offset == at)
+                    );
+                    let again =
+                        recover_segment(&f, MAX, true, SEGMENT_SIZE, MAX_RECORD_SIZE).unwrap();
+                    assert_eq!((again.max_lsn, again.tail_state), (MAX, TailState::Clean));
+                } else {
+                    assert!(
+                        matches!(res, Err(WalError::Corruption { offset, .. }) if offset == at),
+                        "sealed extra={extra}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn v71_physically_truncated_nonzero_tail_after_max_is_corruption() {
+        // Fewer than 20 bytes remain but one is non-zero ⇒ data after the last
+        // LSN ⇒ fatal Corruption even on the active segment (no torn tail).
+        let dir = tempfile::tempdir().unwrap();
+        let f = fresh_segment(dir.path(), MAX);
+        write_record_at(&f, HEADER_SIZE, MAX, b"x");
+        let at = next_off(HEADER_SIZE, b"x");
+        f.set_len(at + 6).unwrap();
+        f.write_all_at(&[0x42], at + 5).unwrap();
+        let err = recover_segment(&f, MAX, true, SEGMENT_SIZE, MAX_RECORD_SIZE).unwrap_err();
+        assert!(matches!(err, WalError::Corruption { offset, .. } if offset == at));
     }
 }

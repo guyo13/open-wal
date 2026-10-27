@@ -1,0 +1,71 @@
+name: Publish
+
+# Manual-only release to crates.io via Trusted Publishing (OIDC), so no
+# long-lived CARGO_REGISTRY_TOKEN secret is stored in the repo. A short-lived
+# token is minted per run by rust-lang/crates-io-auth-action.
+#
+# One-time setup on crates.io (Settings → Trusted Publishing for the `open-wal`
+# crate), matching the values below exactly:
+#   - Repository owner/name : guyo13/open-wal
+#   - Workflow filename     : publish.yml
+#   - Environment           : (leave blank unless you enable the optional
+#                             `environment:` block below — then it must match)
+# See https://crates.io/docs/trusted-publishing.
+on:
+  workflow_dispatch:
+
+# Never run two publishes concurrently.
+concurrency:
+  group: publish-${{ github.workflow }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  publish:
+    name: Publish to crates.io
+    runs-on: ubuntu-latest
+    # Optional hardening: gate publishes behind a GitHub Environment (required
+    # reviewers, branch restrictions). If you enable this, add the SAME
+    # environment name to the crates.io Trusted Publisher config above.
+    # environment: release
+    permissions:
+      # Required for the OIDC token exchange with crates.io. `contents: read`
+      # is enough — publishing needs no write access to the repository.
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Pre-publish gate: a publish is irreversible (a version can be yanked but
+      # never re-uploaded), so fail fast on anything obviously broken. The
+      # heavier fault-injection tiers live in ci.yml / the nightly workflows.
+      - name: Format check
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --locked
+
+      # Verify the package builds from exactly the files that will be uploaded
+      # (honors the `exclude` list in Cargo.toml).
+      - name: Package (verify)
+        run: cargo package --locked
+
+      # Exchange the workflow's OIDC identity for a short-lived crates.io token.
+      - name: Authenticate to crates.io
+        uses: rust-lang/crates-io-auth-action@v1
+        id: auth
+
+      - name: Publish
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
