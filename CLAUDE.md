@@ -112,6 +112,35 @@ The entire value of this component is **correct behavior under crashes and fault
 
 ## Project status (keep this updated)
 
+- **LATEST (2026-10-27, RM3 prep): spec §9 rewritten and kickoff C hardened through adversarial critique. Still DRAFT, not dispatched: it waits on #53's merge.**
+  - **Round 1:** a 3-angle critique of the first §9.1/§9.2 draft produced 28 findings. All were re-verified against #53's code at `3ba6f27`: 21 confirmed, 7 narrowed, **0 refuted**. The first draft would have built:
+    - a chunk-end attach racing session teardown (stale attach);
+    - a catch-up ceiling at `wal.durable_lsn()` that disagrees with R1, plus `Ahead ⇒ reject` for honest replicas;
+    - a mid-stream `RESEED_REQUIRED` that the real `Receiver` rejects;
+    - silent stalls on `Reader::next() ⇒ None` below durable;
+    - a false writer-stall bound (the containing-segment prefix rescan);
+    - T1/T5/T6/T8 rows that pass with their mutations applied.
+  - **Fixes:**
+    - a §9.3 request/answer slot handshake (the writer attaches only inside `answer`; the network thread never ends a session with a request outstanding);
+    - ceiling = `released`;
+    - below-oldest ⇒ close and re-HELLO, so step 1 answers RESEED;
+    - a sticky `PrimaryLogUnreadable`;
+    - in-session overflow fall-back;
+    - an honest stall bound plus `catchup_replicas_per_poll`;
+    - a normative `poll(wal)` cadence;
+    - the ring LSN domain pulled forward from RM4;
+    - step 2 documented as a tripwire.
+  - **Round 2:** a critique of the revision produced 27 more findings. The main ones, each found independently by two reviewers:
+    - the reader cap had no deferral path (a stranded request) ⇒ fixed with joins that never read (NeedChunk), a `Deferred` answer, and a `poll` that always finishes its pass;
+    - T8a/T8b opened no reader in their natural setup ⇒ fixed with a released-prefix setup and a wire positive control;
+    - T12 contradicted `last_lsn = seed − 1` ⇒ both boundaries are now pinned;
+    - the payload-only chunk budget was unbounded for empty payloads ⇒ the budget now counts `+32` per record;
+    - L8 could not drive `shipper.rs`, which is not built under loom ⇒ the slot module exports `post`/`answer`/`abandon`.
+  - **Kickoff C now has:** T1–T14, L7/L7b/L8 with measured mutation shapes, an anti-vacuity rule, a forwarding-proxy oracle, and the one RM2 test to rewrite.
+  - Commits `1c38c45` and `e2e6f37`. Round 3 is running.
+  - **Owner decisions raised (§16):**
+    1. A resumable WAL reader position, e.g. `Wal::reader_resume(token)` or `segment_bases()`. It is the only way to remove the O(segment_size) rescan per catch-up chunk; until then, replicated WALs should use `segment_size ≤ 32 MiB`.
+    2. A v1.x HELLO record-`d` CRC heuristic for former-primary detection past the step-2 tripwire.
 - **LATEST (2026-10-27, round 3b): #22 APPROVED at `e19806d` — ready for the owner to merge; H1 itself stays OPEN pending the owner's run on the rig.** Required 4–8 were verified by execution on a build of the head:
   - **R4:** `power_pull_verify` returns **5 = RECOVERY-FAIL** instead of panicking; it is counted as FAIL and the cycle dir is snapshotted, so it can no longer reach the INCONCLUSIVE arm.
   - **R5:** each cycle uses its own `cycle-<n>-<nonce>` dir. Verify on an absent dir (what a rolled-back device presents) gives `rc=1`, "ACKED DATA WAS LOST".
