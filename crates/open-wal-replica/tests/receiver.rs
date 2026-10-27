@@ -466,3 +466,36 @@ fn replica_observer_sees_only_committed_watermarks() {
     );
     assert_eq!(read_all(rx.wal()), log);
 }
+
+/// WAL v7.1: sequencing uses `checked_next`. A replica whose log already ends
+/// at `u64::MAX` cannot accept a `SERVING` (there is no next LSN) — it fails
+/// with `LsnExhausted`, never a saturated/repeated LSN and never poison.
+#[test]
+fn exhausted_lsn_space_is_its_own_error_not_poison() {
+    let rdir = tempfile::tempdir().unwrap();
+    {
+        let (mut wal, _) = Wal::options()
+            .seed(Lsn(u64::MAX))
+            .open(rdir.path(), SMALL)
+            .unwrap();
+        assert_eq!(wal.append(b"last").unwrap(), Lsn(u64::MAX));
+        wal.commit().unwrap();
+    }
+    let (addr, h) = spawn_receiver(rdir.path(), rx_cfg(1), 1);
+    let mut fp = FakePrimary::connect(addr);
+    assert_eq!(fp.hello(), u64::MAX);
+    fp.serving(u64::MAX);
+    fp.finish();
+    let (rx, results) = h.join().unwrap();
+    assert!(
+        matches!(
+            results[0],
+            Err(ReplError::LsnExhausted {
+                last: Lsn(u64::MAX)
+            })
+        ),
+        "{:?}",
+        results[0]
+    );
+    assert!(!rx.is_poisoned());
+}

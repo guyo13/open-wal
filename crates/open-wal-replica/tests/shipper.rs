@@ -455,3 +455,23 @@ fn min_acked_and_unknown_ids() {
     sh.shutdown();
     drop((a, b));
 }
+
+/// WAL v7.1: a primary whose log ends at `u64::MAX` has no next LSN to ship;
+/// `Shipper::new` refuses with `LsnExhausted` instead of saturating.
+#[test]
+fn shipper_on_exhausted_wal_is_refused() {
+    let pdir = tempfile::tempdir().unwrap();
+    let (mut wal, _) = Wal::options()
+        .seed(Lsn(u64::MAX))
+        .open(pdir.path(), SMALL)
+        .unwrap();
+    wal.append(b"last").unwrap();
+    wal.commit().unwrap();
+    let fake = FakeReplica::new();
+    assert!(matches!(
+        Shipper::new(ship_cfg(fake.addr()), &wal),
+        Err(open_wal_replica::ReplError::LsnExhausted {
+            last: Lsn(u64::MAX)
+        })
+    ));
+}

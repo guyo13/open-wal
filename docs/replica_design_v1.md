@@ -630,10 +630,23 @@ underspecified or where loom showed it needed sharpening. None weakens R1.
   make a fixed number of concurrent drain passes (no spinning — a spin on `released` lets loom
   feed stale values until "max branches"), then finish draining after `join`. Without this the
   L1 `Release→Relaxed` mutations were masked; with it they fail.
-- **Preemption bounds.** L1, L2, L3, L5 are exhaustive (no bound). L4 and L6a run at
-  preemption bound 3, L6b at 2 (L6b at bound 3 ≈ 1.45M interleavings / 11 min — run once,
-  green); unbounded, these do not finish, and they are already at the §15.7.3 minimum size.
-  Every §15.7.5 mutation was shown to fail at the per-PR bounds.
+- **Preemption bounds.** L1, L2, L2b, L3, L5 are exhaustive (no bound). L4 runs at preemption
+  bound **4** — the shallowest bound at which a regression to `Relaxed` pins (the bug loom found)
+  fails a model; at bound 3 every model passes it (~5 s at bound 4). L6a runs at bound 3, L6b at
+  2 per-PR; L6b at bound 3 (≈ 1.45M interleavings / 11 min, green) runs in the scheduled
+  `replica-loom-deep.yml` job. Unbounded, L4/L6a/L6b do not finish, and they are already at the
+  §15.7.3 minimum size. Every mutation below was shown to fail at the per-PR bounds.
+- **L2b — R1 checked independently of the ring's own report (added at review).** L2 compares
+  emissions with `Drain.watermark`, a value the ring reports about itself, and every other
+  model releases everything it captures — so a release-on-capture bug *inside* the ring kept
+  every model green (L5 tripped only incidentally, via a skipped unpark). L2b captures 1..=3,
+  releases 1 then 2, never 3, and asserts the end state is exactly records 1 and 2 against the
+  producer's log.
+- **Mutations added at review** (beyond the seven of §15.7.5; each shown to fail, reverted):
+  | Mutation | Must fail |
+  |---|---|
+  | consumer pin CAS `Release` → `Relaxed` (regression of the loom-found bug) | **L4** at bound 4 — "ring invariant: a spare buffer is always free" |
+  | release-on-capture inside the ring (`released.store(lsn, Release)` at the end of `capture`, producer's private watermark untouched so `release` still unparks) | **L2b** — "R1: emitted a captured-but-unreleased record" |
 - **`loom` is a `[target.'cfg(loom)'.dependencies]` entry**, not a dev-dependency: the library
   itself is compiled with `--cfg loom` as a regular dependency of `tests/loom_ring.rs`, where
   dev-dependencies are invisible. The cfg is never set in a normal build.

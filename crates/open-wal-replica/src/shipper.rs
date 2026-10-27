@@ -165,8 +165,11 @@ impl Shipper {
             slot_bytes: cfg.slot_bytes,
             consumers: n,
         };
-        let (mut producer, consumers) =
-            ring::ring(ring_cfg, wal.last_lsn().next(), wal.durable_lsn());
+        let last = wal.last_lsn();
+        let next = last
+            .checked_next()
+            .ok_or(ReplError::LsnExhausted { last })?;
+        let (mut producer, consumers) = ring::ring(ring_cfg, next, wal.durable_lsn());
         let net = Arc::new(Net {
             shutdown: AtomicBool::new(false),
             join_pending: AtomicBool::new(false),
@@ -399,7 +402,18 @@ fn session(
     // R7: resume from the replica's own durable_lsn. The writer thread decides
     // (it owns the ring's producer side): join, behind (catch-up), or ahead.
     set_status(r, ReplicaStatus::Joining);
-    let from = durable.next();
+    // checked_next (v7.1): a replica durable at u64::MAX can never be served
+    // more; never saturate into a repeated LSN.
+    let Some(from) = durable.checked_next() else {
+        let _ = send(
+            &stream,
+            &Frame::Err {
+                code: ErrCode::Protocol,
+                msg: "LSN space exhausted",
+            },
+        );
+        return Err(ReplError::LsnExhausted { last: durable });
+    };
     r.join_resp.store(JOIN_PENDING, Ordering::Relaxed);
     r.join_req.store(from.0, Ordering::Release);
     net.join_pending.store(true, Ordering::Release);
@@ -429,7 +443,7 @@ fn session(
         JOIN_BEHIND => {
             set_status(r, ReplicaStatus::NeedsCatchUp);
             r.catch_ups.fetch_add(1, Ordering::AcqRel);
-            hold(cfg, &stream, rd, net, r, durable);
+            hold(cfg, &stream, rd, net, r, consumer, durable);
             return Ok(SessionEnd::Refused);
         }
         _ => {}
@@ -534,6 +548,7 @@ fn hold(
     rd: FrameReader<TcpStream>,
     net: &Net,
     r: &ReplicaShared,
+    consumer: &Consumer,
     durable: Lsn,
 ) {
     let _ = stream.set_read_timeout(Some(ack_timeout(cfg)));
@@ -543,10 +558,12 @@ fn hold(
     thread::scope(|s| {
         s.spawn(|| ack_reader(rd, r, &dead, &sent, &me));
         while !net.shutdown.load(Ordering::Acquire) && !dead.load(Ordering::Acquire) {
+            // §6: a heartbeat carries the *sender's* watermark — the primary's
+            // released watermark, not the replica's durable_lsn.
             if send(
                 stream,
                 &Frame::Heartbeat {
-                    durable_lsn: durable,
+                    durable_lsn: consumer.released(),
                 },
             )
             .is_err()

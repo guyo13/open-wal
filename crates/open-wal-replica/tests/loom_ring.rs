@@ -14,10 +14,13 @@
 //! Payloads are `[lsn as u8; 4]`, so a torn or reused read is detectable by
 //! value as well as by loom's race report.
 //!
-//! **Preemption bounds (documented per §15.7.3).** L1, L2, L3 and L5 run with
-//! loom's default — no preemption bound, i.e. exhaustive. L4 and L6a are
-//! exhaustive up to **3 preemptions** (`BOUNDED`) and L6b up to **2**
-//! (`L6B_BOUND`): unbounded, L4 and L6a did not finish in 280 s+ and L6b at
+//! **Preemption bounds (documented per §15.7.3).** L1, L2, L2b, L3 and L5 run
+//! with loom's default — no preemption bound, i.e. exhaustive. L4 is exhaustive
+//! up to **4 preemptions** (`L4_BOUND`), L6a up to **3** (`BOUNDED`) and L6b up
+//! to **2** (`L6B_BOUND`). L4 runs one deeper than the rest because bound 4 is
+//! the shallowest at which the bug loom found (pins must be `Release`, see
+//! `Consumer::copy_out`) is caught — a regression to `Relaxed` pins passes
+//! every model at bound 3. Unbounded, L4 and L6a did not finish in 280 s+ and L6b at
 //! bound 3 takes ~11 min (green, recorded in the RM2 status), and the models
 //! are already at the spec's minimum size (2 slots / 3–4 records / 2
 //! consumers), so they cannot shrink further. Bounded exploration is the
@@ -38,8 +41,9 @@
 //!
 //! # Falsifiability (§15.7.5)
 //! Each of the seven required mutations of `src/ring.rs` was applied, its model
-//! run and shown to fail, then reverted — see the RM2 status in
-//! `crates/open-wal-replica/CLAUDE.md` for the recorded results.
+//! run and shown to fail, then reverted, plus two added at review (`Relaxed`
+//! pins ⇒ L4 at bound 4; release-on-capture inside the ring ⇒ L2b) — see the
+//! RM2 status in `crates/open-wal-replica/CLAUDE.md` for the recorded results.
 #![cfg(loom)]
 
 use std::time::Duration;
@@ -50,6 +54,11 @@ use open_wal_replica::ring::{self, Consumer, ConsumerStatus, Producer, RingConfi
 
 /// Preemption bound for the models that are too large to explore unbounded.
 const BOUNDED: Option<usize> = Some(3);
+
+/// L4 runs at bound 4: the shallowest bound at which the `Relaxed`-pin
+/// regression (the bug loom found — the producer counts a released spare as
+/// still pinned and runs out of spares) fails a model. ~3 s.
+const L4_BOUND: Option<usize> = Some(4);
 
 /// L6b (two consumers *and* slot reuse) is the largest model: ~1.45M
 /// interleavings / ~11 min at bound 3 (run once, green — see the RM2 status),
@@ -244,6 +253,38 @@ fn l2_never_ahead_of_the_pass_watermark() {
     });
 }
 
+/// L2b — R1 checked **independently of the ring's own report**: a captured
+/// record that is never released is never emitted. Capture 1..=3, release 1
+/// then 2, never release 3. The end state must be exactly records 1 and 2 —
+/// asserted against the producer's own log, not against `Drain.watermark` (a
+/// value the ring reports about itself, which a release-on-capture bug would
+/// keep consistent). 3 slots: no reuse, no overflow.
+#[test]
+fn l2b_never_emits_an_unreleased_record() {
+    model(None, || {
+        let (mut p, mut cs) = setup(3, 1);
+        let h = spawn_consumer(cs.pop().unwrap(), 2, Wait::Passes(3));
+        for l in 1..=3 {
+            p.capture(Lsn(l), &pat(l));
+        }
+        p.release(Lsn(1));
+        p.release(Lsn(2));
+        // Record 3 is captured but its commit "never returned": not shippable.
+        let (out, status) = finish(h);
+        assert_eq!(status, ConsumerStatus::Streaming);
+        let got: Vec<(u64, Vec<u8>)> = out.iter().map(|(l, b, _)| (*l, b.clone())).collect();
+        assert!(
+            got.iter().all(|(l, _)| *l <= 2),
+            "R1: emitted a captured-but-unreleased record: {got:?}"
+        );
+        assert_eq!(
+            got,
+            vec![(1, pat(1).to_vec()), (2, pat(2).to_vec())],
+            "R1: end state must be exactly the released records"
+        );
+    });
+}
+
 /// L3 — slot-reuse safety. 2 slots / 3 records: capturing 3 reuses the slot of
 /// record 1, which the consumer may be reading at that moment. The producer
 /// must Acquire the consumer's cursor before overwriting in place, or evict;
@@ -269,7 +310,7 @@ fn l3_slot_reuse_only_after_min_cursor() {
 /// record (`assert_consistent` checks every emitted `(lsn, payload)`).
 #[test]
 fn l4_eviction_bumps_generation() {
-    model(BOUNDED, || {
+    model(L4_BOUND, || {
         let (mut p, mut cs) = setup(2, 1);
         let h = spawn_consumer(cs.pop().unwrap(), 4, Wait::Passes(3));
         p.capture(Lsn(1), &pat(1));

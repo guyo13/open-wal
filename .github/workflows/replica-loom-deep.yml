@@ -1,0 +1,54 @@
+name: Replica loom deep (RM2)
+
+# Deeper sweep of the RM2 loom gate (docs/replica_design_v1.md §15.7.8), off the
+# per-PR path. The per-PR `replica — loom ring gate` job (ci.yml) runs L6b — two
+# consumers plus slot reuse, the largest model — at preemption bound 2. Here it
+# runs at bound 3: ~1.45M interleavings, ~11 min. Scheduled + manual only.
+#
+# Only L6b is selected: LOOM_MAX_PREEMPTIONS overrides every model's own bound,
+# and L4 runs at 4 per-PR (the shallowest bound that catches a regression to
+# `Relaxed` pins), so a blanket 3 would make L4 *weaker* than per-PR.
+#
+# A failure here is a real concurrency bug in the ring.
+on:
+  schedule:
+    # 06:17 UTC daily — offset from the bench (03:17), fuzz (04:17) and soak
+    # (05:17) jobs.
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+    inputs:
+      bound:
+        description: "LOOM_MAX_PREEMPTIONS for L6b"
+        required: false
+        default: "3"
+
+concurrency:
+  group: replica-loom-deep-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  l6b-deep:
+    name: replica — loom L6b (deep)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: loom
+      - name: loom L6b at the deep bound
+        env:
+          RUSTFLAGS: --cfg loom
+          CARGO_TARGET_DIR: target/loom
+          LOOM_MAX_PREEMPTIONS: ${{ inputs.bound || '3' }}
+        run: >-
+          cargo test -p open-wal-replica --test loom_ring --release --
+          l6b_spmc_free_only_when_both_cursors_passed --exact

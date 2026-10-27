@@ -201,7 +201,11 @@ impl<O: DurabilityObserver> Receiver<O> {
             let (stream, _) = listener.accept()?;
             match self.serve_connection(stream) {
                 Ok(()) => {}
-                Err(e @ (ReplError::Wal(_) | ReplError::ReseedRequired { .. })) => return Err(e),
+                Err(
+                    e @ (ReplError::Wal(_)
+                    | ReplError::ReseedRequired { .. }
+                    | ReplError::LsnExhausted { .. }),
+                ) => return Err(e),
                 Err(_) => {}
             }
         }
@@ -253,7 +257,7 @@ impl<O: DurabilityObserver> Receiver<O> {
         set_timeout(stream, self.cfg.idle_timeout)?;
         match rd.read_frame()? {
             Frame::Serving { from_lsn, .. } => {
-                let expected = self.wal.last_lsn().next();
+                let expected = next_lsn(self.wal.last_lsn())?;
                 if from_lsn != expected {
                     return Err(ReplError::Contiguity {
                         expected,
@@ -297,7 +301,7 @@ impl<O: DurabilityObserver> Receiver<O> {
                     // R9 (CRC) was verified by the decoder. R3: hard contiguity
                     // check BEFORE append — a gap, duplicate or reorder is never
                     // appended.
-                    let expected = self.wal.last_lsn().next();
+                    let expected = next_lsn(self.wal.last_lsn())?;
                     if lsn != expected {
                         return Err(ReplError::Contiguity { expected, got: lsn });
                     }
@@ -377,6 +381,12 @@ impl<O: DurabilityObserver> Receiver<O> {
             None => Ok(()),
         }
     }
+}
+
+/// `last + 1` for sequencing — never saturating (WAL v7.1: `u64::MAX` is the
+/// last LSN; a saturating `next()` would repeat it).
+fn next_lsn(last: Lsn) -> Result<Lsn> {
+    last.checked_next().ok_or(ReplError::LsnExhausted { last })
 }
 
 fn set_timeout(stream: &TcpStream, t: Option<Duration>) -> Result<()> {

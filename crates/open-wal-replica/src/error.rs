@@ -56,6 +56,14 @@ pub enum ReplError {
     /// Producing or applying a re-seed snapshot failed (§10, RM4).
     SnapshotFailed,
 
+    /// The LSN space is exhausted (WAL v7.1): the next LSN after `last` would
+    /// pass `u64::MAX`. Not a durability failure and not poison — the log
+    /// simply cannot grow; sequencing never wraps or saturates.
+    LsnExhausted {
+        /// The last assignable LSN that was reached.
+        last: Lsn,
+    },
+
     /// The peer sent an `ERR` frame and is closing the connection.
     Remote {
         /// The peer's error class.
@@ -86,6 +94,9 @@ impl fmt::Display for ReplError {
             ReplError::PrimaryPoisoned => write!(f, "primary WAL is poisoned"),
             ReplError::Io(e) => write!(f, "transport I/O error: {e}"),
             ReplError::SnapshotFailed => write!(f, "snapshot produce/apply failed"),
+            ReplError::LsnExhausted { last } => {
+                write!(f, "LSN space exhausted after lsn {last}")
+            }
             ReplError::Remote { code, msg } => write!(f, "peer sent ERR({code:?}): {msg}"),
         }
     }

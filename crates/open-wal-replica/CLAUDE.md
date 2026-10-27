@@ -21,8 +21,11 @@ destructive operation. The one property that makes v1 tractable: **a replica onl
 records ≤ the primary's `durable_lsn`, in order, so it is always a dense prefix of the primary
 and never needs to truncate.** Every design rule below exists to preserve that.
 
-Depends on open-wal **spec v7** (`WalConfig::initial_lsn`, `Wal::oldest_lsn()`, containing-segment
-`reader_from`). RM0–RM2 need none of it; **RM3+ waits for v7 to land.**
+Depends on open-wal **spec v7** — **landed** (#52 v7, #54 v7.1): the cold-start seed is the
+`Wal::options().seed(..)` builder (not a `WalConfig` field), plus `Wal::oldest_lsn()` and
+containing-segment `reader_from`; v7.1 adds `LsnExhausted` — **sequencing uses
+`Lsn::checked_next()`, never the saturating `next()`**. RM0–RM2 need none of v7. Tracker: issue
+#47.
 
 ---
 
@@ -44,7 +47,7 @@ Depends on open-wal **spec v7** (`WalConfig::initial_lsn`, `Wal::oldest_lsn()`, 
 - **R1 Never ahead.** A replica's durable set ⊆ the primary's durable set. The shipper MUST NOT
   send any record with `lsn > w` where `w` is the latest `commit() → Ok(w)`. A captured record
   whose commit has not returned is **not shippable** (the §15.1 visibility gap applied to the ring).
-- **R2 LSN mirroring.** Same LSN on primary and replica for every record (via `initial_lsn` +
+- **R2 LSN mirroring.** Same LSN on primary and replica for every record (via `Wal::options().seed(..)` +
   R3). After `wal.append(payload)` on the replica, the returned LSN MUST equal the shipped LSN.
 - **R3 Stream contiguity — hard check.** Receiver verifies `lsn == replica_wal.last_lsn() + 1`
   **before** `append`. Any other value ⇒ do NOT append, `ERR(Contiguity)`, close, re-HELLO.
@@ -123,7 +126,7 @@ Depend on the WAL via `open-wal = { path = "../..", version = "0.2" }`.
 | **RM1** | `Receiver`: own WAL, R3 hard check, group commit, R4 ack | §15.1, §15.2 P1–P2 |
 | **RM2** | `Shipper`: ring capture/release, per-replica net threads, overflow ⇒ `NeedsCatchUp`, R1 as Release/Acquire watermark | §15.2 P3–P4, §15.3 overflow, **§15.7 loom L1–L6 + all 7 mutations — GATE** |
 | **RM3** | catch-up (§9) *(needs WAL v7)* | §15.3, §15.2 P5 |
-| **RM4** | re-seed traits + `initial_lsn` cold start + reseed checkpoint guard | §15.3 |
+| **RM4** | re-seed traits + `options().seed(..)` cold start + reseed checkpoint guard | §15.3 |
 | **RM5** | checkpoint policy helper, promotion runbook, former-primary rejection | §15.3 |
 | **RM6** | model/oracle harness | §15.4 |
 | **RM7** | fault injection: LazyFS replica-never-ahead headline + negative control, split-batch, SIGKILL matrices, wire corruption, partition | §15.5 |
@@ -220,9 +223,10 @@ underspecified, flag it and propose a fix — do not silently diverge.
   `1..=N`, no dup at any cutover; 273 `NeedsCatchUp` on a 2-slot ring). Disabling the consumer's
   generation check makes P4 fail (shown, reverted).
   **loom (`tests/loom_ring.rs`, imports the crate's ring):** L1 visibility, L2 never-ahead, L3
-  slot reuse, L4 eviction, L5 no lost wakeup, L6a/L6b SPMC. Bounds: L1/L2/L3/L5 exhaustive;
-  L4/L6a preemption bound 3; L6b bound 2 per-PR (bound 3 run once here: 1.45M iterations,
-  669 s, green). **Loom found a real bug**: `Relaxed` pins let the producer see a consumer's new
+  slot reuse, L4 eviction, L5 no lost wakeup, L6a/L6b SPMC; **L2b** never-emits-unreleased
+  (added at review). Bounds: L1/L2/L2b/L3/L5 exhaustive; **L4 bound 4** (raised at review — the
+  shallowest bound catching the `Relaxed`-pin regression, ~5 s); L6a bound 3; L6b bound 2 per-PR
+  (bound 3: 1.45M iterations, 669 s, green — now the scheduled `replica-loom-deep.yml` job). **Loom found a real bug**: `Relaxed` pins let the producer see a consumer's new
   pin without its earlier unpin ⇒ "spare always free" invariant panicked (L4) ⇒ pins are now
   `Release`. **Mutation results (each applied to `src/ring.rs`, run, reverted):**
   | Mutation | Model | Result |
@@ -234,12 +238,27 @@ underspecified, flag it and propose a fix — do not silently diverge.
   | drop generation bump (tombstone) on eviction | L4 | FAIL — loom `Causality violation` |
   | drop `unpark` in `release` | L5 | FAIL — loom deadlock (consumer parked forever) |
   | re-read `released` mid-drain, send to new value | L2 | FAIL — "emitted N past its pass watermark" |
+  | *(review)* pin CAS `Release`→`Relaxed` (loom-found bug regressed) | L4 @ bound 4 | FAIL — "ring invariant: a spare buffer is always free" |
+  | *(review)* release-on-capture inside the ring (`released.store(lsn)` in `capture`, private watermark untouched) | L2b | FAIL — "R1: emitted a captured-but-unreleased record" |
   Model-strength fixes made to get there (recorded in design §15.7.8): L1's first version did
   not catch the two L1 mutations because loom's `unpark` synchronizes the target immediately —
   non-L5 models now register no waker and do bounded drain passes (no spinning: a spin made the
   max-branch limit, not a real catch, fail M4). Spec refinements flagged in §15.7.8 (pinning
   instead of overwrite-then-detect for L4; park/unpark instead of Condvar for L5).
-- **Current milestone:** RM3 (catch-up) — BLOCKED on WAL v7 (`options().seed(..)`,
-  `oldest_lsn()`, containing-segment `reader_from`).
-- **RM2 loom gate:** PASSED (see RM2 entry).
-- **WAL v7 dependency (RM3+):** pending
+- **RM2 review follow-up (2026-10-27, designer review on #53).** Merged `main` (v7 + v7.1, clean).
+  Required 1: L4 raised to preemption bound 4 so the `Relaxed`-pin regression fails per-PR.
+  Required 2: new L2b (unreleased tail never emitted, checked against the producer's log, not
+  `Drain.watermark`) + the release-on-capture-inside-the-ring mutation. All **nine** mutations
+  re-run at the per-PR bounds — all FAIL their model, `ring.rs` restored. Non-blocking: sequencing
+  `next()` → `checked_next()` in `receiver.rs`/`shipper.rs` with a dedicated
+  `ReplError::LsnExhausted` (not poison; `Receiver::run` treats it as fatal) + tests; `hold()`
+  heartbeats now carry the primary's `released` (§6), via a reporting-only
+  `Consumer::released()`; L6b bound 3 moved to a scheduled job. Note 3 (proptest case counts)
+  needed no change: `proptest!` runs every config through `contextualize_config`, so
+  `PROPTEST_CASES` already overrides `cases: N` (verified: P4 0.10 s → 7.5 s at 2000). Notes 2
+  (`MAX_LSN` vs `seed`, RM4) and 7 (0.3.0 bump must also bump this crate's `open-wal`
+  requirement) are tracked, not done here.
+- **Current milestone:** RM3 (catch-up) — **BLOCKED until the RM2 gate is re-reviewed** on #53.
+  (Implement the corrected §9 step 2: reject iff `d > durable_lsn`.)
+- **RM2 loom gate:** L1–L6 + L2b green, nine mutations fail; awaiting designer re-review.
+- **WAL v7 dependency (RM3+):** landed (#52 v7, #54 v7.1).

@@ -652,6 +652,15 @@ impl Consumer {
         }
     }
 
+    /// The producer's released (shippable) watermark, `Acquire`-loaded. For
+    /// reporting only (e.g. a heartbeat carrying the primary's watermark); it
+    /// never authorizes emitting anything — only [`drain`](Consumer::drain)
+    /// emits.
+    #[must_use]
+    pub fn released(&self) -> Lsn {
+        Lsn(self.shared.released.load(Ordering::Acquire))
+    }
+
     /// Whether the producer marked this consumer `NeedsCatchUp`.
     #[must_use]
     pub fn needs_catch_up(&self) -> bool {
