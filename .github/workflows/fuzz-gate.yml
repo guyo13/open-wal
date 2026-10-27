@@ -11,8 +11,13 @@ name: Fuzz gate (self-hosted, §14.13)
 #
 # Trigger: Actions → "Fuzz gate (self-hosted, §14.13)" → Run workflow.
 #   - hours_per_target: real CPU-hours to require per target (default 24).
-#   - The gate clock starts at the last format change; this job asserts HEAD is
-#     at/after that baseline and records the SHA in the evidence.
+#   - The gate clock starts at the last format / recovery-classification change;
+#     this job asserts HEAD is at/after that baseline and records the SHA in the
+#     evidence. Current baseline: d844d5f (v7.1 — a new recovery arm after a
+#     u64::MAX record). The previous baseline 2b198e7 (sentinel fix) was met for
+#     all four targets; after d844d5f only F1 (recovery) and F3 (structure) need
+#     the 24 CPU-h re-run — F2 (decode, byte-identical decoder) and F4 (model,
+#     cannot construct a u64::MAX log) carry over (fuzz/README.md regrow log).
 
 on:
   workflow_dispatch:
@@ -24,7 +29,7 @@ on:
       format_baseline:
         description: "Commit the gate clock starts at (last format change)"
         required: false
-        default: "2b198e7"
+        default: "d844d5f"
 
 concurrency:
   group: fuzz-gate-${{ github.ref }}
@@ -48,13 +53,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           # Full history: the baseline-ancestry check below needs the format-baseline
-          # commit (2b198e7) present locally. The default shallow clone (depth 1) has
+          # commit (d844d5f) present locally. The default shallow clone (depth 1) has
           # only HEAD, so `git merge-base --is-ancestor` fails with "Not a valid object".
           fetch-depth: 0
 
       - name: Assert format baseline (gate clock)
         run: |
-          BASE="${{ github.event.inputs.format_baseline || '2b198e7' }}"
+          BASE="${{ github.event.inputs.format_baseline || 'd844d5f' }}"
           if ! git cat-file -e "${BASE}^{commit}" 2>/dev/null; then
             echo "::error::Baseline commit $BASE is not present in this checkout — the clone is too shallow. Ensure actions/checkout uses fetch-depth: 0."
             exit 1
@@ -144,7 +149,7 @@ jobs:
           # reuse the M8 evidence emitter (dotted keys nest, @-prefix = raw JSON)
           scripts/m8/evidence.sh emit out=evidence/fuzz_gate.json \
             gate="fuzz-cpuh-per-target" \
-            baseline="${{ github.event.inputs.format_baseline || '2b198e7' }}" \
+            baseline="${{ github.event.inputs.format_baseline || 'd844d5f' }}" \
             head="$(git rev-parse HEAD)" \
             hours_required_per_target="$HOURS" \
             accounting="real User+System CPU seconds, taskset-pinned, dedicated vCPU" \

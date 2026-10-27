@@ -16,13 +16,30 @@ impl Lsn {
     /// The first valid record LSN. Records are dense starting here.
     pub const FIRST: Lsn = Lsn(1);
 
-    /// The next LSN in sequence. Saturating, so `Lsn(u64::MAX).next()` does not
-    /// wrap (a 2^64-record log is not reachable in practice, but recovery must
-    /// never panic on arbitrary inputs — D11).
+    /// The next LSN, **saturating**: `Lsn(u64::MAX).next() == Lsn(u64::MAX)`
+    /// (never wraps, never panics).
+    ///
+    /// Because it saturates, it is **not** used for sequencing: a saturated
+    /// "next" would silently reuse `u64::MAX`. The WAL's own sequencing (append,
+    /// the recovery scan, cross-segment continuity) uses
+    /// [`checked_next`](Lsn::checked_next) and treats `u64::MAX` as the end of
+    /// the LSN space (v7.1, `WalError::LsnExhausted`).
     #[inline]
     #[must_use]
     pub const fn next(self) -> Lsn {
         Lsn(self.0.saturating_add(1))
+    }
+
+    /// The next LSN in sequence, or `None` if `self` is `Lsn(u64::MAX)` — the
+    /// last LSN of the finite LSN space `[1, u64::MAX]` (v7.1, §4 D2). Used for
+    /// all sequencing, so exhaustion is detected instead of an LSN being reused.
+    #[inline]
+    #[must_use]
+    pub const fn checked_next(self) -> Option<Lsn> {
+        match self.0.checked_add(1) {
+            Some(n) => Some(Lsn(n)),
+            None => None,
+        }
     }
 
     /// True for the reserved `Lsn(0)` sentinel.
@@ -57,6 +74,15 @@ mod tests {
     fn next_is_monotone_and_dense() {
         assert_eq!(Lsn::NONE.next(), Lsn::FIRST);
         assert_eq!(Lsn(41).next(), Lsn(42));
+    }
+
+    #[test]
+    fn checked_next_detects_exhaustion() {
+        // v7.1: sequencing uses checked_next; u64::MAX is the last LSN.
+        assert_eq!(Lsn(1).checked_next(), Some(Lsn(2)));
+        assert_eq!(Lsn::NONE.checked_next(), Some(Lsn::FIRST));
+        assert_eq!(Lsn(u64::MAX - 1).checked_next(), Some(Lsn(u64::MAX)));
+        assert_eq!(Lsn(u64::MAX).checked_next(), None);
     }
 
     #[test]

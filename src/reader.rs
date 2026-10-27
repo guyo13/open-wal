@@ -39,7 +39,9 @@ pub struct Reader<'w> {
     /// after the stream ends.
     file: Option<File>,
     offset: u64,
-    expected_lsn: Lsn,
+    /// The LSN the next record must carry; `None` once a `u64::MAX` record has
+    /// been yielded — the LSN space is exhausted, so nothing may follow (v7.1).
+    expected_lsn: Option<Lsn>,
     from: Lsn,
     segment_size: u64,
     max_record_size: u32,
@@ -49,31 +51,44 @@ pub struct Reader<'w> {
 
 impl<'w> Reader<'w> {
     /// Build a reader replaying `segments` (sorted ascending `base_lsn`s) under
-    /// `dir`, with `first` already opened on `segments[0]`, yielding records
-    /// with `lsn >= from`. The first record's LSN is `segments[0]` (the oldest
-    /// base); continuity carries `expected_lsn` across segment boundaries.
+    /// `dir`, starting at `segments[start]` — the segment containing `from`
+    /// (§8.5, v7) — with `first` already opened on it, yielding records with
+    /// `lsn >= from`. The scan begins at that segment's first record (LSN
+    /// `segments[start]`) and skips forward to `from`; continuity carries
+    /// `expected_lsn` across later segment boundaries.
     pub(crate) fn new(
         dir: &'w Path,
         segments: &'w [Lsn],
+        start: usize,
         first: File,
         from: Lsn,
         segment_size: u64,
         max_record_size: u32,
     ) -> Reader<'w> {
-        debug_assert!(!segments.is_empty(), "a Wal always has ≥1 segment");
+        debug_assert!(start < segments.len(), "start indexes a live segment");
         Reader {
             dir,
             segments,
-            seg_idx: 0,
+            seg_idx: start,
             file: Some(first),
             offset: segment::HEADER_SIZE,
-            expected_lsn: segments[0],
+            expected_lsn: Some(segments[start]),
             from,
             segment_size,
             max_record_size,
             buf: Vec::new(),
             done: false,
         }
+    }
+
+    /// Test/fuzz hook (§14.2 P-reader, v7): `base_lsn` of the segment this
+    /// reader currently has open, or `None` once the stream has ended. Called
+    /// right after [`Wal::reader_from`](crate::Wal::reader_from), it names the
+    /// segment `reader_from` opened — which §8.5 requires to be the one
+    /// containing `from`, never unconditionally the oldest.
+    #[cfg(any(test, feature = "fuzzing"))]
+    pub(crate) fn open_segment_base(&self) -> Option<Lsn> {
+        self.file.as_ref().map(|_| self.segments[self.seg_idx])
     }
 
     /// Advance to the next segment in the list, opening its file and resetting
@@ -153,7 +168,7 @@ impl<'w> Reader<'w> {
                     payload_len,
                     framed_len,
                 }) => {
-                    if lsn != self.expected_lsn {
+                    if Some(lsn) != self.expected_lsn {
                         // A clean log has dense, in-order LSNs across segments; a
                         // break ends the valid records (defensive — recovery
                         // already validated continuity).
@@ -161,7 +176,10 @@ impl<'w> Reader<'w> {
                         return None;
                     }
                     self.offset += framed_len as u64;
-                    self.expected_lsn = lsn.next();
+                    // `checked_next`, never the saturating `next()`: after
+                    // `u64::MAX` no record may follow, so a (corrupt) duplicate
+                    // `u64::MAX` ends the stream instead of being yielded (v7.1).
+                    self.expected_lsn = lsn.checked_next();
                     if lsn < self.from {
                         continue;
                     }

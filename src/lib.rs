@@ -6,7 +6,7 @@
 //! serialization is entirely the caller's concern. It is not a database, not
 //! multi-writer, and runs no background threads.
 //!
-//! The normative design lives in `docs/wal_design_v6.md`; the durability
+//! The normative design lives in `docs/wal_design_v7.md`; the durability
 //! invariants D1–D12 there are binding on every change.
 //!
 //! This crate is built in milestones (§13). **M0 (foundations)** provides the
@@ -20,7 +20,10 @@
 //! mid-log corruption). **M4** adds the multi-segment write path — segment roll,
 //! commit-time whole-record split, sealed-segment immutability — and
 //! multi-segment recovery (discovery, cross-segment continuity, crash-during-roll
-//! handling). Checkpoint/retention (M5) arrives later.
+//! handling). Checkpoint/retention (M5) arrives later. **Spec v7** adds the
+//! open-time [`OpenOptions`] builder ([`Wal::options`] — a cold-start `seed` and
+//! an `observer`), the live [`Wal::oldest_lsn`] retention floor, and a
+//! [`Wal::reader_from`] that seeks straight to the segment containing `from`.
 
 // This is an embeddable library; every public item must be documented. With
 // CI's `clippy -D warnings`, an undocumented public item fails the build.
@@ -31,6 +34,7 @@ mod crc;
 mod error;
 mod lsn;
 mod observer;
+mod options;
 mod reader;
 mod record;
 mod recovery;
@@ -42,6 +46,7 @@ pub use crc::crc32c;
 pub use error::{Result, WalError};
 pub use lsn::Lsn;
 pub use observer::{DurabilityObserver, NullObserver};
+pub use options::OpenOptions;
 pub use reader::Reader;
 pub use wal::{RecoveryReport, TailState, Wal};
 
@@ -174,6 +179,16 @@ pub mod fuzzing {
         /// An error outside the classification surface (e.g. I/O). The differential
         /// treats this as its own class so it is never silently equated.
         OtherErr,
+    }
+
+    /// §14.2 P-reader instrumentation (v7 §8.5): the `base_lsn` of the segment
+    /// `reader` currently has open (`None` once its stream has ended). Called
+    /// right after [`Wal::reader_from`](crate::Wal::reader_from), it is the
+    /// segment `reader_from` opened — which must be the one containing `from`,
+    /// never unconditionally the oldest.
+    #[must_use]
+    pub fn reader_open_segment(reader: &crate::Reader<'_>) -> Option<Lsn> {
+        reader.open_segment_base()
     }
 
     /// Run the **real** production `recover_segment` (§8.2) over one open segment

@@ -88,5 +88,5 @@ fault-injection negative control.)
 ### Where are the exact guarantees written down?
 
 [§4 (invariants D1–D12) and §5 (on-disk format) of the design
-spec](https://github.com/guyo13/open-wal/blob/main/docs/wal_design_v6.md) are
+spec](https://github.com/guyo13/open-wal/blob/main/docs/wal_design_v7.md) are
 normative, and §14 maps every invariant to the tests that enforce it.

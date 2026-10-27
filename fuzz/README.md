@@ -27,7 +27,8 @@ cargo +nightly fuzz run recovery -- -runs=100000
 
 # Long run (the §14.13 release gate: >= 24 CPU-hours PER TARGET, zero crashes,
 # bounded-scan counter never exceeded, accumulated SINCE the last parser/format
-# change — currently 2b198e7, the all-zero-header sentinel fix).
+# change — currently d844d5f for recovery/structure, v7.1; decode/model carry
+# over from 2b198e7 — see the regrow log below).
 cargo +nightly fuzz run recovery
 ```
 
@@ -62,6 +63,23 @@ so the next format change has a precedent:
   174→316, structure 130→129, decode 17→40, model 321→348; per-target coverage
   rose (recovery 780→892, structure 561→592, model 798→839); zero crashes. The
   24-CPU-hour/target gate clock therefore starts at `2b198e7`.
+- **v7.1 (`d844d5f`, `Mutation::DuplicateMaxLsn` added to F3)** — `structure` only.
+  Adding an enum variant re-maps how existing corpus bytes `Arbitrary`-decode to
+  mutations (still valid inputs, but a stale coverage map — the same hygiene rule
+  as a format change, applied to a mutation-menu change). Regrown (`-max_total_time=300`,
+  278 148 execs, zero crashes) + `cargo fuzz cmin`: **129 → 141** minimized entries,
+  coverage **664 → 681** edges (features 1715 → 1794), 19 entries now reach
+  `DuplicateMaxLsn`. The presence check showed `cmin` had **dropped** the interior
+  `ZeroRecType` shape, so one fuzzer-found seed reaching it was re-added
+  (`54c1894f…`, see below) ⇒ **142** entries.
+  **Gate clock (designer decision):** v7.1 added a recovery-classification arm (the
+  at-`u64::MAX` `Corruption` rule) — a classification change, like `2b198e7` — so the
+  §14.13 clock **resets to `d844d5f`** for the targets that can reach it: **F1
+  `recovery`** (its `Arbitrary` `base_lsn` spans all of `u64`) and **F3 `structure`**
+  (`DuplicateMaxLsn`). **F2 `decode` and F4 `model` carry over** from `2b198e7`: F2's
+  single-record decoder is byte-identical, and F4 has no seed so it cannot construct a
+  `u64::MAX` log. The 24-CPU-h gate was met at `2b198e7` for all four; F1 + F3 re-run
+  pending (~48 CPU-h). `fuzz-gate.yml` defaults `format_baseline` to `d844d5f`.
 
 ## Coverage & regression trust model
 
@@ -90,13 +108,18 @@ Those are the proof. The **fuzzer** additionally starts from that shape: the
 `structure` corpus already carries an interior-`ZeroRecType` entry (verified by
 replaying the target's `arbitrary` decode + record-build + mutation-selection logic
 over the committed corpus — 1 interior-`ZeroRecType` and 11 total-`ZeroRecType`
-entries as of the `2b198e7` regrow). It survives `cmin` because the
-`rec_type→0 → CRC-fail → classify → TornMidLog` path is a **distinct coverage arm**,
-so a coverage-preserving minimization keeps at least one entry reaching it. We
-therefore do **not** commit a redundant hand-authored seed; if a future regrow's
-`cmin` ever drops the shape (re-run the presence check), the two deterministic tests
-above still hold the line, and a fresh interior-`ZeroRecType` seed can be re-added
-then.
+entries as of the `2b198e7` regrow). **Correction (v7.1 regrow):** the shape is
+*not* guaranteed to survive `cmin` — the interior `rec_type→0 → CRC-fail → classify →
+TornMidLog` path shares its coverage with interior `FlipCrc`/`FlipBody` entries, and
+the v7.1 `cmin` dropped it. Per this policy a fresh seed was re-added:
+`corpus/structure/54c1894fb00b53174610d5f00c4c25dbf8b29530`, found by running the
+target with a temporary "panic on interior `ZeroRecType`" hook (the saved artifact is
+the seed), then confirmed against the real target. **Presence check** (re-run after
+every `structure` regrow): temporarily add
+`eprintln!("PRESENCE {:?} interior={}", s.mutation, m < n - 1)` after
+`apply_mutation`, run `cargo +nightly fuzz run structure -- -runs=0`, and
+`grep -o 'PRESENCE.*' | sort | uniq -c`; expect `ZeroRecType interior=true ≥ 1`.
+The two deterministic tests above hold the line regardless.
 
 ## CI
 

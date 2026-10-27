@@ -65,6 +65,16 @@ pub enum WalError {
     /// The handle was poisoned by a prior durability failure (§12). All
     /// subsequent `append`/`commit` calls return this.
     Poisoned,
+
+    /// `append` was called with `last_lsn == u64::MAX`: the LSN space
+    /// `[1, u64::MAX]` is exhausted (v7.1, §7.1).
+    ///
+    /// The log is **full, not broken** — this is **not** a poison condition
+    /// (§12). The handle is left untouched: `last_lsn` and the staged batch are
+    /// unchanged, `commit` of already-appended records still works, reads still
+    /// work, and every further `append` returns `LsnExhausted` again. The
+    /// integrator's recovery path is to rotate to a new log.
+    LsnExhausted,
 }
 
 impl fmt::Display for WalError {
@@ -92,6 +102,7 @@ impl fmt::Display for WalError {
             WalError::FsyncFailed => write!(f, "fsync failed; handle is poisoned"),
             WalError::ContiguityViolation => write!(f, "retained segments are not contiguous"),
             WalError::Poisoned => write!(f, "WAL handle is poisoned by a prior durability failure"),
+            WalError::LsnExhausted => write!(f, "LSN space exhausted (last LSN is u64::MAX)"),
         }
     }
 }
