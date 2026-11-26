@@ -1,7 +1,8 @@
 # Kickoff C — `open-wal-replica` RM3: catch-up / resume (§9)
 
-> **Status: DRAFT, not yet dispatched.** It waits on two things:
-> 1. PR #53 (RM0–RM2) merged to `main`;
+> **Status: DRAFT, not yet dispatched.** #53 (RM0–RM2) merged to `main` on 2026-11-26
+> (`bfca651`). It still waits on:
+> 1. this branch (spec §9–§9.3 and this kickoff) reaching `main`;
 > 2. **the owner's decision on the §16 resumable WAL reader position** (WAL v7.2,
 >    designer-recommended *before* RM3). If it lands first, the dispatched kickoff adds one
 >    scope item ("chunks after the first in a session use `Wal::reader_at`") and T5's bound
@@ -126,6 +127,11 @@ Everything you need from the WAL is on `main`. **Do not touch `open-wal`'s `src/
    - **Keep:** the dense-prefix check.
    - **Replace** the reconnect, hold and status assertions with in-session
      `CatchingUp → Streaming` and convergence.
+
+5. **Fix the vacuous ring test** `capture_at_or_below_released_writes_nothing` (found at the
+   #53 pre-merge review). The consumer is already `NeedsCatchUp`, so its `out` is always
+   empty and the "never overwrites released data" assertion cannot fail. Drain before the bad
+   capture, or inspect the slot. Show it failing on a build that proceeds with the write.
 
 Any other existing test that fails on a correct RM3 build: stop and report it.
 

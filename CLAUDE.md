@@ -113,6 +113,14 @@ The entire value of this component is **correct behavior under crashes and fault
 
 ## Project status (keep this updated)
 
+- **LATEST (2026-11-26): #53 (replica RM0–RM2) MERGED to `main` as `bfca651` (squash), on the owner's instruction after a pre-merge re-review.**
+  - **Re-run on #53 merged with `main`:** replica 58/58, root 174/174, clippy and fmt clean, root `src/` diff empty, loom 8/8 models.
+  - **Fresh independent review** (a reviewer given none of the earlier conclusions; it read every source and test file and ran its own ring stress test): no blocker or major finding. R1, R3, R4, ring memory safety, wire decoding and the writer-thread paths all traced clean.
+  - **Three minor findings, carried into RM3:**
+    1. `ring.rs` test `capture_at_or_below_released_writes_nothing` cannot fail: the consumer is already `NeedsCatchUp`, so `out` is always empty. Fix: drain before the bad capture, or inspect the slot.
+    2. `Receiver`'s `batch_interval` is only checked between frames, so a frame that trickles in delays the ACK of earlier records. Latency only; nothing is acked early or lost.
+    3. Above `ring::MAX_LSN` the capture fast path truncates the tag (safe: replicas go `NeedsCatchUp`), and `next = lsn + 1` overflows at `u64::MAX` (debug panic on the writer). Reachable only by seed. RM3's LSN-domain item closes this.
+  - **Next:** RM3 is still blocked on the owner's WAL v7.2 decision (resumable reader position) and on this branch reaching `main`.
 - **LATEST (2026-10-27, RM3 prep): spec §9 rewritten and kickoff C hardened through adversarial critique. Still DRAFT, not dispatched: it waits on #53's merge.**
   - **Round 1:** a 3-angle critique of the first §9.1/§9.2 draft produced 28 findings. All were re-verified against #53's code at `3ba6f27`: 21 confirmed, 7 narrowed, **0 refuted**. The first draft would have built:
     - a chunk-end attach racing session teardown (stale attach);
