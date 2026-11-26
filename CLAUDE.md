@@ -113,6 +113,17 @@ The entire value of this component is **correct behavior under crashes and fault
 
 ## Project status (keep this updated)
 
+- **LATEST (2026-11-26, v7.2): owner decided WAL Spec v7.2 (resumable reader position) lands BEFORE replica RM3; delta written, critiqued and DISPATCHED.**
+  - **What it is:** `ReaderPos`, `Reader::position()`, `Wal::reader_at(pos)`, and a non-poisoning `WalError::InvalidPosition`. Read-only and additive: no write-path, recovery or format change, D1–D12 untouched, fuzz clocks do not reset.
+  - **Why:** replica catch-up runs on the writer thread and `reader_from` rescans the segment prefix per chunk (measured up to 1.34 s per 32 MiB segment of empty records). With v7.2 only the first chunk of a catch-up pays that skip.
+  - **Contract:** `docs/wal_design_v7_2_delta.md`; kickoff `docs/kickoff_d_wal_v7_2.md` (both on `claude/epic-hopper-2jb32q`, commits `727f78a`, `f8f5a76`).
+  - **Pre-dispatch critique** against the reader code found 1 blocker and 3 majors in the first draft, two confirmed by experiment; all fixed:
+    - a sealed-segment-end position was rejected after a checkpoint deleted that segment ⇒ the segment-base rule;
+    - the "forged positions never lie" guarantee was false (a payload can embed a CRC-valid frame) ⇒ exact equivalence is promised for genuine positions only;
+    - P9 compared `reader_at` only with `reader_from`, so a wrong but self-consistent `position()` passed ⇒ P9 asserts against the test's own model at capture time;
+    - the first `reader_from` of a catch-up still pays one prefix skip ⇒ said so.
+  - **Implementing agent:** `session_0179ehu8ajZVAuiBzjJgBNxt`, based on `main`. It opens a PR; the designer reviews against the diff; the owner merges.
+  - **After v7.2 merges:** revise replica spec §9.1 and kickoff C to carry a `ReaderPos` in the chunk request/answer (fallback to `reader_from` on `InvalidPosition`), run one more critique pass, then dispatch RM3.
 - **LATEST (2026-11-26): #53 (replica RM0–RM2) MERGED to `main` as `bfca651` (squash), on the owner's instruction after a pre-merge re-review.**
   - **Re-run on #53 merged with `main`:** replica 58/58, root 174/174, clippy and fmt clean, root `src/` diff empty, loom 8/8 models.
   - **Fresh independent review** (a reviewer given none of the earlier conclusions; it read every source and test file and ran its own ring stress test): no blocker or major finding. R1, R3, R4, ring memory safety, wire decoding and the writer-thread paths all traced clean.
