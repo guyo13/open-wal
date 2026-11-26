@@ -109,7 +109,10 @@ What v1 does **not** include: a cross-process watermark channel (so
 failover. The crate's responsibility ends at providing committed records in
 order plus a truthful watermark, `oldest_lsn()` (so a shipper can tell
 "serve from the log" from "the replica must re-seed"), a `reader_from` that
-seeks straight to the segment containing `from`, and a cold-start
+seeks straight to the segment containing `from`, a
+[resumable reader position](writing-and-reading.md#resuming-a-reader) so a
+shipper serving catch-up in bounded chunks does not rescan a segment prefix per
+chunk, and a cold-start
 [`seed`](getting-started.md#open-time-options) so a replica can mirror the
 primary's LSN space. Async primary/replica replication on top of those is the
 companion `open-wal-replica` crate's job. See

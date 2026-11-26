@@ -24,6 +24,9 @@
 //! open-time [`OpenOptions`] builder ([`Wal::options`] — a cold-start `seed` and
 //! an `observer`), the live [`Wal::oldest_lsn`] retention floor, and a
 //! [`Wal::reader_from`] that seeks straight to the segment containing `from`.
+//! **Spec v7.2** adds a resumable reader position: [`Reader::position`] reports
+//! where a reader is as an opaque [`ReaderPos`], and [`Wal::reader_at`] starts a
+//! later reader exactly there without rescanning the segment prefix.
 
 // This is an embeddable library; every public item must be documented. With
 // CI's `clippy -D warnings`, an undocumented public item fails the build.
@@ -35,6 +38,8 @@ mod error;
 mod lsn;
 mod observer;
 mod options;
+#[cfg(test)]
+mod position_tests;
 mod reader;
 mod record;
 mod recovery;
@@ -47,7 +52,7 @@ pub use error::{Result, WalError};
 pub use lsn::Lsn;
 pub use observer::{DurabilityObserver, NullObserver};
 pub use options::OpenOptions;
-pub use reader::Reader;
+pub use reader::{Reader, ReaderPos};
 pub use wal::{RecoveryReport, TailState, Wal};
 
 /// Internal hooks exposed **only** under the `fuzzing` feature for the M9
@@ -189,6 +194,24 @@ pub mod fuzzing {
     #[must_use]
     pub fn reader_open_segment(reader: &crate::Reader<'_>) -> Option<Lsn> {
         reader.open_segment_base()
+    }
+
+    /// §14.2 P10 (v7.2 §8.7): build a [`ReaderPos`](crate::ReaderPos) from
+    /// arbitrary fields. The public API has no such constructor — a real
+    /// position only comes from [`Reader::position`](crate::Reader::position) —
+    /// so this is how the property test hands `reader_at` forged positions.
+    #[must_use]
+    pub fn reader_pos(segment_base: u64, offset: u64, next_lsn: u64) -> crate::ReaderPos {
+        crate::ReaderPos::from_parts(Lsn(segment_base), offset, Lsn(next_lsn))
+    }
+
+    /// §14.2 P10 (v7.2): the `(segment_base, offset, next_lsn)` fields of a
+    /// position, so the property test can perturb a real one. An input to the
+    /// test's *generator* only — never its oracle.
+    #[must_use]
+    pub fn reader_pos_parts(pos: &crate::ReaderPos) -> (u64, u64, u64) {
+        let (base, offset, next) = pos.parts();
+        (base.0, offset, next.0)
     }
 
     /// Run the **real** production `recover_segment` (§8.2) over one open segment
