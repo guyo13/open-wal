@@ -36,6 +36,16 @@ exclude = [
     "benches",
 ]
 
+# Workspace: `open-wal` stays the ROOT package (src/, tests/, benches/ untouched)
+# and is the only default member, so every existing `cargo` invocation in CI and
+# scripts/ keeps building/testing exactly `open-wal`. The replication companion
+# crate is a member; build it with `-p open-wal-replica` (or `--workspace`).
+# `fuzz/` is a cargo-fuzz crate that declares its own `[workspace]`; excluding it
+# keeps it standalone.
+[workspace]
+members = ["crates/open-wal-replica"]
+exclude = ["fuzz"]
+
 [features]
 # Test-only NEGATIVE CONTROL for §14.4d (M8): build the writer to deliberately
 # OMIT the directory fsync after a segment roll, so the rolled segment's filename
