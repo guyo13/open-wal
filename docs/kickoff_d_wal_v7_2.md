@@ -30,8 +30,9 @@ every chunk.
   `record::decode`, the sentinel rule, any fsync call, or the on-disk format. If the work
   seems to need one, stop and flag it.
 - `Reader::next`'s behaviour and its zero-allocation hot path stay as they are. The one
-  permitted internal change is keeping the last segment's coordinates when the stream ends
-  cleanly, so that `position()` can report the end.
+  permitted internal change is bookkeeping for `position()`: the reader may record whether
+  its final scan outcome was `CleanEnd`, and keep that segment's index and offset. What
+  `next` returns must not change in any case.
 - **Zero edits to existing tests, benches, bins and fuzz targets.** Run the existing suite
   unchanged before adding any new test, and say so in the PR.
 - Do not touch `crates/open-wal-replica` (RM3 will adopt the API).
