@@ -310,18 +310,21 @@ impl Slot {
     /// A scheduling point for the loom model checker between the `DONE` store
     /// and the unpark; compiled to nothing otherwise.
     ///
-    /// loom switches threads only at atomic operations, and its `unpark` is
-    /// not one — it also joins the unparker's causality into the target at
-    /// once. Without this point no modelled execution has the network thread
-    /// running between the `DONE` store and the unpark, so loom could not see
-    /// a network thread that reads the answer without having `Acquire`d
-    /// `DONE`, or a writer that writes the answer after `DONE` (two §15.7.5
-    /// rows passed L8 / L8b until this was added). Real hardware can preempt
-    /// there. A `Relaxed` load of the writer's own latest store has no
-    /// memory-ordering effect; it only gives loom the branch.
+    /// loom switches threads only at its own operations, and its `unpark` is
+    /// not a branch point — it also joins the unparker's causality into the
+    /// target at once. Without this point no modelled execution has the
+    /// network thread running between the `DONE` store and the unpark, so loom
+    /// could not see a network thread that reads the answer without having
+    /// `Acquire`d `DONE`, or a writer that writes the answer after `DONE` (two
+    /// §15.7.5 rows passed L8 / L8b until this was added). Real hardware can
+    /// preempt there. `yield_now` hands the model's schedule to the network
+    /// thread if it is runnable; it has no memory-ordering effect. (A `Relaxed`
+    /// load of `state` is also a branch point, but loom's partial-order
+    /// reduction treats it as independent of the network thread's load and
+    /// never reorders them: the `Relaxed` row still passed with it.)
     #[cfg(loom)]
     fn loom_preemption_point(&self) {
-        let _ = self.state.load(Ordering::Relaxed);
+        loom::thread::yield_now();
     }
 
     #[cfg(not(loom))]
