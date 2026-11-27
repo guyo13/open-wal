@@ -300,11 +300,33 @@ impl Slot {
         // Release: the answer, the buffer and any attach `f` made are visible
         // to whoever Acquire-observes DONE.
         self.state.store(DONE, Ordering::Release);
+        self.loom_preemption_point();
         if let Some(t) = waker {
             t.unpark();
         }
         Some(ans)
     }
+
+    /// A scheduling point for the loom model checker between the `DONE` store
+    /// and the unpark; compiled to nothing otherwise.
+    ///
+    /// loom switches threads only at atomic operations, and its `unpark` is
+    /// not one — it also joins the unparker's causality into the target at
+    /// once. Without this point no modelled execution has the network thread
+    /// running between the `DONE` store and the unpark, so loom could not see
+    /// a network thread that reads the answer without having `Acquire`d
+    /// `DONE`, or a writer that writes the answer after `DONE` (two §15.7.5
+    /// rows passed L8 / L8b until this was added). Real hardware can preempt
+    /// there. A `Relaxed` load of the writer's own latest store has no
+    /// memory-ordering effect; it only gives loom the branch.
+    #[cfg(loom)]
+    fn loom_preemption_point(&self) {
+        let _ = self.state.load(Ordering::Relaxed);
+    }
+
+    #[cfg(not(loom))]
+    #[inline(always)]
+    fn loom_preemption_point(&self) {}
 
     /// Wait for the answer to the posted request (network thread).
     ///
