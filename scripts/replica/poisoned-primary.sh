@@ -16,6 +16,8 @@
 # ceiling, not a durability test (same caveat as the H3 gate).
 #
 # Usage: scripts/replica/poisoned-primary.sh [build|run]
+#   WAL_REPLICA_FAULT_CARGO_FLAGS   extra `cargo test` flags (e.g. `--release`,
+#                                   to run without debug assertions)
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -24,6 +26,7 @@ SHIM_SRC="${REPO_ROOT}/tests/fault/eio_preload.c"
 SHIM_SO="${BUILD_DIR}/eio_preload.so"
 ARM_FILE="${BUILD_DIR}/fault.arm"
 COUNT_FILE="${BUILD_DIR}/fault.count"
+CARGO_FLAGS="${WAL_REPLICA_FAULT_CARGO_FLAGS:-}"
 
 log() { printf '\033[1;34m[replica/poisoned-primary]\033[0m %s\n' "$*" >&2; }
 die() { printf '\033[1;31m[replica/poisoned-primary] ERROR:\033[0m %s\n' "$*" >&2; exit 1; }
@@ -43,14 +46,16 @@ cmd_run() {
   printf '0\n' > "$COUNT_FILE"
 
   log "building the tests (no preload)"
-  ( cd "$REPO_ROOT" && cargo test -p open-wal-replica --no-run --test poisoned_primary )
+  # shellcheck disable=SC2086  # deliberate word splitting of the extra flags
+  ( cd "$REPO_ROOT" && cargo test ${CARGO_FLAGS} -p open-wal-replica --no-run --test poisoned_primary )
 
   log "running T8b under LD_PRELOAD=$SHIM_SO"
+  # shellcheck disable=SC2086
   ( cd "$REPO_ROOT" && \
     LD_PRELOAD="$SHIM_SO" \
     WAL_FAULT_ARM="$ARM_FILE" \
     WAL_FAULT_COUNT="$COUNT_FILE" \
-    cargo test -p open-wal-replica --test poisoned_primary -- --ignored --test-threads=1 --nocapture )
+    cargo test ${CARGO_FLAGS} -p open-wal-replica --test poisoned_primary -- --ignored --test-threads=1 --nocapture )
 
   local n
   n="$(cat "$COUNT_FILE")"

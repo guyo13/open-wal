@@ -340,7 +340,11 @@ fn t1_overflow_falls_back_in_session_and_cuts_over() {
     assert_eq!(p.sh().replica_status(0), Some(ReplicaStatus::CatchingUp));
     // R4 detection power: an ACK for a catch-up record must arrive while the
     // session is still catching up.
-    r.proxy.wait_ack(chunk_first, 30);
+    wait_until(30, "a forwarded ACK for the first chunk", || {
+        r.proxy.assert_clean();
+        assert_eq!(r.proxy.session_count(), 1, "the session ended mid-catch-up");
+        r.proxy.max_ack() >= chunk_first
+    });
     sample_r4(&p, 0, &r);
 
     // Phase C: the writer keeps appending and committing (3 records per
@@ -379,15 +383,10 @@ fn t1_overflow_falls_back_in_session_and_cuts_over() {
         sample_r4(p, 0, &r);
         p.sh().replica_acked_lsn(0) == Some(w)
     });
-    assert_eq!(p.sh().replica_status(0), Some(ReplicaStatus::Streaming));
-    assert_eq!(
-        p.sh().catch_up_events(0),
-        1,
-        "exactly one overflow was induced"
-    );
+    let (status, episodes) = (p.sh().replica_status(0), p.sh().catch_up_events(0));
     p.stop();
 
-    // Oracles.
+    // Oracles (all independent of the shipper).
     r.proxy.assert_clean();
     assert_eq!(
         r.proxy.session_count(),
@@ -411,6 +410,10 @@ fn t1_overflow_falls_back_in_session_and_cuts_over() {
         assert_eq!(gl.0, *ml, "LSN mirroring");
         assert!(gp == mp, "record {ml} is not byte-identical");
     }
+    // Reachability (shipper-reported; never the oracle): one episode, and the
+    // replica ended up streaming.
+    assert_eq!(status, Some(ReplicaStatus::Streaming));
+    assert_eq!(episodes, 1, "exactly one overflow was induced");
 }
 
 // ---------------------------------------------------------------------------
@@ -728,14 +731,7 @@ fn t4_restart_with_two_lagging_replicas_converges_through_catch_up() {
     p.commit();
     both(&mut p, 60, &a, &b);
     let w = p.wal.durable_lsn();
-    for id in 0..2 {
-        assert_eq!(p.sh().replica_status(id), Some(ReplicaStatus::Streaming));
-    }
-    assert_eq!(
-        saw_catching_up,
-        [true, true],
-        "both replicas must have caught up from the log"
-    );
+    let statuses = [p.sh().replica_status(0), p.sh().replica_status(1)];
     p.stop();
 
     for r in [a, b] {
@@ -754,6 +750,13 @@ fn t4_restart_with_two_lagging_replicas_converges_through_catch_up() {
             .collect();
         assert!(got == p.model, "replica log != the primary's records");
     }
+    // Reachability (shipper-reported; never the oracle).
+    assert_eq!(statuses, [Some(ReplicaStatus::Streaming); 2]);
+    assert_eq!(
+        saw_catching_up,
+        [true, true],
+        "both replicas must have caught up from the log"
+    );
 }
 
 // ---------------------------------------------------------------------------
