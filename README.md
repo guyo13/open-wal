@@ -70,6 +70,26 @@ Reopening the same directory re-runs recovery and hands back a log with exactly
 the committed records — a crash loses at most the appended-but-not-committed
 tail, never anything at or below a `durable_lsn` that `commit` returned.
 
+### Resuming a reader
+
+A consumer that reads in bounded steps can remember where a reader stopped and
+start the next one there, without rescanning the segment prefix that
+`reader_from` has to scan:
+
+```rust,ignore
+let mut reader = wal.reader_from(Lsn(1))?;
+let (lsn, payload) = reader.next().expect("a record")?;
+let pos = reader.position().expect("resumable"); // opaque, `Copy`, borrows nothing
+drop(reader);
+
+wal.append(b"more")?; // the writer keeps going
+wal.commit()?;
+
+let mut reader = wal.reader_at(pos)?; // continues at `pos.next_lsn()`
+```
+
+See the book's "Writing and reading → Resuming a reader" for the rules.
+
 ## The durability model in 30 seconds
 
 The write path has two halves. `append` sequences and buffers a record in

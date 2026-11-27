@@ -75,6 +75,66 @@ appending while a `Reader` is alive — read, drop the reader, then write. (For
 readers that run *concurrently* with the writer — tailing from another thread
 or process — see [External readers](external-access.md).)
 
+## Resuming a reader
+
+`reader_from(from)` finds the segment containing `from` and scans it from its
+start, reading and checksumming every record before `from`. That is fine for a
+one-off replay, but a consumer that reads in **bounded steps** — read a chunk,
+drop the reader so the writer can append and commit, come back — would pay that
+prefix scan again on every step.
+
+Instead, ask the reader where it is before dropping it, and start the next one
+there:
+
+```rust,ignore
+// Step 1: read a bounded chunk, then remember where we stopped.
+let mut reader = wal.reader_from(Lsn(1))?;
+for _ in 0..2 {
+    let (lsn, payload) = reader.next().expect("a record")?;
+    ship(lsn, payload);
+}
+let pos = reader.position().expect("resumable");
+drop(reader); // release the borrow so the writer can run
+
+// The writer keeps going: appends, commits, rolls and checkpoints
+// do not invalidate the position.
+wal.append(b"more")?;
+wal.commit()?;
+
+// Step 2: pick up exactly where we left off — no prefix rescan.
+let mut reader = wal.reader_at(pos)?;
+while let Some(record) = reader.next() {
+    let (lsn, payload) = record?;
+    ship(lsn, payload);
+}
+let pos = reader.position(); // `Some` at a clean end of log: resume later
+```
+
+A `ReaderPos` is a small opaque `Copy` value that borrows nothing, so it
+outlives the reader and any `append`/`commit`/`checkpoint` in between.
+`pos.next_lsn()` tells you which record a resumed reader yields first.
+
+- **`position()` is `Some` at a clean end of log.** Resuming there later yields
+  whatever was committed since. It is `None` only when the reader cannot be
+  resumed: after an error, after the stream ended on an invalid record, or after
+  the very last possible LSN (`u64::MAX`) was yielded.
+- **Right after `reader_from(from)`, before the first `next()`, the position is
+  the start of the containing segment** — the skip to `from` happens inside the
+  first `next()`. A position does not remember `from`.
+- **The retention floor still applies.** If a checkpoint deleted the record the
+  position points at, `reader_at` fails with `ContiguityViolation`, exactly as
+  `reader_from` would.
+- **A position belongs to the log it came from.** Never hand `reader_at` a
+  position taken from another log. Where the WAL can tell — the position does
+  not land on a record carrying the expected LSN — it returns
+  `WalError::InvalidPosition` (which does not poison the handle), and every
+  record a reader yields is still checksummed and LSN-checked. But payloads are
+  opaque bytes, so it cannot always tell: treat a foreign position as a bug in
+  the caller, not as something the WAL will catch for you.
+- **After closing and reopening the directory, discard any position whose
+  `next_lsn()` is above the recovered `durable_lsn + 1`.** It pointed into an
+  uncommitted tail that recovery removed; `reader_at` cannot detect that later.
+
 ## LSNs are yours to correlate
 
 The WAL hands out LSNs; it does not interpret payloads. Typical integrations

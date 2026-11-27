@@ -19,9 +19,9 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Result, WalError};
 use crate::observer::{DurabilityObserver, NullObserver};
-use crate::reader::Reader;
+use crate::reader::{Reader, ReaderPos};
 use crate::recovery;
-use crate::segment::{self, HEADER_SIZE};
+use crate::segment::{self, HEADER_SIZE, ScanOutcome};
 use crate::{Lsn, WalConfig};
 
 /// Outcome of recovery, returned by [`Wal::open`] (§6).
@@ -584,6 +584,97 @@ impl<O: DurabilityObserver> Wal<O> {
             effective_from,
             self.segment_size,
             self.max_record_size,
+        ))
+    }
+
+    /// A streaming replay [`Reader`] that starts exactly at `pos` — a position
+    /// previously returned by [`Reader::position`] on this log — **without
+    /// scanning the segment prefix** (v7.2, §8.7). Costs one segment-file open
+    /// plus one record read, where [`reader_from`](Wal::reader_from) reads and
+    /// CRC-checks every record of the containing segment below `from`.
+    ///
+    /// For a genuine position it yields exactly what
+    /// `reader_from(pos.next_lsn())` yields, and fails with
+    /// [`ContiguityViolation`](WalError::ContiguityViolation) exactly when that
+    /// would (the records were checkpointed away, §15.4). A position stays valid
+    /// across `append`, `commit`, roll and `checkpoint` on the same handle. After
+    /// closing and reopening the directory, discard every position whose
+    /// `next_lsn()` is above the recovered `durable_lsn + 1`.
+    ///
+    /// Any other value (e.g. one from a different log) yields
+    /// [`InvalidPosition`](WalError::InvalidPosition) or a dense (possibly
+    /// empty) run of CRC-valid records starting at `next_lsn` — never a panic,
+    /// never unbounded I/O.
+    /// `InvalidPosition` does not poison the handle.
+    pub fn reader_at(&self, pos: ReaderPos) -> Result<Reader<'_>> {
+        let next = pos.next_lsn;
+
+        // Rule 1 (§8.7): below the retention floor is the same fatal gap as
+        // `reader_from` (§15.4), whatever the rest of the position says.
+        if next < self.oldest_lsn {
+            return Err(WalError::ContiguityViolation);
+        }
+
+        // Rule 2, the segment-base rule: `next_lsn` is the base of live segment
+        // `j` ⇒ start at that segment's first record, exactly as
+        // `reader_from(base_j)` does (which scans no prefix). `segment_base` and
+        // `offset` are ignored, which is what keeps a sealed-segment-end position
+        // valid after `checkpoint` deletes the segment it names.
+        if let Ok(j) = self.segments.binary_search(&next) {
+            let first = File::open(self.dir.join(segment::filename_for(next)))?;
+            return Ok(Reader::new(
+                &self.dir,
+                &self.segments,
+                j,
+                first,
+                next,
+                self.segment_size,
+                self.max_record_size,
+            ));
+        }
+
+        // Rule 3: structural checks.
+        let Ok(i) = self.segments.binary_search(&pos.segment_base) else {
+            return Err(WalError::InvalidPosition);
+        };
+        if pos.offset < HEADER_SIZE || pos.offset > self.segment_size || pos.offset % 8 != 0 {
+            return Err(WalError::InvalidPosition);
+        }
+        // The equal cases were taken by rule 2.
+        if next <= pos.segment_base || self.segments.get(i + 1).is_some_and(|&b| next >= b) {
+            return Err(WalError::InvalidPosition);
+        }
+
+        // Rule 4: one bounded read at `offset` (the reader's own scanner).
+        let file = File::open(self.dir.join(segment::filename_for(pos.segment_base)))?;
+        let mut buf = Vec::new();
+        let ok = match segment::read_record_at(
+            &file,
+            pos.offset,
+            self.segment_size,
+            self.max_record_size,
+            &mut buf,
+        )? {
+            ScanOutcome::Record { lsn, .. } => lsn == next,
+            // A genuine end of log: the active segment, past everything durable.
+            // On a non-poisoned handle the file holds exactly the records
+            // `≤ durable_lsn` (staged records are not in it).
+            ScanOutcome::CleanEnd => i + 1 == self.segments.len() && next > self.durable_lsn,
+            ScanOutcome::Invalid => false,
+        };
+        if !ok {
+            return Err(WalError::InvalidPosition);
+        }
+        Ok(Reader::new_at(
+            &self.dir,
+            &self.segments,
+            i,
+            file,
+            pos,
+            next,
+            self.segment_size,
+            self.max_record_size,
+            buf,
         ))
     }
 
