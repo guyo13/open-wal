@@ -115,6 +115,12 @@ The entire value of this component is **correct behavior under crashes and fault
 
 ## Project status (keep this updated)
 
+- **LATEST (2026-11-27, RM3): replica RM3 DISPATCHED.**
+  - **Contract:** `docs/replica_design_v1.md` §9–§9.3 and `docs/kickoff_c_replica_rm3.md` on `claude/epic-hopper-2jb32q` at `6fa37c1` (the agent copies both files; this branch has no PR).
+  - **v7.2 revision:** a Chunk answer returns the reader's `ReaderPos`, the network thread sends it back, and the writer uses `reader_at` only when `pos.next_lsn() == cursor`. Only the first chunk of a catch-up episode pays the segment-prefix scan. A reader started by `reader_at` can never cause a sticky ReadFailed (retry once with `reader_from`).
+  - **Fourth critique pass** (independent, against the real reader code): no gap, duplicate, above-`released` or spurious-failure case found. Two test rows could not fail (T18(a) masked by the retry; the drop-on-resume rule had no observable) and were fixed or removed; wording fixes folded in. T18(b)'s dev-dependency `fuzzing` feature was confirmed buildable by experiment.
+  - **Residual, documented:** the first chunk of each episode can still stall the writer for one segment scan (§16 "chunked first skip", not planned).
+  - **Implementing agent:** `session_0179ehu7VN6DNwEDTDecEwd8`, based on `main`. It opens a PR; the designer reviews against the diff and re-derives the mutation rows; the owner merges.
 - **LATEST (2026-11-27): v7.2 MERGED (#56, `a0c47bb`); LazyFS CI gate FIXED and made BLOCKING (#57, `bdebdc2`); mutation-row automation parked as issue #58.**
   - **#56 (Spec v7.2):** designer review against the diff. Zero edits to existing tests; no write-path or recovery change; 191 root tests (194 with `fuzzing`); P9/P10 green at 2,000 cases. Nine mutations re-derived by the reviewer: eight fail their designated test, and the ninth (dropping the offset bounds check) is caught by a unit test, not P10, as the delta predicted. Rebased onto `main` at the owner's request before merge (15/15 checks).
   - **#57 (LazyFS):** the hosted runner's CMake (>= 4) rejected LazyFS's pinned `toml` dependency, so the gate had not run since the cached build expired (last green 2026-10-27; red on `main` at `bfca651`). Fix: `CMAKE_POLICY_VERSION_MINIMUM=3.5` in `scripts/lazyfs-gate.sh build`. Owner decision: the "Run the gate" step is no longer `continue-on-error`. Confirmed from the job log: LazyFS built cold and 7 + 4 power-loss tests passed. Not shown: the blocking step going red on a real test failure.
