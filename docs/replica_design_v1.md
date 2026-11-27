@@ -431,10 +431,15 @@ stall the writer for the whole lag and buffer it in memory. Therefore:
      into the replica's chunk buffer, always taking at least one record, while all of these
      hold:
      - `lsn ≤ released`;
-     - the chunk's size stays within `catchup_chunk_bytes`. The size counts **each record as
+     - the size accumulated so far is `< catchup_chunk_bytes`. This is checked **before**
+       each read, because a payload's length is unknown until it is read; a chunk may
+       therefore exceed the budget by at most one record. The size counts **each record as
        `payload.len() + 32` bytes**: the WAL's 20-byte header and padding on the read side,
        and the 17-byte `RECORD` frame on the wire;
-     - the record count stays within `catchup_chunk_records`.
+     - the record count so far is `< catchup_chunk_records`.
+
+     Every record read is shipped. Reading a record and then discarding it for budget
+     would leave the reader's position one record past the chunk.
 
      Reading costs two `pread`s per record, so a log of tiny payloads is bounded by the
      record cap, not the byte budget.
@@ -453,21 +458,28 @@ stall the writer for the whole lag and buffer it in memory. Therefore:
   chunk after the first.
   - The writer still keeps no per-session state. The position travels in the handshake: a
     Chunk answer returns it, and the network thread sends it back in its next chunk request.
-  - The network thread keeps a position only within one catch-up episode. It drops it when
-    the session ends, and when it resumes the ring consumer. A fall-back from the ring
-    (§9.2) therefore starts with no position.
+  - A Chunk answer is **Chunk{records, attached}** or **Chunk{records, pos}**: a position
+    is returned exactly when the replica must ask for another chunk.
+  - The network thread keeps its copy of the latest `pos` for the rest of the session,
+    across Wait and Deferred re-posts, and sends it with every chunk request. It drops it
+    when the session ends.
   - The writer uses `pos` only if `pos.next_lsn() == cursor`. Otherwise it ignores it and
-    uses `reader_from(cursor)`.
+    uses `reader_from(cursor)`. This check is what makes a stale position harmless: after
+    a cutover and a ring fall-back, the kept position no longer matches the cursor unless
+    the ring served nothing, in which case it is still correct.
   - `reader_at(pos)` results:
     - `Ok` ⇒ read from it;
     - `ContiguityViolation` ⇒ **BelowOldest**, exactly as for `reader_from`;
-    - `InvalidPosition` ⇒ fall back to `reader_from(cursor)` for this answer. This is not
-      expected for a position this shipper handed out, so count it (observability) but do
-      not fail.
+    - `InvalidPosition`, or any other `Err` (e.g. an I/O error opening the segment) ⇒ fall
+      back to `reader_from(cursor)` for this answer; that result decides. This is not
+      expected for a position this shipper handed out.
   - **A reader started by `reader_at` never causes a sticky failure by itself.** If it
     yields `None`, an `Err`, or an unexpected LSN below the ceiling, the writer discards
     what that reader produced and retries the answer once with `reader_from(cursor)`. Only
     the `reader_from` result can lead to ReadFailed.
+  - Both fallbacks bump one `#[doc(hidden)]` read-only counter,
+    `Shipper::position_fallbacks()`. It is observability, and reachability evidence for the
+    position-safety test; it is never an oracle.
   - A position is valid across `append`, `commit`, roll and `checkpoint` on the same `Wal`
     handle (WAL §8.7). After an in-process WAL reopen, the WAL requires positions with
     `next_lsn > durable_lsn + 1` to be discarded. Every position here has
@@ -537,7 +549,7 @@ stall the writer for the whole lag and buffer it in memory. Therefore:
   - **Every later chunk of the episode** uses `reader_at(pos)` and costs at most:
     - **bytes:** `catchup_chunk_bytes + 2 · max framed record` (`reader_at` validates the
       first record, and `Reader::next` then reads it again);
-    - **syscalls:** `2 · catchup_chunk_records + 2`.
+    - **syscalls:** `2 · catchup_chunk_records + 2`, plus one per segment boundary crossed.
   - An episode is one run of catch-up for one replica: from a join that needs the log, or
     from a ring fall-back, until the cutover.
   - `poll` opens a reader for at most `catchup_replicas_per_poll` replicas, round-robin
@@ -656,7 +668,7 @@ network thread posts and the writer answers in a later `poll`.
   - The writer touches the slot only between `TAKEN` and `DONE`.
   - The network thread touches it only in `IDLE`, or after it has observed `DONE`.
   - The slot lives in its own module, written against the crate's loom-swappable
-    primitives. The answer and the chunk buffer sit in `crate::sync::UnsafeCell`, so loom
+    primitives. The request, the answer and the chunk buffer sit in `crate::sync::UnsafeCell`, so loom
     reports any unsynchronized access (the §15.7.2 analogue). The module is built under
     `--cfg loom`; `shipper.rs` is not.
   - The slot holds the network thread's waker, registered once.
@@ -814,9 +826,12 @@ fixed slots — and `max_reconnect_backoff`, `io_timeout`, `send_batch`.)* **`Re
   ring-overflow, **§15.7 loom L1–L6 + all falsifiability mutations** (gate — do not start RM3
   until the ring's cross-thread barrier is model-checked).*
 - **RM3** — catch-up (§9, §9.1–§9.3) using WAL v7 `oldest_lsn()` + containing-segment
-  `reader_from`: the request/answer handshake, chunked catch-up under the `released` ceiling,
-  in-session overflow fall-back, the ring LSN domain (pulled forward from RM4).
-  *§15.3 catch-up, §15.2 P5, §15.7 L7/L7b/L8.*
+  `reader_from` and v7.2 `Reader::position` / `reader_at`: the request/answer handshake,
+  chunked catch-up under the `released` ceiling, in-session overflow fall-back, the ring LSN
+  domain (pulled forward from RM4). Adds `ShipperConfig` `catchup_chunk_bytes`,
+  `catchup_chunk_records`, `catchup_replicas_per_poll`, and `ReplError`
+  `PrimaryLogUnreadable{lsn}`, `LsnDomainExhausted`.
+  *§15.3 catch-up, §15.2 P5, §15.7 L7/L7b/L8/L8b.*
 - **RM4** — re-seed traits + `options().seed(..)` cold start; re-seed loop guard. *§15.3 re-seed.*
 - **RM5** — checkpoint policy helper + promotion runbook + former-primary rejection (§12.2).
   *§15.3 promotion, rejoin-rejected.*
@@ -1013,9 +1028,10 @@ very interleavings we want explored).
     eager `unpark` causality (§15.7.8).
   - End state: the consumer's cursor is `PARKED` (no stale attach) and the slot is `IDLE`.
     Loom reports no race on the slot's answer or buffer.
-- **L8b Answer handoff (RM3, §9.3).** The writer runs `post → answer`, writing the buffer;
-  the network thread runs `await_answer → read buffer`. Assert: no race, and the buffer
-  read equals what `f` wrote.
+- **L8b Request and answer handoff (RM3, §9.3).** The network thread `post`s a request
+  (with a `pos`) and runs `await_answer → read buffer`. The writer runs `answer`, whose `f`
+  reads the request and writes the buffer. Assert: no race, `f` saw exactly the posted
+  request, and the buffer read equals what `f` wrote.
 
 #### 15.7.5 Falsifiability — REQUIRED, each mutation demonstrated to fail, then reverted
 The gate is only meaningful if it can fail. Apply each mutation, run the corresponding model,
@@ -1040,6 +1056,7 @@ confirm loom reports a race or an assertion trips, revert, and record it in the 
 | *(RM3)* Network thread does not wait for `DONE` when the CAS fails | **L8** |
 | *(RM3)* Writer writes the answer **after** storing `DONE` | **L8** (loom `UnsafeCell` race) |
 | *(RM3)* `await_answer`'s `DONE` load `Acquire` → `Relaxed` | **L8b** (loom `UnsafeCell` race) |
+| *(RM3)* `post` stores `PENDING` before it writes the request | **L8b** (loom `UnsafeCell` race) |
 | *(RM3)* `abandon` gives up after a bounded wait while `TAKEN` | **std unit test** of the slot module, not loom. Loom always schedules the writer within the bound. The test runs `answer` with an `f` that signals, then sleeps 300 ms, then attaches; `abandon` called meanwhile must return only after `f` finishes, with the cursor `PARKED` and the slot `IDLE`. |
 
 If a mutation does **not** make its model fail, the model is too weak — fix the model, do
