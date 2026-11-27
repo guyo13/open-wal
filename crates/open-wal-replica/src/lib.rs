@@ -32,9 +32,14 @@ pub mod ring;
 #[cfg(not(loom))]
 mod shipper;
 // The §9.3 request slot is built under `cfg(loom)` too (models L8 / L8b drive
-// it); it is public only so `tests/loom_ring.rs` can.
+// it). Its methods are safe `&self` methods whose soundness depends on which
+// thread calls them, so it is NOT part of the crate's API: it is `pub` only
+// under `cfg(loom)`, where `tests/loom_ring.rs` is its one external user.
+#[cfg(loom)]
 #[doc(hidden)]
 pub mod slot;
+#[cfg(not(loom))]
+pub(crate) mod slot;
 mod sync;
 pub mod wire;
 

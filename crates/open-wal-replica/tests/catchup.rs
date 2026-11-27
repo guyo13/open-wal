@@ -432,7 +432,14 @@ fn t1_overflow_falls_back_in_session_and_cuts_over() {
     // Reachability (shipper-reported; never the oracle): one episode, and the
     // replica ended up streaming.
     assert_eq!(status, Some(ReplicaStatus::Streaming));
-    assert_eq!(episodes, 1, "exactly one overflow was induced");
+    // `>= 1`, not `== 1`: a shipper counter is never an oracle, and a second
+    // episode is legitimate (the cutover can land on the ring's oldest
+    // record, which the next capture evicts — §9.2). That the fall-back was
+    // in-session is the proxy's session count, asserted above.
+    assert!(
+        episodes >= 1,
+        "the induced overflow must have caused a catch-up episode"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1137,6 +1144,95 @@ fn t6_checkpoint_mid_catch_up_ends_the_session_and_demands_a_reseed() {
         got == p.expect(1, c - 1),
         "the replica log must be exactly d + 1..=c − 1"
     );
+}
+
+/// T6b (review of #59, Required 2). After BelowOldest the primary half-closes
+/// and waits for the replica's EOF. A peer that never closes and keeps sending
+/// ACKs must not pin the network thread: the drain has a deadline
+/// (`io_timeout`), after which the session is torn down — so the next HELLO
+/// is answered `RESEED_REQUIRED`, and `Shipper::shutdown` returns promptly even
+/// while the peer is still ACKing.
+fn t6b_run(check_shutdown: bool) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    const IO: Duration = Duration::from_millis(400);
+    let mut p = Prim::open(SMALL);
+    p.fill(600, 64, 30);
+    let fake = Fake::new(256);
+    let mut cfg = ship_cfg(vec![fake.addr()]);
+    cfg.ring_bytes = 8 * 256;
+    cfg.catchup_chunk_records = 5;
+    cfg.io_timeout = IO;
+    p.start(cfg);
+    let mut c = fake.hello(0);
+    assert_eq!(join(&mut p, 0, &mut c), Saw::Serving { from: 1, oldest: 1 });
+    p.await_request(0);
+    p.poll(); // one chunk: 1..=5
+    assert_eq!(c.drain_records(Duration::from_millis(100)).len(), 5);
+    p.await_request(0);
+    p.wal.checkpoint(Lsn(500)).unwrap();
+    let oldest = p.wal.oldest_lsn().0;
+    assert!(oldest > 6);
+    p.poll(); // BelowOldest: the primary sends a FIN
+    assert_eq!(c.next_data(Duration::from_secs(5)), Saw::Eof, "the FIN");
+
+    // The peer does not close; it ACKs every 20 ms.
+    let stop = Arc::new(AtomicBool::new(false));
+    let st = Arc::clone(&stop);
+    let acker = std::thread::spawn(move || {
+        while !st.load(Ordering::Acquire) {
+            c.ack(1);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(c);
+    });
+    let bound = IO + Duration::from_secs(3);
+    let outcome: Result<(), String> = if check_shutdown {
+        let sh = p.sh.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let t = Instant::now();
+        std::thread::spawn(move || {
+            sh.shutdown();
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(bound)
+            .map_err(|_| format!("Shipper::shutdown did not return within {bound:?}"))
+            .map(|()| eprintln!("T6b: shutdown returned after {:?}", t.elapsed()))
+    } else {
+        let t = Instant::now();
+        match fake.try_hello(5, bound) {
+            None => Err(format!(
+                "no new session within {bound:?}: the peer's ACKs pinned the old one"
+            )),
+            Some(mut c2) => match next_polling(&mut p, &mut c2, 10) {
+                Saw::Reseed { oldest: o } if o == oldest => {
+                    eprintln!("T6b: RESEED_REQUIRED after {:?}", t.elapsed());
+                    Ok(())
+                }
+                other => Err(format!(
+                    "expected RESEED_REQUIRED{{{oldest}}}, got {other:?}"
+                )),
+            },
+        }
+    };
+    // Release the old connection before failing, so a failure is a failure
+    // and not a hang in `Drop`.
+    stop.store(true, Ordering::Release);
+    acker.join().unwrap();
+    if let Err(e) = outcome {
+        panic!("{e}");
+    }
+    p.stop();
+}
+
+#[test]
+fn t6b_a_peer_that_keeps_acking_after_the_fin_still_gets_reseed_required() {
+    t6b_run(false);
+}
+
+#[test]
+fn t6b_a_peer_that_keeps_acking_after_the_fin_cannot_hang_shutdown() {
+    t6b_run(true);
 }
 
 // ---------------------------------------------------------------------------

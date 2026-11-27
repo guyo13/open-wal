@@ -436,7 +436,8 @@ impl Slot {
         self.state.load(Ordering::Acquire) == PENDING && self.join.load(Ordering::Relaxed)
     }
 
-    /// Whether no request is outstanding.
+    /// Whether no request is outstanding. Tests and loom models only.
+    #[cfg(any(test, loom))]
     #[must_use]
     pub fn is_idle(&self) -> bool {
         self.state.load(Ordering::Acquire) == IDLE

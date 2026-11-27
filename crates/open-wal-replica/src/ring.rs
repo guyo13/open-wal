@@ -200,13 +200,14 @@ pub fn ring(cfg: RingConfig, next: Lsn, released: Lsn) -> (Producer, Vec<Consume
 pub enum AttachError {
     /// The consumer is still attached (it must detach first).
     AlreadyAttached,
-    /// `from` is past `released + 1`: the replica claims records the primary
-    /// has not durably committed (§9 step 2 — a former primary, or a bug).
+    /// `from` is past `released + 1`: nothing at `from` is shippable yet. The
+    /// shipper makes that replica **wait** until `released ≥ from − 1`; it is
+    /// never a rejection (§9: step 2 alone rejects, on `wal.durable_lsn()`).
     Ahead {
         /// The current released watermark.
         released: Lsn,
     },
-    /// `from` is older than the ring retains; serve it from the log (§9, RM3).
+    /// `from` is older than the ring retains; serve it from the log (§9.1).
     Behind {
         /// The oldest LSN the ring can still serve contiguously.
         oldest: Lsn,

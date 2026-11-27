@@ -169,7 +169,9 @@ fn run_primary(ops: &[Op], release_on_capture: bool) -> Option<String> {
     wait_until(30, "replica to ack the primary's durable watermark", || {
         sh.poll(&wal).unwrap();
         check(&wal, &sh);
-        sh.replica_acked_lsn(0) == Some(w)
+        // Also wait for Streaming: with zero records `acked == w == 0` holds
+        // before the replica has even connected (review of #59, Required 3).
+        sh.replica_acked_lsn(0) == Some(w) && sh.replica_status(0) == Some(ReplicaStatus::Streaming)
     });
     assert_eq!(sh.replica_status(0), Some(ReplicaStatus::Streaming));
     sh.shutdown();

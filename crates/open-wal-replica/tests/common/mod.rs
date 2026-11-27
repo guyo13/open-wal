@@ -794,6 +794,37 @@ impl Fake {
         c
     }
 
+    /// Like [`hello`](Self::hello), but gives up after `timeout` if the primary
+    /// does not connect.
+    pub fn try_hello(&self, durable: u64, timeout: Duration) -> Option<FakeConn> {
+        self.listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + timeout;
+        let stream = loop {
+            match self.listener.accept() {
+                Ok((s, _)) => break s,
+                Err(_) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(_) => {
+                    self.listener.set_nonblocking(false).unwrap();
+                    return None;
+                }
+            }
+        };
+        self.listener.set_nonblocking(false).unwrap();
+        stream.set_nonblocking(false).unwrap();
+        let mut c = FakeConn {
+            rd: FrameReader::new(stream.try_clone().unwrap(), Limits::new(self.max_payload)),
+            stream,
+        };
+        c.send(&Frame::Hello {
+            proto_ver: PROTO_VERSION,
+            replica_id: 9,
+            durable_lsn: Lsn(durable),
+        });
+        Some(c)
+    }
+
     /// How many further connections the primary has opened (non-blocking):
     /// an independent count of reconnects.
     pub fn pending_connections(&self) -> usize {

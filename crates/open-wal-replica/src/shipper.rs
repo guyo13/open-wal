@@ -1012,9 +1012,22 @@ fn session(
         match &end {
             Ok(Served::BelowOldest) => {
                 // A FIN and no ERR: the replica sees a clean end, commits and
-                // acks what it has, and closes; the ack reader then sees EOF
-                // (the scope waits for it, bounded by its read timeout).
+                // acks what it has, and closes; the ack reader then sees EOF.
                 let _ = stream.shutdown(Shutdown::Write);
+                // The drain has a deadline. The ack reader's read timeout
+                // restarts on every frame, so a peer that never closes and
+                // keeps sending ACKs would otherwise pin this thread — and
+                // with it `Shipper::shutdown` / `Drop` on the writer thread
+                // (§4.2) — and never be answered RESEED_REQUIRED.
+                let deadline = Instant::now() + cfg.io_timeout;
+                while !dead.load(Ordering::Acquire) && !net.shutdown.load(Ordering::Acquire) {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    thread::park_timeout(deadline - now); // the ack reader unparks us
+                }
+                let _ = stream.shutdown(Shutdown::Both);
             }
             Ok(Served::Closed) => {
                 let _ = stream.shutdown(Shutdown::Both);
@@ -1161,6 +1174,7 @@ impl Serving<'_> {
                                     got: cursor,
                                 });
                             }
+                            *chunk = Vec::new();
                             self.resume_at(consumer, cursor)?;
                             set_status(r, ReplicaStatus::Streaming);
                             Mode::Stream
@@ -1177,6 +1191,9 @@ impl Serving<'_> {
                             }
                             match end {
                                 ChunkEnd::Attached => {
+                                    // Catch-up is over: keep one chunk-sized
+                                    // buffer per replica (the slot's), not two.
+                                    *chunk = Vec::new();
                                     self.resume_at(consumer, next)?;
                                     set_status(r, ReplicaStatus::Streaming);
                                     Mode::Stream
