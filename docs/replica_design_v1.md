@@ -1,10 +1,41 @@
 # `open-wal-replica` — Design, Implementation & Test Specification
 
 **Status:** Draft **v1** — async master/slave, static primary, no election, no sharding.
-**Depends on:** `open-wal` at **spec v7** (`Wal::options().seed(..)` cold-start seed,
-`oldest_lsn()`, containing-segment `reader_from`). Do not begin RM3+ until the v7 WAL delta has landed.
+**Depends on:** `open-wal` at **spec v7.2**: v7's `Wal::options().seed(..)` cold-start seed,
+`oldest_lsn()` and containing-segment `reader_from`; v7.1's `checked_next`; and v7.2's
+resumable reader position (`Reader::position`, `Wal::reader_at`), which RM3's catch-up uses.
+All three have landed on `main`.
 **Intended audience:** a coding agent implementing the crate, plus a human reviewer.
 **Crate name:** `open-wal-replica` (owner's call; the name is not load-bearing).
+**Revisions:** 2026-10-27 — §9 step 2 off-by-one fixed: the "ahead of the primary" test is
+`d > durable_lsn` (as §12.2 always said), not `d + 1 > durable_lsn`, which rejected every
+fully caught-up replica as a former primary. 2026-10-27 (RM3 prep) — §9 step 3 now requires
+**bounded, chunked** catch-up (§9.1) with an explicit cutover rule and ring-sizing constraint
+(§9.2). The old step 3 copied the whole lag range in one writer-thread call, an unbounded
+writer stall and memory spike for a replica gigabytes behind. 2026-10-27 (RM3 prep, after an
+adversarial critique, each finding re-verified against the RM2 code) — §9 rewritten:
+- a request/answer writer↔network handshake (§9.3), so an attach can never race a session
+  teardown;
+- a serve ceiling of `released` (R1's own watermark), with `Ahead` ⇒ wait, never reject;
+- below-oldest ⇒ close and re-HELLO, so R6 still answers at join;
+- loud, sticky failure on an unreadable committed record;
+- in-session fall-back on ring overflow;
+- an honest writer-stall bound (the containing-segment rescan);
+- a normative `poll(wal)` cadence;
+- the ring LSN domain enforced at RM3.
+
+Hardened over three critique rounds (28 + 27 + 32 findings). Rounds 2–3 added:
+- joins that never read;
+- a Deferred answer;
+- framed and record-capped chunk budgets;
+- per-record stall accounting (measured);
+- data-level-only stickiness;
+- an `abandon` that never gives up;
+- a session-level heartbeat timer;
+- the §16 resumable-reader recommendation.
+
+2026-11-27 — WAL v7.2 landed, so §9.1 now carries a `ReaderPos` between chunks: only the
+first chunk of a catch-up episode pays the segment-prefix scan.
 
 This is a build contract in the same style as the WAL spec: invariants are normative,
 tests are co-equal deliverables, and **the crate is "done" only when its fault-injection tests
@@ -125,7 +156,7 @@ on the network.
 |---|---|---|---|---|
 | `capture(lsn, payload)` | **writer** (after `append`) | no (just the lsn) | **never** | one bounded memcpy into a ring slot |
 | `on_commit(w)` | **writer** (after `commit` Ok) | no | **never** | Release-store `released = w` + one wake; **sends nothing** |
-| Catch-up read (§9) | **writer** | **yes** (`reader_from`) | I/O, bounded by lag | rare; copies range to the net queue |
+| Catch-up read (§9) | **writer**, inside `poll(wal)` | **yes** (`reader_from`) | I/O, bounded per call (§9.1) | ≤ one containing-segment prefix + one chunk per opened reader; ≤ `catchup_replicas_per_poll` readers per `poll` |
 | Drain ring → send `RECORD` | **network** (one per replica) | no | yes (socket) | none |
 | Read `ACK`/`HEARTBEAT`, reconnect/backoff | **network** | no | yes | none |
 | Slot free (all cursors passed) | **writer** (on `capture`, lazily) | no | never | Acquire-load of consumer cursors |
@@ -183,6 +214,10 @@ Each maps to tests in §15.
 - **A former primary MUST be re-seeded, never resumed as a replica** (§12.2). It may hold
   durable records beyond the new primary — the *only* divergence case v1 admits — and v1
   has no suffix-truncate, so wipe-and-reseed is the only safe path.
+- **The primary detects a returning former primary only while it is ahead.** §9 step 2
+  rejects a HELLO with `durable_lsn > primary.durable_lsn`. Once the new primary's log passes
+  that value, an un-wiped former primary looks like an honest replica and is served on top of
+  its divergent tail. The operator wipe (§12.2) is the guard; step 2 is a tripwire (§16).
 - **Ring overflow drops nothing durable** — it only forces a catch-up from the log (§8.3).
 
 ---
@@ -196,7 +231,7 @@ HELLO; unknown type ⇒ `ERR(Protocol)`.
 |---|---|---|---|
 | `HELLO` | R→P | `proto_ver:u16, replica_id:u64, durable_lsn:u64` | "I am durable to `durable_lsn`; serve me from `+1`." Sent on every (re)connect. |
 | `SERVING` | P→R | `from_lsn:u64, primary_oldest:u64` | Primary will stream from `from_lsn` (= `durable_lsn+1`). |
-| `RESEED_REQUIRED` | P→R | `primary_oldest:u64` | `durable_lsn+1 < oldest_lsn` (R6). Replica must re-seed (§10). |
+| `RESEED_REQUIRED` | P→R | `primary_oldest:u64` | `durable_lsn+1 < oldest_lsn` (R6). Replica must re-seed (§10). Only ever sent **in place of** `SERVING`; a mid-stream below-oldest ends the session instead, and the re-HELLO gets this frame (§9.1). |
 | `RECORD` | P→R | `lsn:u64, crc:u32, payload:[u8]` | One record; `crc = crc32c(lsn ‖ payload)`. Strictly ascending `lsn`. |
 | `ACK` | R→P | `durable_lsn:u64` | Replica's durable watermark (R4). Monotonic. |
 | `HEARTBEAT` | both | `durable_lsn:u64` | Keepalive; carries the sender's watermark. |
@@ -284,7 +319,13 @@ fallback allocation — document it). The record is **not shippable yet**.
 thread MUST only ever send entries with `lsn ≤ released_watermark`. It MUST NOT be called on
 `commit() → Err` (the handle is poisoned; captured-but-unreleased entries are discarded on
 reopen — they were never durable-acknowledged, and any that *were* durable in a split batch
-are recovered by the replica's catch-up from the log, §9).
+are recovered by the replica's catch-up from the log, §9). A `Shipper` MAY outlive an in-process
+WAL reopen: `capture` discards the stale captured-but-unreleased tail on re-capture (§8.1, as
+built). After the reopen, and before the next `append`, the integrator MUST call
+`shipper.on_commit(wal.commit()?)`. An empty `commit()` on the reopened handle returns
+`Ok(durable_lsn)`, so this releases the split-batch survivors under R1's own wording. A new
+`Shipper` built after a process restart starts at `released = wal.durable_lsn()` and needs
+nothing extra.
 
 ### 8.3 Network thread & overflow — never block the writer
 - Drains shippable entries per replica cursor, sends `RECORD`s, reads `ACK`s, updates
@@ -293,18 +334,22 @@ are recovered by the replica's catch-up from the log, §9).
 - **Overflow rule:** if `capture` finds the ring full, it MUST evict the oldest slot and mark
   every replica whose cursor still pointed at it as **`NeedsCatchUp`**. It MUST NOT block, MUST
   NOT drop the capture of the *new* record, and MUST NOT affect `append`/`commit`. A
-  `NeedsCatchUp` replica is served from the log (§9) then rejoins the ring. Nothing durable is
-  ever lost by overflow — the log is the source of truth; the ring is a fast path.
-- Disconnected replicas are simply `NeedsCatchUp` on reconnect (R7).
+  `NeedsCatchUp` replica falls back, **within its session**, to catch-up from the log (§9.1),
+  then cuts back over to the ring (§9.2). There is no reconnect. Nothing durable is ever lost
+  by overflow: the log is the source of truth and the ring is a fast path.
+- A disconnected replica re-HELLOs and is caught up from its `durable_lsn` (R7, §9).
 
 ### 8.4 Shipper API surface (informative shape)
 ```rust
 pub struct Shipper { /* ring, cursors, acked map, net handles */ }
 impl Shipper {
-    pub fn new(cfg: ShipperConfig) -> Self;
+    pub fn new(cfg: ShipperConfig, wal: &Wal<O>) -> Result<Self>;  // Err past ring::MAX_LSN (§9.2)
     pub fn capture(&mut self, lsn: Lsn, payload: &[u8]);          // after append
-    pub fn on_commit(&mut self, durable: Lsn);                     // after commit Ok
-    pub fn serve_catchup(&mut self, wal: &Wal<O>, replica: ReplicaId) -> Result<()>; // §9
+    pub fn on_commit(&mut self, durable: Lsn);                     // after commit Ok: release + wake only
+    pub fn poll(&mut self, wal: &Wal<O>) -> Result<()>;            // §9: joins + catch-up; MUST be called
+                                                                   // after every on_commit and ≥ once per
+                                                                   // heartbeat when idle (§9.1 cadence)
+    pub fn catching_up(&self) -> usize;                            // replicas in CatchingUp (poll faster)
     pub fn min_replica_acked_lsn(&self) -> Option<Lsn>;            // §11 checkpoint policy
     pub fn replica_acked_lsn(&self, id: ReplicaId) -> Option<Lsn>; // §13 sync surface
 }
@@ -314,22 +359,365 @@ impl Shipper {
 
 ## 9. Catch-up / resume (NORMATIVE)
 
-Triggered by a replica `HELLO{durable_lsn = d}` (fresh connect, reconnect, or after ring
-overflow). On the **writer thread** (it needs `&Wal`):
+Triggered by a replica `HELLO{durable_lsn = d}` on every (re)connect.
+- A HELLO with `d ≥ ring::MAX_LSN` lies outside the crate's LSN domain (§9.2). The network
+  thread refuses it with `ERR(Protocol, "LSN domain exhausted")` and does not post a join.
+- Otherwise the network thread posts a **join request** carrying `d`. The writer thread
+  answers it inside `Shipper::poll(&mut self, wal)`, because the decision needs `&Wal`
+  (§9.3).
+
+Let `released` be the ring's released watermark, `Producer::released()`.
+- It is the latest `on_commit(w)`, **clamped to the last captured LSN**, or
+  `wal.durable_lsn()` at `Shipper::new`.
+- Use the clamped value, never the raw `w`. The ring clamps, and a raw `w` above the last
+  capture would make the "impossible" `Ahead` reachable.
 
 1. If `d + 1 < wal.oldest_lsn()` ⇒ send `RESEED_REQUIRED{oldest}` (R6). Stop.
-2. Else if `d + 1 > wal.durable_lsn()` ⇒ replica claims more than we have durably. This can
-   only be a **former primary or a bug** ⇒ send `ERR(Contiguity)`; the replica MUST NOT be
-   served (§12.2). Log loudly.
-3. Else: send `SERVING{from = d+1}`; open `wal.reader_from(Lsn(d+1))`; for each record with
-   `lsn ≤ wal.durable_lsn()` (re-read the watermark — never read past it, R1), copy to the
-   network thread's queue. Stop at the watermark; the replica's cursor now joins the live ring
-   at `watermark + 1`. Records that land in the ring *during* catch-up are already ≥ the
-   cutover point, so no gap and no duplicate — assert this at cutover (R3 on the sending side).
+2. Else if `d > wal.durable_lsn()` ⇒ the replica claims more than we have durably ⇒ send
+   `ERR(Contiguity)`. The replica MUST NOT be served (§12.2). Log loudly.
+   - `d == wal.durable_lsn()` is a **fully caught-up** replica, not an ahead one, and step 3
+     serves it.
+   - Step 2 is the **only** source of this rejection. A ring `AttachError::Ahead` never
+     rejects (see the serve ceiling below).
+   - Step 2 is a **tripwire, not a guard**. It catches a former primary only while that
+     primary is still ahead of this one. Once this primary's `durable_lsn` passes its `d`,
+     nothing in the protocol can tell it from an honest replica. The §12.2 operator wipe is
+     the only guard (§5.1, §16).
+3. Else send `SERVING{from = d+1, primary_oldest = wal.oldest_lsn()}` (read at decision
+   time) and serve `d+1..`. Serve from the ring if it holds the cursor. Otherwise serve from
+   the log in bounded chunks (§9.1) until the replica can cut over to the ring (§9.2).
+   - **A join answer never opens a reader**, so it is never deferred and never capped. Step 3
+     applies §9.1 answers 1–2 at `cursor = d + 1` (Attached, or Wait).
+   - Where answer 3 would read, the join answers **NeedChunk** instead. The network thread
+     sends `SERVING`, which lets heartbeats flow, and then posts `Chunk{d + 1}`.
+   - A HELLO is therefore decided, and `SERVING` sent, within one `poll` of the join request.
 
-Catch-up is O(one segment scan + range) with the v7 containing-segment `reader_from`. It runs
-on the writer thread and is a latency hiccup proportional to the lag — acceptable for a rare
-event in v1; v2 moves it off-thread (§16).
+`d + 1` is always computed with `Lsn::checked_next()` (WAL v7.1), never the saturating
+`next()`. The same holds for every cursor advance below.
+
+**Serve ceiling (R1).** Every record shipped, from the ring or from the log, has
+`lsn ≤ released`, which is exactly R1's "latest `commit() → Ok(w)`". Catch-up reads stop at
+`released`. They never stop at `wal.durable_lsn()` or at the reader's end.
+- `released ≤ wal.durable_lsn()` always holds.
+- The two differ between `commit()` and `on_commit()`, and after a `commit()` `Err`: records
+  durable in a split batch that no `Ok` returned. §8.2 says how those are released.
+- The ceiling makes every cutover cursor `≤ released + 1` by construction.
+  `AttachError::Ahead` can therefore only mean `released < d ≤ wal.durable_lsn()`. That
+  replica **waits**, served nothing, until `released ≥ d`. It is never rejected.
+
+### 9.1 Bounded, chunked catch-up (NORMATIVE — RM3)
+
+A lagging replica may be gigabytes behind. Copying the lag in one writer-thread call would
+stall the writer for the whole lag and buffer it in memory. Therefore:
+
+- **Where.** Catch-up reads run **only** inside `Shipper::poll(&mut self, wal)` on the writer
+  thread, and only to answer a **chunk request** posted by the replica's network thread
+  (§9.3).
+  - Never in `on_commit`. It is a release plus wakes and nothing else (§4.2). RM2's
+    `on_commit` also decided joins; RM3 moves that into `poll(wal)`.
+  - Never on a network thread (`Wal` is `!Sync`).
+- **Answering a chunk request.** A chunk request names `cursor`, the next LSN the network
+  thread will put on the wire, and optionally `pos`: the WAL `ReaderPos` returned with the
+  previous Chunk answer of this session (see "Reader position" below).
+  1. If `attach(id, cursor)` succeeds ⇒ **Attached{cursor}**, with no records. This is also
+     the fast path for a replica whose `d + 1` is still in the ring.
+  2. Else if `cursor > released` ⇒ **Wait**, **without opening a reader**. A replica that is
+     caught up but outside the ring, or one that is ahead of `released`, costs no log I/O.
+  3. Else, if catch-up is disabled by a sticky ReadFailed ⇒ **ReadFailed{first lsn}** (no
+     read). Else, if this `poll` has already opened `catchup_replicas_per_poll` readers ⇒
+     **Deferred**. Nothing is read, and the network thread re-posts the same request at once.
+     Otherwise open a reader at `cursor` (by `reader_at(pos)` when the request carries a
+     usable `pos`, else by `reader_from(cursor)`; see "Reader position") and copy records
+     into the replica's chunk buffer, always taking at least one record, while all of these
+     hold:
+     - `lsn ≤ released`;
+     - the size accumulated so far is `< catchup_chunk_bytes`. This is checked **before**
+       each read, because a payload's length is unknown until it is read; a chunk may
+       therefore exceed the budget by at most one record. The size counts **each record as
+       `payload.len() + 32` bytes**: the WAL's 20-byte header and padding on the read side,
+       and the 17-byte `RECORD` frame on the wire;
+     - the record count so far is `< catchup_chunk_records`.
+
+     Every record read is shipped. Reading a record and then discarding it for budget
+     would leave the reader's position one record past the chunk.
+
+     Reading costs two `pread`s per record, so a log of tiny payloads is bounded by the
+     record cap, not the byte budget.
+
+     The loop decides whether to read the next record from its LSN alone (`last + 1`), which
+     it knows without reading. It never calls `Reader::next` for a record it will not ship.
+     After the last record it takes `reader.position()`. Then call `attach(id, last + 1)`:
+     - Ok ⇒ **Chunk{records, attached}**;
+     - `Behind` ⇒ **Chunk{records, pos}**, carrying that position;
+     - `Ahead` cannot occur, because of the ceiling.
+  - `AlreadyAttached` cannot occur either, because the network thread always detaches before
+    it posts a request. If it does occur, it is an internal bug: end the session loudly and
+    `debug_assert!`.
+- **Reader position (WAL v7.2).** `reader_from(cursor)` scans the containing segment from
+  its base on every call. Carrying a `ReaderPos` between chunks removes that scan for every
+  chunk after the first.
+  - The writer still keeps no per-session state. The position travels in the handshake: a
+    Chunk answer returns it, and the network thread sends it back in its next chunk request.
+  - A Chunk answer is **Chunk{records, attached}** or **Chunk{records, pos}**: a position
+    is returned exactly when the replica must ask for another chunk.
+  - The network thread keeps its copy of the latest `pos` for the rest of the session,
+    across Wait and Deferred re-posts, and sends it with every chunk request. It drops it
+    when the session ends.
+  - The writer uses `pos` only if `pos.next_lsn() == cursor`. Otherwise it ignores it and
+    uses `reader_from(cursor)`. This check is what makes a stale position harmless: after
+    a cutover and a ring fall-back, the kept position no longer matches the cursor unless
+    the ring served nothing, in which case it is still correct.
+  - `reader_at(pos)` results:
+    - `Ok` ⇒ read from it;
+    - `ContiguityViolation` ⇒ **BelowOldest**, exactly as for `reader_from`;
+    - `InvalidPosition`, or any other `Err` (e.g. an I/O error opening the segment) ⇒ fall
+      back to `reader_from(cursor)` for this answer; that result decides. This is not
+      expected for a position this shipper handed out.
+  - **A reader started by `reader_at` never causes a sticky failure by itself.** If it
+    yields `None`, an `Err`, or an unexpected LSN below the ceiling, the writer discards
+    what that reader produced and retries the answer once with `reader_from(cursor)`. Only
+    the `reader_from` result can lead to ReadFailed.
+  - Both fallbacks bump one `#[doc(hidden)]` read-only counter,
+    `Shipper::position_fallbacks()`. It is observability, and reachability evidence for the
+    position-safety test; it is never an oracle.
+  - A position is valid across `append`, `commit`, roll and `checkpoint` on the same `Wal`
+    handle (WAL §8.7). After an in-process WAL reopen, the WAL requires positions with
+    `next_lsn > durable_lsn + 1` to be discarded. Every position here has
+    `next_lsn = cursor ≤ released + 1 ≤ durable_lsn + 1`, so that holds by construction.
+- **Below oldest (R6).** If the reader cannot be opened because of the below-oldest gap
+  error, the integrator checkpointed past the replica (§11) ⇒ **BelowOldest**.
+  - The network thread closes the session with a FIN (no `ERR`) and reconnects immediately.
+  - The replica's next HELLO is decided by step 1, which answers `RESEED_REQUIRED`.
+  - This is loud and skips nothing. It needs no new frame and no new receiver state:
+    `RESEED_REQUIRED` is only ever sent in place of `SERVING` (§6).
+- **Unreadable committed record ⇒ loud.** If the reader returns `None`, an `Err`, or an LSN
+  `≠` the expected one while the expected LSN is `≤ released`, a record the primary durably
+  committed could not be read ⇒ **ReadFailed{lsn}**.
+  - An `Err` (an I/O error, e.g. `EMFILE` on the segment open) is **not sticky**. That one
+    answer fails loudly, and the replica's reconnect backoff bounds any retries.
+  - `None` or an LSN mismatch is data-level corruption. It is sticky, as below.
+  - `Reader::next` ends with `None`, not `Err`, on an invalid record or an LSN-continuity
+    break. "`None` below the ceiling" MUST therefore be treated as this failure, never as an
+    empty chunk.
+  - A `poll` returns `Err(ReplError::PrimaryLogUnreadable{lsn})` exactly when its pass
+    answered at least one request ReadFailed. The sticky state alone is not an error.
+  - The replica's status becomes `Failed` and its session ends.
+  - `lsn` is the LSN catch-up expected and did not get. The record that is actually corrupt
+    may be earlier in the same segment, because the reader's skip-scan passes through it and
+    the API does not say where it stopped.
+  - **Catch-up reads are then disabled for the whole shipper (sticky; data-level only).**
+    Answers 1 (attach) and 2 (Wait) still run, because they read nothing. Every request that
+    would reach answer 3 is answered ReadFailed{first lsn} without reading. There is no
+    rescan loop, and no ring copy is used to paper over a corrupt log.
+  - Replicas already streaming from the ring are unaffected.
+  - The condition persists until the integrator recreates the `Shipper`. A primary whose
+    committed log cannot be read is a WAL D5-class emergency: its next `open()` will refuse
+    it too.
+- **Poisoned primary.** `poll(wal)` MAY be called on a poisoned primary handle; the crate
+  cannot detect poison through `&Wal`. The ceiling still binds: nothing above `released` is
+  served, even though the file may hold CRC-valid records above it.
+- **Never blocks; bounded memory.**
+  - The chunk buffer is owned by whichever side the §9.3 handshake says, so the writer never
+    waits on a lock or a queue.
+  - At most one request per replica is outstanding.
+  - Memory is one reused buffer per catching-up replica: `≤ catchup_chunk_bytes +
+    max_record_size + 32` bytes, counted in the same per-record units as the chunk budget.
+- **`poll` always finishes its pass.**
+  - It answers every request it takes: answers, Deferred, errors.
+  - It collects errors and returns them after the pass, never part-way through with a
+    request left `TAKEN` or unanswered.
+  - Its pass starts at a rotating replica index, so a replica deferred by the cap is answered
+    first by a later `poll`.
+  - **Joins first.** Within a pass, `poll` answers every pending join before it opens any
+    reader. `SERVING` latency therefore never includes a log read.
+  - Every `poll` that has a chunk request opens at least one reader, unless catch-up is
+    disabled by a sticky ReadFailed. Catch-up therefore always makes progress.
+    `Shipper::new` rejects `catchup_replicas_per_poll == 0` and `catchup_chunk_records == 0`.
+  - **Terminal shipper** (LSN domain, §9.2). Every request taken is answered **Terminal**
+    (no read), and the network thread turns it into `ERR(Protocol)`.
+- **Writer stall per `poll` (honest bound).**
+  - A `Reader` borrows `&Wal`, so it cannot be kept across calls. Each answer opens one.
+  - **The first chunk of a catch-up episode** has no position, so it uses
+    `reader_from(cursor)`. That starts at the base of the segment containing `cursor` and
+    reads and CRC-checks every earlier record in that segment, inside its first `next`
+    (WAL §8.5). It costs at most:
+    - **bytes:** `segment_size + catchup_chunk_bytes + max framed record`;
+    - **syscalls:** `2 · (records in the containing segment before cursor) +
+      2 · catchup_chunk_records`. Each `pread` costs about 1 µs hot.
+
+    For small payloads the syscall term dominates.
+  - **Every later chunk of the episode** uses `reader_at(pos)` and costs at most:
+    - **bytes:** `catchup_chunk_bytes + 2 · max framed record` (`reader_at` validates the
+      first record, and `Reader::next` then reads it again);
+    - **syscalls:** `2 · catchup_chunk_records + 2`, plus one per segment boundary crossed.
+  - An episode is one run of catch-up for one replica: from a join that needs the log, or
+    from a ring fall-back, until the cutover.
+  - `poll` opens a reader for at most `catchup_replicas_per_poll` replicas, round-robin
+    (default 1). Answers that read nothing are not limited: join decisions, NeedChunk,
+    Attached, Wait, Deferred, and a sticky ReadFailed.
+  - The per-`poll` stall is therefore bounded by the chunk and segment sizes, not by the
+    number of lagging replicas.
+  - Total log reads for a lag `L` are about `L + S` per episode, where `S = segment_size`:
+    the one prefix skip plus the records shipped. (Without positions it was about
+    `L · (1 + S/(2C))`.)
+  - Measured hot-cache cost of a full containing-segment scan via `reader_from`, 32 MiB
+    segment, release build:
+
+    | Payload | Rescan time |
+    |---|---|
+    | 4 KiB | 19.6 ms |
+    | 100 B | 284 ms |
+    | 0 B | 1.34 s (1.4 M records, about 0.96 µs each) |
+
+    The scan is O(records before the cursor in its segment).
+  - **Residual stall.** The first chunk of each episode can still stall the writer for one
+    such scan: up to hundreds of ms, or seconds for a large segment of tiny records. It
+    happens once per episode, not once per chunk.
+  - A replicated WAL with small events SHOULD therefore still size segments by record
+    count. About 16 k records per segment keeps that one scan near 16 ms.
+  - Removing the residual needs a chunked skip in the WAL reader (§16).
+  - Defaults: `catchup_chunk_bytes = 16 MiB`, `catchup_chunk_records = 16 384`,
+    `catchup_replicas_per_poll = 1`. Neither the shipper nor `Wal` can read `segment_size`,
+    so the documentation states the formulas and the recommendation.
+- **Cadence (integrator obligation, NORMATIVE).**
+  - The integrator MUST call `shipper.poll(&wal)` after every `on_commit`, and at least once
+    per `heartbeat` when no commits occur. A `poll` with nothing pending is one atomic swap.
+  - This bounds the join decision to one commit or one heartbeat. That bound MUST stay well
+    under the receiver's `idle_timeout`, because nothing the receiver accepts can be sent
+    before `SERVING`.
+  - While `catching_up() > 0`, an idle integrator SHOULD poll more often. Catch-up proceeds
+    at about one chunk per opened reader per `poll`.
+  - A Wait answer is served one `poll` after the release that unblocks it: the re-post lands
+    after the integrator's post-`on_commit` poll.
+
+### 9.2 Cutover to the live ring (NORMATIVE — RM3)
+
+- **Attach only when answering.** The writer calls `Producer::attach` only while answering a
+  pending request (§9.3), at that request's cursor (answer 1), or at the end of the chunk it
+  just copied for it (answer 3). Nothing else attaches. A session teardown therefore never
+  races an attach.
+- **Ordering on the wire.**
+  - On **Chunk{…, attached}**, the network thread sends the chunk's records, then resumes the
+    ring consumer.
+  - On **Attached{c}**, it resumes the consumer directly.
+  - On **Chunk{records, pos}**, it sends the records and posts the next chunk request,
+    carrying `pos`.
+  - On **Wait**, it re-posts **as soon as `Consumer::released() ≥ cursor`**. That is a
+    condition re-checked before every park, not an event: a release wake can coalesce with
+    the `DONE` wake. Otherwise it parks for up to `heartbeat` and re-checks.
+  - On **Deferred**, it re-posts the same request at once.
+  - On **NeedChunk** (a join answer), it sends `SERVING`, then posts `Chunk{d + 1}`.
+  - On **Terminal**, it sends `ERR(Protocol, "LSN domain exhausted")` and closes.
+  - `Consumer::resume()` MUST return the answered cursor. Otherwise the session ends with
+    `ERR(Contiguity)`.
+- **Sending-side contiguity (R3, primary side; defence in depth).**
+  - The network thread keeps `next = d + 1` for the session. It checks every record it
+    encodes against `next`, whether the record came from catch-up or from the ring.
+  - A record with `lsn ≠ next` is **never sent**. The session ends with
+    `ERR(Contiguity)`, so the replica sees an in-band error, not a silent EOF.
+  - Otherwise it sets `next = lsn.checked_next()`.
+  - The tests' oracles stay independent of this check (§15.3).
+- **Overflow falls back in-session.**
+  - Suppose the ring evicts the consumer's cursor (`NeedsCatchUp`), either before the first
+    drain after a cutover or at any time while streaming.
+  - The network thread detaches the consumer and posts a chunk request at its own `next`.
+  - The session continues: no reconnect, no re-HELLO. This replaces RM2's close-and-re-HELLO
+    (`SessionEnd::FellBehind`).
+  - `catch_up_events` counts entries into `CatchingUp`.
+- **Sizing (liveness, not safety).** A cutover sticks if the ring still holds the cursor when
+  the consumer first drains, i.e. after the network thread has sent one chunk.
+  - Size `ring_bytes / slot_bytes ≥` the largest commit batch plus the records the primary
+    captures while one chunk is on the wire. That is about `A · (C / R + poll interval)`,
+    where `A` is the append rate and `R` the replica's ingest rate.
+  - Convergence also needs `A < R`.
+  - An undersized ring degrades to serving from the log. It never causes loss, a gap, or a
+    reconnect storm.
+- **Retention.** `acked` is set to the HELLO's `d` when the session is accepted, and raised
+  only by ACKs within the session (RM2 R4). The §11 `min_replica_acked_lsn` term therefore
+  protects the catch-up range. An integrator that checkpoints past it gets BelowOldest, which
+  leads to step 1 and R6.
+- **LSN domain.** The ring tags LSNs `≤ ring::MAX_LSN` (2^56 − 2). This rule is pulled forward
+  from RM4, because RM3 makes mid-stream attach the normal path.
+  - `Shipper::new` MUST return `Err` when `wal.last_lsn() ≥ ring::MAX_LSN`, i.e. when the
+    next record could not be captured. It checks `checked_next` (`LsnExhausted`) first, then
+    the domain, so a WAL at `u64::MAX` keeps its RM2 error.
+    - A WAL seeded at `MAX_LSN + 1` (`last_lsn = MAX_LSN`) is refused.
+    - A WAL seeded at `MAX_LSN` (`last_lsn = MAX_LSN − 1`) is accepted and ships exactly the
+      record `MAX_LSN`.
+  - `Shipper::capture` MUST test `lsn > ring::MAX_LSN` itself, **before** calling the ring. On
+    a crossing it enters the terminal state without calling `Producer::capture`. The ring's
+    cold path `debug_assert!`s on that input, so it must never receive it.
+  - `Producer::capture` MUST also check the bound on its fast path (`lsn != next || lsn >
+    MAX_LSN` goes to the cold path). This is defence in depth for direct ring users: a
+    producer-local compare that touches no atomic. Ring unit tests prove it, in the existing
+    `catch_unwind` + `is_err() == cfg!(debug_assertions)` style.
+  - Once a capture crosses the bound at runtime, the shipper is **terminal**:
+    - every session ends with `ERR(Protocol, "LSN domain exhausted")`;
+    - statuses become `Failed`;
+    - `poll` returns `Err(ReplError::LsnDomainExhausted)`.
+  - It never answers Ahead⇒reject and never catches up forever.
+
+### 9.3 Writer ↔ network handshake (NORMATIVE — RM3)
+
+The writer keeps **no per-session state** between polls. Every interaction is a request the
+network thread posts and the writer answers in a later `poll`.
+
+- **The slot.** Each replica has one request slot holding a request (`Join{d}` or
+  `Chunk{cursor, pos}`), its answer, and the chunk buffer.
+  - A state word moves `IDLE → PENDING → TAKEN → DONE → IDLE`.
+  - The writer touches the slot only between `TAKEN` and `DONE`.
+  - The network thread touches it only in `IDLE`, or after it has observed `DONE`.
+  - The slot lives in its own module, written against the crate's loom-swappable
+    primitives. The request, the answer and the chunk buffer sit in `crate::sync::UnsafeCell`, so loom
+    reports any unsynchronized access (the §15.7.2 analogue). The module is built under
+    `--cfg loom`; `shipper.rs` is not.
+  - The slot holds the network thread's waker, registered once.
+  - The module exports the **whole sequences**, and `shipper.rs` calls them verbatim:
+    - `post(req)`;
+    - `answer(f)`: CAS `PENDING → TAKEN`, run `f` (which may call `Producer::attach`), write
+      the answer, store `DONE` (Release), then **unpark the waker**;
+    - `await_answer()`: park (via `crate::sync`) until `DONE` (Acquire), re-checking the
+      state after every wake, then read the answer and buffer;
+    - `abandon(consumer)`:
+      - try CAS `PENDING → IDLE`;
+      - else, if the state is `IDLE` (no request outstanding), detach and return. Only the
+        network thread leaves `IDLE`, so this check cannot race;
+      - else, wait as `await_answer` does for `DONE`, detach if the answer attached, and
+        store `IDLE`.
+  - `await_answer` and `abandon` have **no exit before `DONE` except shutdown**. A
+    give-up-after-N-retries or timeout in shipped code is exactly the stale-attach and
+    buffer race this handshake exists to prevent. Bounded retries belong only in test
+    harness loops.
+  - A read-only, `#[doc(hidden)]` accessor `Shipper::request_pending(id) -> bool` reads the
+    state word. It is a reachability aid for tests (T9, T13, T15), not a fault hook, and
+    never an oracle.
+
+    §15.7 L8 therefore drives the shipped sequences, and each L8 mutation is applied inside
+    them.
+- **Network thread.**
+  - It detaches its consumer, fills the slot, and stores `PENDING` (Release). It then sets
+    the shipper's pending flag and waits for `DONE` (Acquire).
+  - **Heartbeats use one session-level timer.** After `SERVING`, whenever
+    `now − last_frame_sent ≥ heartbeat` it sends `HEARTBEAT{released}`. The timer spans
+    every post-`SERVING` wait: awaiting an answer, Wait parks, and Deferred/Wait re-post
+    cycles. Before `SERVING` it sends nothing, because the receiver accepts nothing else
+    first.
+  - It MUST NOT end a session (socket dead, any error) with a request outstanding.
+    - First it tries to take the request back with CAS `PENDING → IDLE`.
+    - It calls `abandon(consumer)`. Usually that means taking the request back or finding
+      the slot `IDLE`. If the writer holds the request, it waits for `DONE`, which can take
+      as long as the answer's read (§9.1), and detaches if the answer attached.
+    - Shutdown is the only exception: after shutdown nothing is served.
+- **Writer (`poll`).**
+  - For each replica, CAS `PENDING → TAKEN` (Acquire).
+  - On success it answers. That is the **only** call site of `Producer::attach`.
+  - It then stores `DONE` (Release) and wakes the network thread. Both happen inside
+    `answer`.
+- **R4.** The `sent` bound is published **before** every write, catch-up records included (RM2
+  R1). The ACK reader runs from `SERVING` through catch-up and streaming.
+- **Status.** `Connecting → Joining → CatchingUp ⇄ Streaming`, plus three terminal-for-session
+  states: `Rejected` (step 2), `NeedsReseed` (step 1), and `Failed` (ReadFailed, LSN domain).
+  `CatchingUp` replaces RM2's `NeedsCatchUp`; the crate is unpublished.
 
 ---
 
@@ -399,9 +787,12 @@ up_to = min(latest_durable_snapshot_lsn,                 // WAL §9 rule — bin
 ### 12.2 The former primary MUST be re-seeded
 If the old primary machine returns, its WAL may contain durable records **beyond** the new
 primary's log (the lost tail). It is the one node that is *not* a prefix. v1 has no
-suffix-truncate. Therefore it MUST NOT be resumed as a replica: the primary rejects a HELLO
-with `durable_lsn > primary.durable_lsn` (§9 step 2), and the operator MUST wipe it and
-re-seed (§10). Resuming it would create divergence. (A `truncate_after` that lets it rejoin
+suffix-truncate. Therefore it MUST NOT be resumed as a replica. The operator MUST wipe it and
+re-seed (§10); resuming it would create divergence. The primary's §9 step 2 (reject a HELLO
+with `durable_lsn > primary.durable_lsn`) is only a **tripwire**: it fires while the former
+primary is still ahead. Once the new primary's `durable_lsn` passes it, the former primary is
+indistinguishable from an honest replica and would be served silently on top of its divergent
+tail. The operator fence-and-wipe is the only guard (§5.1; v1.x hardening in §16). (A `truncate_after` that lets it rejoin
 without re-seed is a v2 WAL item — WAL v7 §17 Decision 7.)
 
 ---
@@ -434,8 +825,13 @@ fixed slots — and `max_reconnect_backoff`, `io_timeout`, `send_batch`.)* **`Re
   gate. Ring written against loom-swappable primitives (§15.7.1). *§15.2 P3–P4, §15.3
   ring-overflow, **§15.7 loom L1–L6 + all falsifiability mutations** (gate — do not start RM3
   until the ring's cross-thread barrier is model-checked).*
-- **RM3** — catch-up (§9) using WAL v7 `oldest_lsn()` + containing-segment `reader_from`.
-  *§15.3 catch-up, §15.2 P5.*
+- **RM3** — catch-up (§9, §9.1–§9.3) using WAL v7 `oldest_lsn()` + containing-segment
+  `reader_from` and v7.2 `Reader::position` / `reader_at`: the request/answer handshake,
+  chunked catch-up under the `released` ceiling, in-session overflow fall-back, the ring LSN
+  domain (pulled forward from RM4). Adds `ShipperConfig` `catchup_chunk_bytes`,
+  `catchup_chunk_records`, `catchup_replicas_per_poll`, and `ReplError`
+  `PrimaryLogUnreadable{lsn}`, `LsnDomainExhausted`.
+  *§15.3 catch-up, §15.2 P5, §15.7 L7/L7b/L8/L8b.*
 - **RM4** — re-seed traits + `options().seed(..)` cold start; re-seed loop guard. *§15.3 re-seed.*
 - **RM5** — checkpoint policy helper + promotion runbook + former-primary rejection (§12.2).
   *§15.3 promotion, rejoin-rejected.*
@@ -462,10 +858,26 @@ slot accounting (capture/release/free/evict).
 - **P4 Overflow (§8.3):** tiny ring ⇒ replicas repeatedly `NeedsCatchUp` ⇒ final logs still
   identical; no record duplicated at the ring/catch-up cutover.
 - **P5 Catch-up after checkpoint (R6):** primary checkpoints past a lagging replica ⇒
-  `RESEED_REQUIRED`, never a silent skip; a replica *within* retention catches up exactly.
+  `RESEED_REQUIRED` as the **frame** answering the next HELLO, never a silent skip; a replica
+  *within* retention catches up exactly. Plus a deterministic boundary table:
+  - set up `P = wal.oldest_lsn() > 1`;
+  - check `d ∈ {P−2, P−1, P}`, both with `d+1` in the ring and not;
+  - `SERVING.primary_oldest == P`.
 
 ### 15.3 Scenario / integration
 - **Ring overflow → catch-up → live cutover** with no gap/dup (assert at cutover).
+  - **Oracles independent of the shipper:**
+    - a loopback **forwarding proxy** between `Shipper` and the real `Receiver` checks, per
+      session:
+      - `SERVING.from == HELLO.d + 1`;
+      - dense `RECORD` LSNs;
+      - no `ERR` frame;
+      - every `ACK` ≤ the replica WAL's `DurableTap` at forwarding time;
+    - the proxy also counts sessions;
+    - the receiver's exact session-result count;
+    - no in-band `Err`/`Remote{code}` on the receiver side.
+  - **A self-reported shipper counter is never the oracle.** With in-session overflow
+    fall-back (§9.2), a session end in this test is itself a failure.
 - **Re-seed end to end:** replica behind floor ⇒ `RESEED_REQUIRED` ⇒ snapshot ⇒
   `options().seed(s+1).open(..)` ⇒ resume ⇒ converges; and the in-flight-reseed checkpoint guard prevents the loop.
 - **Promotion:** kill primary; promote highest replica; others catch up without truncation;
@@ -576,6 +988,50 @@ very interleavings we want explored).
 - **L6 SPMC.** Two consumers with independent cursors on one ring: a slot is freed only when
   **both** cursors have passed it. Loom must find no race and both consumers must emit the
   full released set. (Catches a producer that frees on *any* cursor instead of the min.)
+- **L7 Late re-attach after fall-behind (RM3).** RM3 makes mid-stream attach the normal path.
+  - **Shared prelude**, run sequentially on the main thread:
+    - build a 2-slot, 1-consumer ring and attach at 1;
+    - capture 1–2 and release 2;
+    - capture 3 (this evicts 1) and release 3;
+    - `drain` returns `NeedsCatchUp` with nothing emitted, then detach;
+    - capture and release 4 while detached;
+    - assert `oldest_valid == 3`.
+  - **Spawn order and handoff.** Spawn the consumer **before** the attach. It polls
+    `resume()` with bounded `yield_now` retries, so the cursor's Release/Acquire is the only
+    edge. Use no waker and no side flag: a spawn-after-attach or a separate flag masks the
+    ordering mutations below.
+  - **L7** cuts over at `oldest_valid`: `attach(0, 3)`, then capture and release 5 and 6.
+    - Both captures can evict a pinned record.
+    - Oracle: the emitted LSNs are dense from the **constant** 3, each `payload == pat(lsn)`,
+      and every LSN is ≤ its pass watermark.
+    - `Streaming` ⇒ exactly 3..=6. `NeedsCatchUp{n}` ⇒ `n == 3 + emitted`.
+    - Preemption bound 4.
+  - **L7b** is a caught-up cutover (`d == durable`): `attach(0, 5) = released + 1`, then
+    capture and release 5 and 6.
+    - No eviction is possible, so assert exactly `[5, 6]` and `Streaming`. A spurious
+      `NeedsCatchUp` fails it.
+    - Exhaustive.
+  - **Finish step (both models), on the main thread after `join`.**
+    - If the consumer never resumed, assert that `resume()` returns the attach cursor.
+    - If its last status was `Streaming`, run one final drain.
+    - Then apply the oracle.
+    - Without this step, executions that end before resuming, or before 6 is released, fail
+      a correct ring or have no oracle. The join edge hides ordering bugs only in those
+      executions; the others still catch them (measured).
+- **L8 Handshake teardown (RM3, §9.3).** It drives the crate's request-slot module and its
+  exported sequences (`post`, `answer`, `abandon`), never a copy.
+  - The network thread registers itself as the slot's waker and posts.
+  - The writer thread calls `answer` with an `f` that attaches.
+  - Concurrently, the network thread calls `abandon`, which parks via `crate::sync`. It
+    never uses a bounded retry: shipped code has none.
+  - The check-before-park interleaving still exposes a race on the answer, despite loom's
+    eager `unpark` causality (§15.7.8).
+  - End state: the consumer's cursor is `PARKED` (no stale attach) and the slot is `IDLE`.
+    Loom reports no race on the slot's answer or buffer.
+- **L8b Request and answer handoff (RM3, §9.3).** The network thread `post`s a request
+  (with a `pos`) and runs `await_answer → read buffer`. The writer runs `answer`, whose `f`
+  reads the request and writes the buffer. Assert: no race, `f` saw exactly the posted
+  request, and the buffer read equals what `f` wrote.
 
 #### 15.7.5 Falsifiability — REQUIRED, each mutation demonstrated to fail, then reverted
 The gate is only meaningful if it can fail. Apply each mutation, run the corresponding model,
@@ -589,6 +1045,19 @@ confirm loom reports a race or an assertion trips, revert, and record it in the 
 | Drop the generation bump on eviction | **L4** (overwritten data emitted as old record) |
 | Drop the `Condvar::notify` in `on_commit` | **L5** (unsent records at end) |
 | Re-read `released` mid-drain and send up to the new value | **L2** |
+| *(RM3)* Drop the generation bump on eviction | **L7** |
+| *(RM3)* Consumer pin CAS `Release` → `Relaxed` | **L7** at bound 4 |
+| *(RM3)* `attach` does not clear the consumer's catch-up flag | **L7b** (spurious `NeedsCatchUp`) |
+| *(RM3)* `attach` stores the cursor **before** clearing the catch-up flag | **L7b** |
+| *(RM3)* `attach`'s cursor store `Release` → `Relaxed` | **L7b** |
+| *(RM3)* `resume`'s cursor load `Acquire` → `Relaxed` | **L7b** |
+| *(RM3)* Network thread abandons a request with a plain store instead of the CAS | **L8** (stale attach) |
+| *(RM3)* Writer stores `DONE` before it attaches | **L8** |
+| *(RM3)* Network thread does not wait for `DONE` when the CAS fails | **L8** |
+| *(RM3)* Writer writes the answer **after** storing `DONE` | **L8** (loom `UnsafeCell` race) |
+| *(RM3)* `await_answer`'s `DONE` load `Acquire` → `Relaxed` | **L8b** (loom `UnsafeCell` race) |
+| *(RM3)* `post` stores `PENDING` before it writes the request | **L8b** (loom `UnsafeCell` race) |
+| *(RM3)* `abandon` gives up after a bounded wait while `TAKEN` | **std unit test** of the slot module, not loom. Loom always schedules the writer within the bound. The test runs `answer` with an `f` that signals, then sleeps 300 ms, then attaches; `abandon` called meanwhile must return only after `f` finishes, with the cursor `PARKED` and the slot `IDLE`. |
 
 If a mutation does **not** make its model fail, the model is too weak — fix the model, do
 not ship it.
@@ -598,8 +1067,9 @@ not ship it.
   does **not** prove the *durability* half of R1 — that `released` is only ever advanced to a
   `w` returned by `commit() → Ok(w)`. That is a logic invariant of the integrator's call
   order, covered by the §15.5 LazyFS headline and its negative control.
-- It does not cover the network, the wire codec, the WAL, or catch-up (§9 runs on the writer
-  thread and touches no shared ring state beyond a normal release).
+- It does not cover the network, the wire codec, the WAL, or catch-up's log reads (§9.1 runs
+  on the writer thread). Its shared-memory parts are covered: the late attach (L7/L7b) and the
+  writer↔network handshake (L8).
 - Exhaustive only for the modeled ring size/record count; larger configurations are covered by
   the §15.4 oracle and §15.5 crash matrices, not by loom.
 
@@ -670,6 +1140,21 @@ non-loom code path.
   moves capture/catch-up I/O off the writer thread; drop-in shipper swap (wire + receiver
   unchanged); v2.
 - **Snapshot transport standardization** — v1 leaves it to the integrator.
+- **Resumable WAL reader position: DONE** (WAL v7.2, `Reader::position` / `Wal::reader_at`,
+  merged 2026-11-27). §9.1 uses it.
+- **Chunked first skip** (WAL API; owner decision; not planned). The first chunk of a
+  catch-up episode still scans the containing segment's prefix inside one `Reader::next`
+  (§9.1 "Residual stall"). Bounding that needs a reader skip that returns periodically, or
+  a coarse per-segment `(lsn → offset)` index kept by the writer (WAL §8.5 already allows
+  one). Until then, record-count segment sizing is the mitigation.
+- **Former-primary detection past the tripwire** (v1.x, heuristic). `HELLO` would carry the
+  crc32c of the replica's record `d`, and the primary would compare it with its own record
+  `d` before serving.
+  - It needs a protocol-version bump.
+  - It needs an explicit "unknown" value for `d == 0`, for `d` already checkpointed on either
+    side, and for a freshly seeded replica.
+  - It is probabilistic: equal payloads at `d` pass.
+  - Not in RM3. The operator wipe (§12.2) stays the guard.
 
 ## 17. References
 - open-wal `docs/wal_design_v7.md` §4 (D1–D12), §6 (`OpenOptions`), §8.5, §9, §15 (esp. §15.1, §15.4, §15.7).
