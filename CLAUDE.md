@@ -115,6 +115,15 @@ The entire value of this component is **correct behavior under crashes and fault
 
 ## Project status (keep this updated)
 
+- **LATEST (2026-11-27, RM3 review round 2): #59 (replica RM3) APPROVED at `fded6b5` — ready for the owner to merge.**
+  - **Required 1–4 verified by execution** (mutations in the separate worktree):
+    1. T1 asserts `episodes >= 1`: 60 of 60 runs passed.
+    2. Post-FIN drain bounded by `io_timeout`, then `shutdown(Both)`; new test T6b. Reviewer's mutations: remove the deadline ⇒ `the peer's ACKs pinned the old one`; no bounded drain ⇒ that plus `Shipper::shutdown did not return`.
+    3. P3 waits for `Streaming`: `ops = [Commit]` pinned, 8 runs, 0 failures.
+    4. `slot` is `pub` only under `cfg(loom)`; U1 and the five L8/L8b slot rows still fail under their mutations.
+  - **Gates run by the reviewer:** replica 98 passed ×3, root 191, clippy (both cfgs), fmt, loom 12/12; root `src/` diff empty; `origin/main` merged in; CI green on the head.
+  - **Not re-run:** the other 15 round-1 mutation rows (their code is unchanged since `fb67914`).
+  - **Next:** owner merges #59; then a fenced RM4 (re-seed) kickoff.
 - **LATEST (2026-11-27, RM3 review round 1): #59 (replica RM3) reviewed at `fb67914` — needs work, four small required changes; no correctness defect found. #60 (this ledger, the spec and kickoff C) MERGED as `15155b3`.**
   - **Verified on #59:** root `src/` diff empty; `ring.rs` non-test change is the bound check only; existing tests edited only as allowed. Replica 96 passed ×3, root 191, clippy (both cfgs), fmt, loom 12/12.
   - **Independent review** (clean copy, none of the PR's claims): no blocker on R1, contiguity, the slot, the writer thread, stickiness or R4. Its randomized stress (two real `Receiver`s, random cuts, 28 seeds × ~7,600 records) saw no gap, duplicate, in-band error or R4 violation.
