@@ -53,8 +53,8 @@ test zeroed_tail_survives_power_loss ... ok
 
 `.github/workflows/lazyfs.yml` drives this same script (`deps` → cache → `build`
 → `mount` → `run` → always `unmount`) on PRs and `main` that touch the recovery
-code. It runs **informational** (`continue-on-error`) until proven stable on the
-hosted runners, then can be made required.
+code. The gate step is **blocking**: a failing power-loss test fails the job. (Add
+the job to branch protection to make it a required check.)
 
 ### Gotchas this script handles for you (so you don't re-discover them)
 
