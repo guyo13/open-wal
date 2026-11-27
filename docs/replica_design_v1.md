@@ -1,8 +1,10 @@
 # `open-wal-replica` — Design, Implementation & Test Specification
 
 **Status:** Draft **v1** — async master/slave, static primary, no election, no sharding.
-**Depends on:** `open-wal` at **spec v7** (`Wal::options().seed(..)` cold-start seed,
-`oldest_lsn()`, containing-segment `reader_from`). Do not begin RM3+ until the v7 WAL delta has landed.
+**Depends on:** `open-wal` at **spec v7.2**: v7's `Wal::options().seed(..)` cold-start seed,
+`oldest_lsn()` and containing-segment `reader_from`; v7.1's `checked_next`; and v7.2's
+resumable reader position (`Reader::position`, `Wal::reader_at`), which RM3's catch-up uses.
+All three have landed on `main`.
 **Intended audience:** a coding agent implementing the crate, plus a human reviewer.
 **Crate name:** `open-wal-replica` (owner's call; the name is not load-bearing).
 **Revisions:** 2026-10-27 — §9 step 2 off-by-one fixed: the "ahead of the primary" test is
@@ -31,6 +33,9 @@ Hardened over three critique rounds (28 + 27 + 32 findings). Rounds 2–3 added:
 - an `abandon` that never gives up;
 - a session-level heartbeat timer;
 - the §16 resumable-reader recommendation.
+
+2026-11-27 — WAL v7.2 landed, so §9.1 now carries a `ReaderPos` between chunks: only the
+first chunk of a catch-up episode pays the segment-prefix scan.
 
 This is a build contract in the same style as the WAL spec: invariants are normative,
 tests are co-equal deliverables, and **the crate is "done" only when its fault-injection tests
@@ -412,7 +417,8 @@ stall the writer for the whole lag and buffer it in memory. Therefore:
     `on_commit` also decided joins; RM3 moves that into `poll(wal)`.
   - Never on a network thread (`Wal` is `!Sync`).
 - **Answering a chunk request.** A chunk request names `cursor`, the next LSN the network
-  thread will put on the wire.
+  thread will put on the wire, and optionally `pos`: the WAL `ReaderPos` returned with the
+  previous Chunk answer of this session (see "Reader position" below).
   1. If `attach(id, cursor)` succeeds ⇒ **Attached{cursor}**, with no records. This is also
      the fast path for a replica whose `d + 1` is still in the ring.
   2. Else if `cursor > released` ⇒ **Wait**, **without opening a reader**. A replica that is
@@ -420,8 +426,10 @@ stall the writer for the whole lag and buffer it in memory. Therefore:
   3. Else, if catch-up is disabled by a sticky ReadFailed ⇒ **ReadFailed{first lsn}** (no
      read). Else, if this `poll` has already opened `catchup_replicas_per_poll` readers ⇒
      **Deferred**. Nothing is read, and the network thread re-posts the same request at once.
-     Otherwise open `wal.reader_from(cursor)` and copy records into the replica's chunk
-     buffer, always taking at least one record, while all of these hold:
+     Otherwise open a reader at `cursor` (by `reader_at(pos)` when the request carries a
+     usable `pos`, else by `reader_from(cursor)`; see "Reader position") and copy records
+     into the replica's chunk buffer, always taking at least one record, while all of these
+     hold:
      - `lsn ≤ released`;
      - the chunk's size stays within `catchup_chunk_bytes`. The size counts **each record as
        `payload.len() + 32` bytes**: the WAL's 20-byte header and padding on the read side,
@@ -429,15 +437,43 @@ stall the writer for the whole lag and buffer it in memory. Therefore:
      - the record count stays within `catchup_chunk_records`.
 
      Reading costs two `pread`s per record, so a log of tiny payloads is bounded by the
-     record cap, not the byte budget. Then call `attach(id, last + 1)`:
+     record cap, not the byte budget.
+
+     The loop decides whether to read the next record from its LSN alone (`last + 1`), which
+     it knows without reading. It never calls `Reader::next` for a record it will not ship.
+     After the last record it takes `reader.position()`. Then call `attach(id, last + 1)`:
      - Ok ⇒ **Chunk{records, attached}**;
-     - `Behind` ⇒ **Chunk{records}**;
+     - `Behind` ⇒ **Chunk{records, pos}**, carrying that position;
      - `Ahead` cannot occur, because of the ceiling.
   - `AlreadyAttached` cannot occur either, because the network thread always detaches before
     it posts a request. If it does occur, it is an internal bug: end the session loudly and
     `debug_assert!`.
-- **Below oldest (R6).** If `reader_from` fails with the below-oldest gap error, the
-  integrator checkpointed past the replica (§11) ⇒ **BelowOldest**.
+- **Reader position (WAL v7.2).** `reader_from(cursor)` scans the containing segment from
+  its base on every call. Carrying a `ReaderPos` between chunks removes that scan for every
+  chunk after the first.
+  - The writer still keeps no per-session state. The position travels in the handshake: a
+    Chunk answer returns it, and the network thread sends it back in its next chunk request.
+  - The network thread keeps a position only within one catch-up episode. It drops it when
+    the session ends, and when it resumes the ring consumer. A fall-back from the ring
+    (§9.2) therefore starts with no position.
+  - The writer uses `pos` only if `pos.next_lsn() == cursor`. Otherwise it ignores it and
+    uses `reader_from(cursor)`.
+  - `reader_at(pos)` results:
+    - `Ok` ⇒ read from it;
+    - `ContiguityViolation` ⇒ **BelowOldest**, exactly as for `reader_from`;
+    - `InvalidPosition` ⇒ fall back to `reader_from(cursor)` for this answer. This is not
+      expected for a position this shipper handed out, so count it (observability) but do
+      not fail.
+  - **A reader started by `reader_at` never causes a sticky failure by itself.** If it
+    yields `None`, an `Err`, or an unexpected LSN below the ceiling, the writer discards
+    what that reader produced and retries the answer once with `reader_from(cursor)`. Only
+    the `reader_from` result can lead to ReadFailed.
+  - A position is valid across `append`, `commit`, roll and `checkpoint` on the same `Wal`
+    handle (WAL §8.7). After an in-process WAL reopen, the WAL requires positions with
+    `next_lsn > durable_lsn + 1` to be discarded. Every position here has
+    `next_lsn = cursor ≤ released + 1 ≤ durable_lsn + 1`, so that holds by construction.
+- **Below oldest (R6).** If the reader cannot be opened because of the below-oldest gap
+  error, the integrator checkpointed past the replica (§11) ⇒ **BelowOldest**.
   - The network thread closes the session with a FIN (no `ERR`) and reconnects immediately.
   - The replica's next HELLO is decided by step 1, which answers `RESEED_REQUIRED`.
   - This is loud and skips nothing. It needs no new frame and no new receiver state:
@@ -488,28 +524,31 @@ stall the writer for the whole lag and buffer it in memory. Therefore:
   - **Terminal shipper** (LSN domain, §9.2). Every request taken is answered **Terminal**
     (no read), and the network thread turns it into `ERR(Protocol)`.
 - **Writer stall per `poll` (honest bound).**
-  - `reader_from(cursor)` starts at the base of the segment containing `cursor`. It reads and
-    CRC-checks every earlier record in that segment (WAL §8.5). A `Reader` borrows `&Wal`, so
-    it cannot be kept across calls.
-  - One answer that opens a reader therefore costs at most:
+  - A `Reader` borrows `&Wal`, so it cannot be kept across calls. Each answer opens one.
+  - **The first chunk of a catch-up episode** has no position, so it uses
+    `reader_from(cursor)`. That starts at the base of the segment containing `cursor` and
+    reads and CRC-checks every earlier record in that segment, inside its first `next`
+    (WAL §8.5). It costs at most:
     - **bytes:** `segment_size + catchup_chunk_bytes + max framed record`;
     - **syscalls:** `2 · (records in the containing segment before cursor) +
       2 · catchup_chunk_records`. Each `pread` costs about 1 µs hot.
 
     For small payloads the syscall term dominates.
+  - **Every later chunk of the episode** uses `reader_at(pos)` and costs at most:
+    - **bytes:** `catchup_chunk_bytes + 2 · max framed record` (`reader_at` validates the
+      first record, and `Reader::next` then reads it again);
+    - **syscalls:** `2 · catchup_chunk_records + 2`.
+  - An episode is one run of catch-up for one replica: from a join that needs the log, or
+    from a ring fall-back, until the cutover.
   - `poll` opens a reader for at most `catchup_replicas_per_poll` replicas, round-robin
     (default 1). Answers that read nothing are not limited: join decisions, NeedChunk,
     Attached, Wait, Deferred, and a sticky ReadFailed.
   - The per-`poll` stall is therefore bounded by the chunk and segment sizes, not by the
     number of lagging replicas.
-  - Read amplification depends on the chunk size `C = catchup_chunk_bytes`, the segment size
-    `S = segment_size`, and where in its segment the first chunk starts. Chunks start
-    wherever the previous one ended. For `C < S`, total log reads for a lag `L` are:
-    - about `L · (1 + S/(2C))` on average;
-    - `L · (1 + (S/C + 1)/2)` in the worst case.
-
-    For `C ≥ S` they are `≤ 2L + S`.
-  - Measured hot-cache cost of a full containing-segment rescan via `reader_from`, 32 MiB
+  - Total log reads for a lag `L` are about `L + S` per episode, where `S = segment_size`:
+    the one prefix skip plus the records shipped. (Without positions it was about
+    `L · (1 + S/(2C))`.)
+  - Measured hot-cache cost of a full containing-segment scan via `reader_from`, 32 MiB
     segment, release build:
 
     | Payload | Rescan time |
@@ -518,13 +557,13 @@ stall the writer for the whole lag and buffer it in memory. Therefore:
     | 100 B | 284 ms |
     | 0 B | 1.34 s (1.4 M records, about 0.96 µs each) |
 
-    The rescan is O(records before the cursor in its segment).
-  - **Without a WAL change, the writer stall per answer is O(segment records). For an
-    LMAX-style writer with small events, that is hundreds of ms to seconds.**
-  - A replicated WAL SHOULD size segments by record count. About 16 k records per segment
-    keeps one rescan near 16 ms. This is the main argument for the §16 resumable reader
-    position, which removes the rescan. The WAL API change is an owner decision, outside
-    RM3's guardrails.
+    The scan is O(records before the cursor in its segment).
+  - **Residual stall.** The first chunk of each episode can still stall the writer for one
+    such scan: up to hundreds of ms, or seconds for a large segment of tiny records. It
+    happens once per episode, not once per chunk.
+  - A replicated WAL with small events SHOULD therefore still size segments by record
+    count. About 16 k records per segment keeps that one scan near 16 ms.
+  - Removing the residual needs a chunked skip in the WAL reader (§16).
   - Defaults: `catchup_chunk_bytes = 16 MiB`, `catchup_chunk_records = 16 384`,
     `catchup_replicas_per_poll = 1`. Neither the shipper nor `Wal` can read `segment_size`,
     so the documentation states the formulas and the recommendation.
@@ -549,7 +588,8 @@ stall the writer for the whole lag and buffer it in memory. Therefore:
   - On **Chunk{…, attached}**, the network thread sends the chunk's records, then resumes the
     ring consumer.
   - On **Attached{c}**, it resumes the consumer directly.
-  - On **Chunk{records}**, it sends the records and posts the next chunk request.
+  - On **Chunk{records, pos}**, it sends the records and posts the next chunk request,
+    carrying `pos`.
   - On **Wait**, it re-posts **as soon as `Consumer::released() ≥ cursor`**. That is a
     condition re-checked before every park, not an event: a release wake can coalesce with
     the `DONE` wake. Otherwise it parks for up to `heartbeat` and re-checks.
@@ -611,7 +651,7 @@ The writer keeps **no per-session state** between polls. Every interaction is a 
 network thread posts and the writer answers in a later `poll`.
 
 - **The slot.** Each replica has one request slot holding a request (`Join{d}` or
-  `Chunk{cursor}`), its answer, and the chunk buffer.
+  `Chunk{cursor, pos}`), its answer, and the chunk buffer.
   - A state word moves `IDLE → PENDING → TAKEN → DONE → IDLE`.
   - The writer touches the slot only between `TAKEN` and `DONE`.
   - The network thread touches it only in `IDLE`, or after it has observed `DONE`.
@@ -1083,21 +1123,13 @@ non-loom code path.
   moves capture/catch-up I/O off the writer thread; drop-in shipper swap (wire + receiver
   unchanged); v2.
 - **Snapshot transport standardization** — v1 leaves it to the integrator.
-- **Resumable WAL reader position.** A WAL API addition, so an **owner decision**; the
-  designer **recommends it before RM3**.
-  - Sketch (additive, read-only):
-    - `Reader::position(&self) -> ReaderPos { segment_base, offset, next_lsn }`;
-    - `Wal::reader_at(&self, pos) -> Result<Reader>`. It checks that `segment_base` is still
-      a live segment and that `offset` is aligned and in bounds, and reads the record at
-      `offset` CRC-checked with `lsn == next_lsn`. Otherwise it returns an error, and the
-      caller falls back to `reader_from(next_lsn)`.
-  - No write-path change, and D1–D12 are untouched. It is the same class of change as v7's
-    `reader_from` seek.
-  - With it, every chunk after the first in a session costs O(chunk). Only the first pays
-    the containing-segment rescan. That turns the §9.1 writer stall from O(segment records)
-    (measured up to 1.34 s per 32 MiB segment of tiny records) into O(chunk) per answer.
-  - Without it, RM3 ships with the documented bound and the record-count segment-sizing
-    guidance.
+- **Resumable WAL reader position: DONE** (WAL v7.2, `Reader::position` / `Wal::reader_at`,
+  merged 2026-11-27). §9.1 uses it.
+- **Chunked first skip** (WAL API; owner decision; not planned). The first chunk of a
+  catch-up episode still scans the containing segment's prefix inside one `Reader::next`
+  (§9.1 "Residual stall"). Bounding that needs a reader skip that returns periodically, or
+  a coarse per-segment `(lsn → offset)` index kept by the writer (WAL §8.5 already allows
+  one). Until then, record-count segment sizing is the mitigation.
 - **Former-primary detection past the tripwire** (v1.x, heuristic). `HELLO` would carry the
   crc32c of the replica's record `d`, and the primary would compare it with its own record
   `d` before serving.

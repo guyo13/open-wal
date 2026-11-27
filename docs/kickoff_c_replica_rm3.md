@@ -1,12 +1,8 @@
 # Kickoff C — `open-wal-replica` RM3: catch-up / resume (§9)
 
-> **Status: DRAFT, not yet dispatched.** #53 (RM0–RM2) merged to `main` on 2026-11-26
-> (`bfca651`). It still waits on:
-> 1. this branch (spec §9–§9.3 and this kickoff) reaching `main`;
-> 2. **the owner's decision on the §16 resumable WAL reader position** (WAL v7.2,
->    designer-recommended *before* RM3). If it lands first, the dispatched kickoff adds one
->    scope item ("chunks after the first in a session use `Wal::reader_at`") and T5's bound
->    drops the segment-prefix term. Everything else below is unchanged.
+> **Status: DRAFT, not yet dispatched.** Its prerequisites are on `main`: RM0–RM2 (#53,
+> `bfca651`) and WAL v7.2's resumable reader position (#56, `a0c47bb`). It waits on a final
+> critique pass of the v7.2 revision.
 >
 > **How this draft was hardened.** Three adversarial critique rounds (28 + 27 + 32 findings).
 > Round 1 was re-verified against the RM2 code, with zero findings refuted. The main ones per
@@ -44,6 +40,9 @@ Everything you need from the WAL is on `main`. **Do not touch `open-wal`'s `src/
 4. The WAL API you drive:
    - `Wal::reader_from`: it borrows `&Wal`, starts at the containing segment's base, and
      makes two `pread`s per record;
+   - **`Reader::position()` and `Wal::reader_at(pos)`** (v7.2, WAL spec §8.7): read the
+     whole section, including what `reader_at` promises for a genuine position and what
+     `InvalidPosition` means;
    - `Reader::next`: it ends with **`None`** on an invalid record or an LSN break;
    - `oldest_lsn`, `durable_lsn`, `last_lsn`;
    - `commit()` on an empty batch returns `Ok(durable_lsn)`;
@@ -71,6 +70,16 @@ Everything you need from the WAL is on `main`. **Do not touch `open-wal`'s `src/
    - Joins are answered before any reader is opened in a pass.
 3. **Chunked catch-up (§9.1).**
    - Ceiling = **`Producer::released()`**, the clamped value.
+   - **Reader position (§9.1).** A Chunk answer returns the reader's `position()`; the
+     network thread sends it back in its next chunk request and drops it when the session
+     ends or the ring consumer resumes.
+     - The writer uses `reader_at(pos)` only when `pos.next_lsn() == cursor`; otherwise
+       `reader_from(cursor)`.
+     - `InvalidPosition` ⇒ fall back to `reader_from` and count it.
+     - A reader started by `reader_at` that misbehaves below the ceiling is retried once
+       with `reader_from`; only that result can become ReadFailed.
+     - Never call `Reader::next` for a record that will not be shipped: decide from the
+       next LSN.
    - Answers: Attached / Wait / Deferred / Chunk{records, attached?} / BelowOldest /
      ReadFailed / Terminal.
    - The chunk is bounded by `catchup_chunk_bytes`, counting `payload + 32` per record, and
@@ -170,7 +179,7 @@ them; say so in the PR.
 | T2 | **P5 + boundary table.** Proptest: a checkpoint past a lagging replica ⇒ the next HELLO's first frame is `RESEED_REQUIRED{wal.oldest_lsn()}`. Table via a fake replica: primary seeded at 1000 and checkpointed so `P = oldest > 1001`; `d ∈ {P−2, P−1, P}`, each with `d+1` in the ring and not. Expected: `P−2` ⇒ `RESEED_REQUIRED{P}` and never `SERVING`; `P−1` ⇒ `SERVING{P, P}` then dense; `P` ⇒ `SERVING{P+1, P}`. | `d+1 <= oldest`; `d+2 < oldest`; `primary_oldest` = 0; `primary_oldest` cached at `Shipper::new` |
 | T3 | **Step 2 boundaries**, judged on raw frames. (i) `d == durable` ⇒ `SERVING{d+1}`, then exactly `d+1..d+N`. (ii) `d == durable+1` ⇒ `ERR(Contiguity)` + close; ≥ 2 more commits + polls ⇒ zero `RECORD`s. (iii) `d == ring::MAX_LSN` ⇒ `ERR(Protocol)`. (iv) `heartbeat = 10 s`. `poll` between `commit()` and `on_commit()` with HELLO `d == wal.durable_lsn() > released` ⇒ `SERVING{d+1}`. After `on_commit`, keep appending/committing and polling every ≤ 10 ms; the first `RECORD` arrives within 1 s. Run (i) and (ii) with `d+1` in and out of the ring. | `d+1 > durable`; `d > durable+1`; restore `Ahead ⇒ reject`; refuse only `d > MAX_LSN`; Wait re-posts on heartbeat only |
 | T4 | **R7 restart with two lagging replicas.** They converge via catch-up; T1 oracles. | catch-up never starts |
-| T5 | **Writer stall (Linux).** `segment_size = 8 MiB`, `C = 1 MiB`, lag ≥ 64 MiB, `d` mid-segment. Per reading `poll`: `rchar ≤ segment_size + C + max framed + 4 KiB` **and** `syscr ≤ 2·(segment records + catchup_chunk_records) + slack`. Variants: 4 KiB records; **0-byte payloads** (the record cap binds). Companions, each `rchar ≈ 0`: the poll that answers the **join**; a poll with nothing pending; every poll in a ≥ 2-heartbeat window where a **chunk request** waits (`released < cursor ≤ durable`, no `on_commit`). Record in the PR that "≤ C + one record" fails a correct build. | unchunked; no record cap (0-byte variant); join reads its first chunk inline; Wait falls through to answer 3 |
+| T5 | **Writer stall (Linux).** `segment_size = 8 MiB`, `C = 1 MiB`, lag ≥ 64 MiB, `d` mid-segment (≥ 4 MiB in). **First reading `poll` of the episode:** `rchar ≤ segment_size + C + max framed + 4 KiB`, and `rchar ≥` the prefix (positive control: the skip really happened). **Every later reading `poll`:** `rchar ≤ C + 2·max framed + 4 KiB` and `syscr ≤ 2·catchup_chunk_records + slack`, including polls whose chunk starts mid-segment. Variants: 4 KiB records; **0-byte payloads** (the record cap binds). Companions, each `rchar ≈ 0`: the poll that answers the **join**; a poll with nothing pending; every poll in a ≥ 2-heartbeat window where a **chunk request** waits (`released < cursor ≤ durable`, no `on_commit`). Record in the PR that "≤ C + one record" fails a correct build. | unchunked; no record cap (0-byte variant); join reads its first chunk inline; Wait falls through to answer 3; position ignored (always `reader_from`); position not returned in the Chunk answer |
 | T6 | **Mid-catch-up checkpoint.** Tiny segments; chunk = a few records; the test thread drives `poll` k times. `c−1` is the last LSN shipped. Then checkpoint far past `c`. Preconditions: `oldest > c`, and `released + 1 − oldest > ring capacity + one chunk`. **Oracles:** session 1 = `SERVING{d+1}`, dense `d+1..=c−1`, EOF, no `RECORD ≥ c`, no ERR. Session 2's first P→R frame is `RESEED_REQUIRED{wal.oldest_lsn()}`. Receiver results: `[0] = Ok(())`, `[1] = Err(ReseedRequired{P})`, and **every later entry also** `Err(ReseedRequired{P})` (the shipper keeps reconnecting). Replica log exactly `d+1..=c−1`. | swallow the below-oldest error and jump to `oldest` |
 | T7 | **R4 detection power.** T1 and T4 sample `acked` before the tap after every poll/commit/wait iteration; the proxy checks every ACK at forwarding time. | the strong-form ack-before-commit mutation must fail **T1 and T4 themselves** |
 | T8a | **Ceiling = `released` (per-PR, structural).** Commit `1..=R` **before** `Shipper::new`, so the ring starts at `R+1`. Fake replica with HELLO `d < R`; the lag plus one more record fits one chunk. Commit `R+1..` **without** `on_commit`, then `poll` until the replica has `RECORD == R`. On Linux, assert `rchar > 0` for that poll. Nothing `> R`. Then `on_commit`. | ceiling = `wal.durable_lsn()` |
@@ -184,6 +193,7 @@ them; say so in the PR.
 | T15 | **Heartbeat rules.** Real `Receiver` behind the proxy, `idle_timeout = 3 × heartbeat`. (a) Withhold polls for 2 × heartbeat after the HELLO ⇒ the first P→R frame is `SERVING`, with no ERR. (b) With a post-`SERVING` chunk request pending (`request_pending`), withhold polls for 5 × heartbeat ⇒ HEARTBEATs seen and session count stays 1. (c) Same for a Wait loop. | heartbeat before `SERVING`; no heartbeat while awaiting an answer; a per-wait (not session-level) timer |
 | T16 | **`poll` finishes its pass.** T9 corrupt-segment setup, with A's first chunk request and B's join both pending (`request_pending`), in both id orders; one `poll` ⇒ B gets `SERVING` within 1 s, while A's fake replica stays silent. | return the first error immediately |
 | T17 | **At least one record.** `catchup_chunk_bytes = 64 B`, 1 KiB payloads, lag outside the ring ⇒ converges, one record per chunk. Plus a `Shipper::new` unit test rejecting a zero cap and zero records. | drop "at least one"; accept a zero cap |
+| T18 | **Position safety.** (a) A chunk request whose `pos.next_lsn() ≠ cursor` (drive the answer function directly, or via a fake network side) is served from `cursor`: the wire stays dense. (b) With a forged `ReaderPos` (dev-dependency `open-wal` with the `fuzzing` feature, `fuzzing::reader_pos`), covering both `InvalidPosition` and a position that makes the reader end early: the answer still ships exactly the model's records from `cursor`, no ReadFailed, and the fallback counter moved. (c) After a ring fall-back the next chunk request carries no position. If (b) cannot be built without touching `open-wal`'s `src/`, report it; do not drop it silently. | use `pos` without the `next_lsn == cursor` check (gap or duplicate; proxy density and the sending-side check); no `reader_from` retry (sticky ReadFailed on a forged position); position kept across a ring fall-back |
 | U1 | **Slot unit test (std, no hooks).** Thread W runs `answer` with an `f` that signals, then sleeps 300 ms, then attaches. Once signalled, thread N calls `abandon` ⇒ it returns only after `f` finishes; cursor `PARKED`; slot `IDLE`. Also `abandon` on an `IDLE` slot returns at once. | `abandon` gives up after a bounded wait; no `IDLE` case (hangs) |
 
 **Interop.** T1, T4, T6, T10, T11 and T15 run against the real `Receiver`; this replaces the
@@ -220,7 +230,7 @@ them; say so in the PR.
 ## Definition of done
 - §9–§9.3 are implemented as written.
 - `hold()` and the overflow reconnect are deleted.
-- T1–T17 and U1 are green, each mutation shown failing; *(liveness)* rows are recorded as
+- T1–T18 and U1 are green, each mutation shown failing; *(liveness)* rows are recorded as
   such.
 - L7, L7b, L8 and L8b are added, with their rows shown failing.
 - The nine existing rows have been re-verified.
