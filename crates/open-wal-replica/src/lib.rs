@@ -25,6 +25,10 @@ pub mod ring;
 // the ring itself is built against loom's primitives and model-checked.
 #[cfg(not(loom))]
 mod shipper;
+// The §9.3 request slot is built under `cfg(loom)` too (models L8 / L8b drive
+// it); it is public only so `tests/loom_ring.rs` can.
+#[doc(hidden)]
+pub mod slot;
 mod sync;
 pub mod wire;
 
