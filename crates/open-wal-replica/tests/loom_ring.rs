@@ -51,6 +51,7 @@ use std::time::Duration;
 use loom::thread;
 use open_wal::Lsn;
 use open_wal_replica::ring::{self, Consumer, ConsumerStatus, Producer, RingConfig};
+use open_wal_replica::slot::{Answer, Awaited, ChunkEnd, Idle, Request, Slot};
 
 /// Preemption bound for the models that are too large to explore unbounded.
 const BOUNDED: Option<usize> = Some(3);
@@ -387,5 +388,287 @@ fn l6b_spmc_free_only_when_both_cursors_passed() {
             let (out, status) = finish(h);
             assert_end_state(&out, status, 3, true);
         }
+    });
+}
+
+// ===========================================================================
+// RM3 — late re-attach (L7 / L7b) and the §9.3 request slot (L8 / L8b).
+// ===========================================================================
+
+/// L7's preemption bound (§15.7.4): the bound at which the `Relaxed`-pin
+/// regression fails this model too.
+const L7_BOUND: Option<usize> = Some(4);
+
+/// How many times the late consumer polls `resume()` before giving up, and how
+/// many concurrent drain passes it then makes. Bounded, no spinning (see
+/// [`Wait::Passes`]); the model's main thread finishes after `join`.
+const L7_RESUME_TRIES: usize = 2;
+const L7_PASSES: usize = 2;
+
+/// The shared L7 / L7b prelude (§15.7.4), run sequentially on the model's main
+/// thread: a 2-slot ring whose only consumer fell behind and detached, with
+/// records 3 and 4 in the ring and 4 released.
+fn l7_prelude() -> (Producer, Consumer) {
+    let (mut p, mut cs) = setup(2, 1);
+    let mut c = cs.pop().unwrap();
+    p.capture(Lsn(1), &pat(1));
+    p.capture(Lsn(2), &pat(2));
+    p.release(Lsn(2));
+    p.capture(Lsn(3), &pat(3)); // evicts 1, which the consumer still needed
+    p.release(Lsn(3));
+    let mut out: Emitted = Vec::new();
+    let status = pass(&mut c, &mut out);
+    assert_eq!(status, ConsumerStatus::NeedsCatchUp { next: Lsn(1) });
+    assert!(
+        out.is_empty(),
+        "nothing may be emitted before the fall-behind"
+    );
+    c.detach();
+    p.capture(Lsn(4), &pat(4));
+    p.release(Lsn(4));
+    assert_eq!(p.oldest_valid(), Lsn(3));
+    (p, c)
+}
+
+type Late = (Emitted, Option<ConsumerStatus>, Consumer, Option<Lsn>);
+
+/// The late consumer, spawned **before** the attach. It polls `resume()` with
+/// bounded `yield_now` retries, so the cursor's Release/Acquire is the only
+/// edge between the attach and its drain: no waker, no side flag (either would
+/// mask the attach-ordering mutations).
+fn spawn_late(mut c: Consumer) -> thread::JoinHandle<Late> {
+    thread::spawn(move || {
+        let mut resumed = None;
+        for _ in 0..L7_RESUME_TRIES {
+            if let Some(at) = c.resume() {
+                resumed = Some(at);
+                break;
+            }
+            thread::yield_now();
+        }
+        let mut out: Emitted = Vec::new();
+        let mut status = None;
+        if resumed.is_some() {
+            for _ in 0..L7_PASSES {
+                let st = pass(&mut c, &mut out);
+                status = Some(st);
+                if st != ConsumerStatus::Streaming {
+                    break;
+                }
+                thread::yield_now();
+            }
+        }
+        (out, status, c, resumed)
+    })
+}
+
+/// The finish step (§15.7.4), on the main thread after `join`: a consumer that
+/// never resumed must now see the attach cursor; one that is still `Streaming`
+/// drains once more. Without it, executions that end before the resume (or
+/// before the last release) would have no oracle.
+fn finish_late(h: thread::JoinHandle<Late>, at: u64) -> (Emitted, ConsumerStatus) {
+    let (mut out, status, mut c, resumed) = h.join().unwrap();
+    let mut status = match resumed {
+        Some(got) => {
+            assert_eq!(got, Lsn(at), "resume() must return the attach cursor");
+            status.expect("a resumed consumer made at least one pass")
+        }
+        None => {
+            assert_eq!(
+                c.resume(),
+                Some(Lsn(at)),
+                "after the attach, resume() must return the attach cursor"
+            );
+            ConsumerStatus::Streaming
+        }
+    };
+    if status == ConsumerStatus::Streaming {
+        status = pass(&mut c, &mut out);
+    }
+    (out, status)
+}
+
+/// Every emitted record is genuine, never past its pass watermark, and the
+/// LSNs are dense from the **constant** `from`.
+fn assert_dense_from(out: &Emitted, from: u64) {
+    for (i, (lsn, payload, watermark)) in out.iter().enumerate() {
+        assert_eq!(
+            *lsn,
+            from + i as u64,
+            "emitted LSNs must be dense from {from}: {out:?}"
+        );
+        assert_eq!(
+            payload[..],
+            pat(*lsn)[..],
+            "torn/overwritten record emitted: {out:?}"
+        );
+        assert!(
+            lsn <= watermark,
+            "emitted {lsn} past its pass watermark {watermark}"
+        );
+    }
+}
+
+/// L7 — late re-attach after fall-behind, cutting over at `oldest_valid`. The
+/// consumer is re-attached at 3 while the producer captures and releases 5 and
+/// 6 — both captures can evict a record the consumer has pinned. It must emit
+/// a dense, genuine run from 3: all of 3..=6, or a prefix and `NeedsCatchUp`
+/// at exactly the first LSN it did not emit.
+#[test]
+fn l7_late_reattach_at_oldest_valid() {
+    model(L7_BOUND, || {
+        let (mut p, c) = l7_prelude();
+        let h = spawn_late(c);
+        p.attach(0, Lsn(3)).unwrap();
+        p.capture(Lsn(5), &pat(5));
+        p.release(Lsn(5));
+        p.capture(Lsn(6), &pat(6));
+        p.release(Lsn(6));
+        let (out, status) = finish_late(h, 3);
+        assert_dense_from(&out, 3);
+        match status {
+            ConsumerStatus::Streaming => {
+                let lsns: Vec<u64> = out.iter().map(|e| e.0).collect();
+                assert_eq!(
+                    lsns,
+                    vec![3, 4, 5, 6],
+                    "a released record was never emitted"
+                );
+            }
+            ConsumerStatus::NeedsCatchUp { next } => {
+                assert_eq!(
+                    next.0,
+                    3 + out.len() as u64,
+                    "NeedsCatchUp at the wrong LSN"
+                );
+            }
+            ConsumerStatus::Detached => unreachable!("attached by the model"),
+        }
+    });
+}
+
+/// L7b — a caught-up cutover (`d == durable`): the consumer is attached at
+/// `released + 1 = 5`, then 5 and 6 are captured and released. No eviction is
+/// possible, so it must emit exactly `[5, 6]` and stay `Streaming`: a spurious
+/// `NeedsCatchUp` (a stale catch-up flag from the prelude's fall-behind) fails.
+/// Exhaustive.
+#[test]
+fn l7b_caught_up_cutover_never_spuriously_falls_behind() {
+    model(None, || {
+        let (mut p, c) = l7_prelude();
+        let h = spawn_late(c);
+        p.attach(0, Lsn(5)).unwrap();
+        p.capture(Lsn(5), &pat(5));
+        p.release(Lsn(5));
+        p.capture(Lsn(6), &pat(6));
+        p.release(Lsn(6));
+        let (out, status) = finish_late(h, 5);
+        assert_dense_from(&out, 5);
+        assert_eq!(
+            status,
+            ConsumerStatus::Streaming,
+            "spurious NeedsCatchUp on a caught-up cutover: {out:?}"
+        );
+        let lsns: Vec<u64> = out.iter().map(|e| e.0).collect();
+        assert_eq!(lsns, vec![5, 6], "a released record was never emitted");
+    });
+}
+
+fn fresh_ring() -> (Producer, Consumer) {
+    let (p, mut cs) = ring::ring(
+        RingConfig {
+            slots: 2,
+            slot_bytes: 4,
+            consumers: 1,
+        },
+        Lsn(1),
+        Lsn(0),
+    );
+    (p, cs.pop().unwrap())
+}
+
+/// L8 — handshake teardown (§9.3). The network thread registers itself as the
+/// slot's waker, posts a request, and tears its session down with `abandon`
+/// (which parks via `crate::sync` — no bounded retry, as shipped). The writer
+/// concurrently runs `answer` with an `f` that attaches the consumer.
+///
+/// End state, in every interleaving: the consumer's cursor is `PARKED` (no
+/// stale attach — either the request was taken back and `f` never ran, or
+/// `abandon` waited for `DONE` and detached) and the slot is `IDLE`. Loom
+/// reports any race on the slot's request / answer / buffer by itself.
+#[test]
+fn l8_handshake_teardown_leaves_no_stale_attach() {
+    model(None, || {
+        let (mut p, mut c) = fresh_ring();
+        let slot = loom::sync::Arc::new(Slot::new());
+        let net_slot = loom::sync::Arc::clone(&slot);
+        let h = thread::spawn(move || {
+            net_slot.register_waker(thread::current());
+            net_slot.post(Request::Chunk {
+                cursor: Lsn(1),
+                pos: None,
+            });
+            net_slot.abandon(&mut c);
+            c
+        });
+        slot.answer(|_req, buf| {
+            buf.push(1);
+            p.attach(0, Lsn(1)).expect("the consumer is detached");
+            Answer::Attached { cursor: Lsn(1) }
+        });
+        let mut c = h.join().unwrap();
+        assert!(slot.is_idle(), "the slot must be IDLE after abandon");
+        assert_eq!(
+            c.resume(),
+            None,
+            "stale attach: the cursor must be PARKED after abandon"
+        );
+    });
+}
+
+/// L8b — request and answer handoff (§9.3). The network thread `post`s a
+/// request carrying a reader position and runs `await_answer`; the writer runs
+/// `answer`, whose `f` reads the request and writes the chunk buffer. `f` must
+/// see exactly the posted request, the network thread must read exactly the
+/// answer and the buffer `f` wrote, and loom must find no race.
+#[test]
+fn l8b_request_and_answer_handoff() {
+    model(None, || {
+        let (_p, mut c) = fresh_ring();
+        let slot = loom::sync::Arc::new(Slot::new());
+        let net_slot = loom::sync::Arc::clone(&slot);
+        let req = Request::Chunk {
+            cursor: Lsn(7),
+            pos: Some(open_wal::fuzzing::reader_pos(1, 64, 7)),
+        };
+        let ans = Answer::Chunk {
+            next: Lsn(9),
+            end: ChunkEnd::More(Some(open_wal::fuzzing::reader_pos(1, 128, 9))),
+        };
+        let h = thread::spawn(move || {
+            net_slot.register_waker(thread::current());
+            net_slot.post(req);
+            let mut buf = vec![0xEE];
+            let got =
+                net_slot.await_answer(&mut c, &mut buf, |_| Idle::Park(Duration::from_secs(1)));
+            (got, buf)
+        });
+        let mut seen = None;
+        // The writer's `poll` loop: nothing pending yet ⇒ try again.
+        while slot
+            .answer(|r, buf| {
+                seen = Some(*r);
+                buf.extend_from_slice(&[7, 8]);
+                ans
+            })
+            .is_none()
+        {
+            thread::yield_now();
+        }
+        let (got, buf) = h.join().unwrap();
+        assert_eq!(seen, Some(req), "`f` must see exactly the posted request");
+        assert_eq!(got, Awaited::Answer(ans));
+        assert_eq!(buf, vec![7, 8], "the buffer read must be what `f` wrote");
+        assert!(slot.is_idle());
     });
 }
