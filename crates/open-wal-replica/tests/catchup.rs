@@ -347,8 +347,17 @@ fn t1_overflow_falls_back_in_session_and_cuts_over() {
     });
     sample_r4(&p, 0, &r);
 
-    // Phase C: the writer keeps appending and committing (3 records per
-    // iteration: a few hundred in total, ≪ the ring) while catch-up proceeds.
+    // Phase C: the writer keeps appending and committing while catch-up
+    // proceeds (a few hundred records in total, ≪ the ring).
+    //
+    // After each commit + poll it lets the network thread act on that poll's
+    // answer before it appends again: either the next chunk request is posted,
+    // or the session cut over AND the replica's stream has reached everything
+    // released. Without that, "exactly one overflow" would be a coin toss: the
+    // cutover attaches wherever the chunk happens to end, possibly on the
+    // ring's very oldest record, which the next capture evicts (a second,
+    // legitimate, in-session fall-back — §9.2 — but not the single episode
+    // this test's reachability check wants).
     let mut cut_over_while_committing = false;
     for _ in 0..20_000 {
         if p.sh().request_pending(0) {
@@ -359,11 +368,21 @@ fn t1_overflow_falls_back_in_session_and_cuts_over() {
         }
         p.commit();
         sample_r4(&p, 0, &r);
-        if p.sh().replica_status(0) == Some(ReplicaStatus::Streaming) {
+        let released = p.sh().released().0;
+        let settle = Instant::now() + Duration::from_secs(5);
+        let mut streaming = false;
+        while Instant::now() < settle {
+            streaming = p.sh().replica_status(0) == Some(ReplicaStatus::Streaming)
+                && r.proxy.last().last_record >= Some(released);
+            if streaming || p.sh().request_pending(0) {
+                break;
+            }
+            std::thread::sleep(Duration::from_micros(100));
+        }
+        if streaming {
             cut_over_while_committing = true;
             break;
         }
-        std::thread::sleep(Duration::from_micros(300));
     }
     assert!(
         cut_over_while_committing,
