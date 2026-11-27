@@ -115,6 +115,18 @@ The entire value of this component is **correct behavior under crashes and fault
 
 ## Project status (keep this updated)
 
+- **LATEST (2026-11-27, RM3 review round 1): #59 (replica RM3) reviewed at `fb67914` — needs work, four small required changes; no correctness defect found. #60 (this ledger, the spec and kickoff C) MERGED as `15155b3`.**
+  - **Verified on #59:** root `src/` diff empty; `ring.rs` non-test change is the bound check only; existing tests edited only as allowed. Replica 96 passed ×3, root 191, clippy (both cfgs), fmt, loom 12/12.
+  - **Independent review** (clean copy, none of the PR's claims): no blocker on R1, contiguity, the slot, the writer thread, stickiness or R4. Its randomized stress (two real `Receiver`s, random cuts, 28 seeds × ~7,600 records) saw no gap, duplicate, in-band error or R4 violation.
+  - **Reviewer's own mutations (21, separate worktree):** all fail a designated test or loom model, incl. ceiling = `durable_lsn` on the wire oracle in `--release`.
+  - **Required 1–4:**
+    1. CI red on the head: T1 asserts `catch_up_events == 1` exactly; a second in-session fall-back is legitimate ⇒ `>= 1`.
+    2. After a BelowOldest FIN, a peer that keeps ACKing pins the network thread and hangs `Shipper::shutdown()`/`Drop` on the writer thread ⇒ a deadline on the drain, plus a test.
+    3. The RM2 P3 test fails 6/6 when proptest generates a zero-record script (`ops = [Commit]`): it asserts `Streaming` before the replica connected ⇒ edit authorized (also wait for `Streaming`).
+    4. `pub mod slot` exposes a safe-but-unsound API ⇒ `pub` only under `cfg(loom)`, or `unsafe fn`.
+  - **Accepted as built:** the `cfg(loom)`-only `yield_now` in `Slot::answer` (two L8/L8b rows are invisible to loom without it), `await_answer`'s idle callback, one answer per replica per pass, the join hint, `ERR(Poisoned)` on ReadFailed, T18 at writer level.
+  - **Reviewer slip, recorded:** the first mutation run edited the checkout the independent reviewer was reading for about a minute. The reviewer noticed and worked from a `git archive` copy; mutations now run in their own worktree.
+  - The agent (`session_0179ehu7VN6DNwEDTDecEwd8`) has the fenced follow-up.
 - **LATEST (2026-11-27, RM3): replica RM3 DISPATCHED.**
   - **Contract:** `docs/replica_design_v1.md` §9–§9.3 and `docs/kickoff_c_replica_rm3.md` on `claude/epic-hopper-2jb32q` at `6fa37c1` (the agent copies both files; this branch has no PR).
   - **v7.2 revision:** a Chunk answer returns the reader's `ReaderPos`, the network thread sends it back, and the writer uses `reader_at` only when `pos.next_lsn() == cursor`. Only the first chunk of a catch-up episode pays the segment-prefix scan. A reader started by `reader_at` can never cause a sticky ReadFailed (retry once with `reader_from`).
