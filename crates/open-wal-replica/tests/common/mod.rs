@@ -319,3 +319,607 @@ pub fn wait_until(secs: u64, what: &str, mut f: impl FnMut() -> bool) {
         std::thread::sleep(Duration::from_millis(1));
     }
 }
+
+// ===========================================================================
+// RM3 shared infrastructure (kickoff C): independent oracles.
+// ===========================================================================
+
+use std::io::Read;
+use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::time::Instant;
+
+use open_wal_replica::wire::{Decoded, ErrCode};
+
+/// The first primary→replica frame of a proxied session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum First {
+    Serving { from: u64, oldest: u64 },
+    Reseed { oldest: u64 },
+    Record(u64),
+    Heartbeat,
+    Err(ErrCode),
+    Other,
+}
+
+/// What the proxy saw on one session (one primary connection).
+#[derive(Clone, Debug, Default)]
+pub struct SessionLog {
+    /// The replica's `HELLO.durable_lsn`.
+    pub hello: Option<u64>,
+    /// The first primary→replica frame.
+    pub first: Option<First>,
+    /// `SERVING{from, primary_oldest}`.
+    pub serving: Option<(u64, u64)>,
+    pub first_record: Option<u64>,
+    pub last_record: Option<u64>,
+    pub records: u64,
+    /// Primary→replica heartbeats.
+    pub heartbeats: u64,
+    /// `ERR` frames, either direction (`true` = from the primary).
+    pub errs: Vec<(bool, ErrCode)>,
+    /// The primary closed its sending half cleanly (FIN).
+    pub primary_eof: bool,
+    /// Highest ACK / replica heartbeat forwarded to the primary.
+    pub max_ack: u64,
+}
+
+struct ProxyInner {
+    upstream: SocketAddr,
+    tap: DurableTap,
+    max_payload: u32,
+    paused: AtomicBool,
+    stop: AtomicBool,
+    sessions: Mutex<Vec<SessionLog>>,
+    conns: Mutex<Vec<(TcpStream, TcpStream)>>,
+    violations: Mutex<Vec<String>>,
+    max_ack: AtomicU64,
+}
+
+impl ProxyInner {
+    fn violate(&self, session: usize, what: String) {
+        self.violations
+            .lock()
+            .unwrap()
+            .push(format!("session {session}: {what}"));
+    }
+
+    fn log<R>(&self, session: usize, f: impl FnOnce(&mut SessionLog) -> R) -> R {
+        f(&mut self.sessions.lock().unwrap()[session])
+    }
+}
+
+/// A loopback **forwarding proxy** between the `Shipper` and the real
+/// `Receiver` — the wire-level oracle, independent of both ends.
+///
+/// It forwards raw bytes and tee-parses them (a parse error is a violation),
+/// propagates half-closes, and counts sessions. Per session it checks
+/// `SERVING.from == HELLO.d + 1`, dense `RECORD` LSNs starting at
+/// `SERVING.from`, no `ERR` in either direction, and every `ACK` (and replica
+/// heartbeat) `≤` the replica WAL's [`DurableTap`] **at forwarding time**. It
+/// can pause primary→replica forwarding (backpressure the shipper), wait for a
+/// forwarded ACK, and cut the current session's sockets.
+pub struct Proxy {
+    pub addr: SocketAddr,
+    inner: Arc<ProxyInner>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl Proxy {
+    pub fn start(upstream: SocketAddr, tap: DurableTap, max_payload: u32) -> Proxy {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("proxy bind");
+        let addr = listener.local_addr().unwrap();
+        let inner = Arc::new(ProxyInner {
+            upstream,
+            tap,
+            max_payload,
+            paused: AtomicBool::new(false),
+            stop: AtomicBool::new(false),
+            sessions: Mutex::new(Vec::new()),
+            conns: Mutex::new(Vec::new()),
+            violations: Mutex::new(Vec::new()),
+            max_ack: AtomicU64::new(0),
+        });
+        let inn = Arc::clone(&inner);
+        let handle = std::thread::spawn(move || {
+            loop {
+                let (p, _) = listener.accept().expect("proxy accept");
+                if inn.stop.load(Ordering::Acquire) {
+                    return;
+                }
+                let Ok(r) = TcpStream::connect(inn.upstream) else {
+                    continue; // receiver gone: drop the primary's connection
+                };
+                let _ = p.set_nodelay(true);
+                let _ = r.set_nodelay(true);
+                let session = {
+                    let mut s = inn.sessions.lock().unwrap();
+                    s.push(SessionLog::default());
+                    s.len() - 1
+                };
+                inn.conns
+                    .lock()
+                    .unwrap()
+                    .push((p.try_clone().unwrap(), r.try_clone().unwrap()));
+                let (p2, r2) = (p.try_clone().unwrap(), r.try_clone().unwrap());
+                let (a, b) = (Arc::clone(&inn), Arc::clone(&inn));
+                std::thread::spawn(move || pump(&a, session, p, r, true));
+                std::thread::spawn(move || pump(&b, session, r2, p2, false));
+            }
+        });
+        Proxy {
+            addr,
+            inner,
+            handle: Some(handle),
+        }
+    }
+
+    /// Stop forwarding primary→replica bytes (the shipper's writes back up).
+    pub fn pause(&self) {
+        self.inner.paused.store(true, Ordering::Release);
+    }
+
+    pub fn resume(&self) {
+        self.inner.paused.store(false, Ordering::Release);
+    }
+
+    pub fn session_count(&self) -> usize {
+        self.inner.sessions.lock().unwrap().len()
+    }
+
+    pub fn sessions(&self) -> Vec<SessionLog> {
+        self.inner.sessions.lock().unwrap().clone()
+    }
+
+    /// The latest session's log (panics if none yet).
+    pub fn last(&self) -> SessionLog {
+        self.sessions().last().cloned().expect("no session yet")
+    }
+
+    pub fn violations(&self) -> Vec<String> {
+        self.inner.violations.lock().unwrap().clone()
+    }
+
+    /// No parse error, no `ERR` frame, dense records, honest `SERVING`, and
+    /// every ACK `≤` the tap at forwarding time.
+    pub fn assert_clean(&self) {
+        let v = self.violations();
+        assert!(v.is_empty(), "proxy oracle violations: {v:#?}");
+    }
+
+    /// Highest ACK forwarded to the primary so far (any session).
+    pub fn max_ack(&self) -> u64 {
+        self.inner.max_ack.load(Ordering::Acquire)
+    }
+
+    /// Wait until an ACK `≥ lsn` has been forwarded to the primary.
+    pub fn wait_ack(&self, lsn: u64, secs: u64) {
+        wait_until(secs, "a forwarded ACK", || self.max_ack() >= lsn);
+    }
+
+    /// Cut the latest session: both sockets are shut down in both directions.
+    pub fn cut_current(&self) {
+        if let Some((p, r)) = self.inner.conns.lock().unwrap().last() {
+            let _ = p.shutdown(Shutdown::Both);
+            let _ = r.shutdown(Shutdown::Both);
+        }
+    }
+
+    pub fn stop(mut self) {
+        self.inner.stop.store(true, Ordering::Release);
+        let _ = TcpStream::connect(self.addr);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Forward `from → to`, tee-parsing every frame. `p2r`: primary→replica.
+fn pump(inner: &ProxyInner, session: usize, mut from: TcpStream, mut to: TcpStream, p2r: bool) {
+    let limits = Limits::new(if p2r { inner.max_payload } else { 0 });
+    let mut parse: Vec<u8> = Vec::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        if p2r {
+            while inner.paused.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        let n = match from.read(&mut buf) {
+            Ok(0) => {
+                if p2r {
+                    inner.log(session, |l| l.primary_eof = true);
+                }
+                let _ = to.shutdown(Shutdown::Write); // propagate the half-close
+                return;
+            }
+            Ok(n) => n,
+            Err(_) => {
+                let _ = to.shutdown(Shutdown::Both);
+                return;
+            }
+        };
+        if p2r {
+            // Bytes read while a pause began are held, not forwarded.
+            while inner.paused.load(Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        parse.extend_from_slice(&buf[..n]);
+        let mut off = 0;
+        loop {
+            match wire::decode_frame(&parse[off..], &limits) {
+                Ok(Decoded::Frame(f, used)) => {
+                    if p2r {
+                        observe_p2r(inner, session, &f);
+                    } else {
+                        observe_r2p(inner, session, &f);
+                    }
+                    off += used;
+                }
+                Ok(Decoded::Incomplete { .. }) => break,
+                Err(e) => {
+                    inner.violate(session, format!("unparseable frame (p2r={p2r}): {e:?}"));
+                    let _ = to.shutdown(Shutdown::Both);
+                    let _ = from.shutdown(Shutdown::Both);
+                    return;
+                }
+            }
+        }
+        parse.drain(..off);
+        if to.write_all(&buf[..n]).is_err() {
+            let _ = from.shutdown(Shutdown::Both);
+            return;
+        }
+    }
+}
+
+fn observe_p2r(inner: &ProxyInner, session: usize, f: &Frame<'_>) {
+    let first = match *f {
+        Frame::Serving {
+            from_lsn,
+            primary_oldest,
+        } => First::Serving {
+            from: from_lsn.0,
+            oldest: primary_oldest.0,
+        },
+        Frame::ReseedRequired { primary_oldest } => First::Reseed {
+            oldest: primary_oldest.0,
+        },
+        Frame::Record { lsn, .. } => First::Record(lsn.0),
+        Frame::Heartbeat { .. } => First::Heartbeat,
+        Frame::Err { code, .. } => First::Err(code),
+        _ => First::Other,
+    };
+    let mut bad = None;
+    inner.log(session, |l| {
+        l.first.get_or_insert(first);
+        match first {
+            First::Serving { from, oldest } => {
+                if l.serving.is_some() {
+                    bad = Some("a second SERVING".to_string());
+                }
+                if l.hello.map(|d| d + 1) != Some(from) {
+                    bad = Some(format!(
+                        "SERVING.from {from} != HELLO.d + 1 ({:?})",
+                        l.hello
+                    ));
+                }
+                l.serving = Some((from, oldest));
+            }
+            First::Record(lsn) => {
+                let want = match (l.last_record, l.serving) {
+                    (Some(last), _) => Some(last + 1),
+                    (None, Some((from, _))) => Some(from),
+                    (None, None) => None,
+                };
+                if want != Some(lsn) {
+                    bad = Some(format!("RECORD {lsn} is not dense (expected {want:?})"));
+                }
+                l.first_record.get_or_insert(lsn);
+                l.last_record = Some(lsn);
+                l.records += 1;
+            }
+            First::Heartbeat => l.heartbeats += 1,
+            First::Err(code) => {
+                l.errs.push((true, code));
+                bad = Some(format!("ERR({code:?}) from the primary"));
+            }
+            First::Reseed { .. } => {}
+            First::Other => bad = Some("unexpected primary→replica frame".to_string()),
+        }
+    });
+    if let Some(b) = bad {
+        inner.violate(session, b);
+    }
+}
+
+fn observe_r2p(inner: &ProxyInner, session: usize, f: &Frame<'_>) {
+    match *f {
+        Frame::Hello { durable_lsn, .. } => inner.log(session, |l| l.hello = Some(durable_lsn.0)),
+        Frame::Ack { durable_lsn } | Frame::Heartbeat { durable_lsn } => {
+            // R4, independent oracle: the replica WAL's own observer, read at
+            // forwarding time (before the primary can see the ACK).
+            let durable = inner.tap.get();
+            if durable_lsn.0 > durable {
+                inner.violate(
+                    session,
+                    format!(
+                        "R4: ACK {} forwarded while the replica WAL is durable only to {durable}",
+                        durable_lsn.0
+                    ),
+                );
+            }
+            inner.log(session, |l| l.max_ack = l.max_ack.max(durable_lsn.0));
+            if matches!(f, Frame::Ack { .. }) {
+                inner.max_ack.fetch_max(durable_lsn.0, Ordering::AcqRel);
+            }
+        }
+        Frame::Err { code, .. } => {
+            inner.log(session, |l| l.errs.push((false, code)));
+            inner.violate(session, format!("ERR({code:?}) from the replica"));
+        }
+        _ => inner.violate(session, "unexpected replica→primary frame".to_string()),
+    }
+}
+
+/// A real `Receiver` behind a [`Proxy`]: point the shipper at `proxy.addr`.
+pub struct Proxied {
+    pub server: ReplicaServer,
+    pub proxy: Proxy,
+}
+
+impl Proxied {
+    pub fn start(dir: &Path, cfg: ReceiverConfig) -> Proxied {
+        let max = cfg.wal_config.max_record_size;
+        let server = ReplicaServer::start(dir, cfg);
+        let proxy = Proxy::start(server.addr, server.tap.clone(), max);
+        Proxied { server, proxy }
+    }
+
+    pub fn addr(&self) -> SocketAddr {
+        self.proxy.addr
+    }
+}
+
+// ---- /proc/thread-self/io probe (Linux): the calling thread's read volume ----
+
+/// `rchar` / `syscr` of the calling thread.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IoCount {
+    pub rchar: u64,
+    pub syscr: u64,
+}
+
+/// Read `/proc/thread-self/io`. `None` off Linux or without
+/// `CONFIG_TASK_IO_ACCOUNTING`.
+pub fn thread_io() -> Option<IoCount> {
+    let s = std::fs::read_to_string("/proc/thread-self/io").ok()?;
+    let field = |k: &str| {
+        s.lines()
+            .find_map(|l| l.strip_prefix(k))
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    };
+    Some(IoCount {
+        rchar: field("rchar:")?,
+        syscr: field("syscr:")?,
+    })
+}
+
+/// Whether the probe works here. Tests that need it print a loud skip.
+pub fn io_probe_available() -> bool {
+    thread_io().is_some()
+}
+
+/// What one probe read itself adds to the counters (measured).
+pub fn io_probe_self_cost() -> IoCount {
+    let mut worst = IoCount::default();
+    for _ in 0..4 {
+        let a = thread_io().expect("io probe");
+        let b = thread_io().expect("io probe");
+        worst.rchar = worst.rchar.max(b.rchar - a.rchar);
+        worst.syscr = worst.syscr.max(b.syscr - a.syscr);
+    }
+    worst
+}
+
+/// Run `f` and return the calling thread's `rchar`/`syscr` delta across it,
+/// minus the probe's measured self-cost.
+pub fn measure_io<T>(f: impl FnOnce() -> T) -> (T, IoCount) {
+    let cost = io_probe_self_cost();
+    let a = thread_io().expect("io probe");
+    let out = f();
+    let b = thread_io().expect("io probe");
+    (
+        out,
+        IoCount {
+            rchar: (b.rchar - a.rchar).saturating_sub(cost.rchar),
+            syscr: (b.syscr - a.syscr).saturating_sub(cost.syscr),
+        },
+    )
+}
+
+// ---- a hand-driven fake replica (the wire is the oracle) ----
+
+/// One frame as a fake replica saw it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Saw {
+    Serving {
+        from: u64,
+        oldest: u64,
+    },
+    Reseed {
+        oldest: u64,
+    },
+    Record(u64, Vec<u8>),
+    Heartbeat(u64),
+    Err(ErrCode, String),
+    /// The primary closed the connection.
+    Eof,
+    /// Nothing arrived within the timeout.
+    Timeout,
+}
+
+/// A listener a `Shipper` connects to, driven by hand.
+pub struct Fake {
+    listener: TcpListener,
+    max_payload: u32,
+}
+
+impl Fake {
+    pub fn new(max_payload: u32) -> Fake {
+        Fake {
+            listener: TcpListener::bind("127.0.0.1:0").unwrap(),
+            max_payload,
+        }
+    }
+
+    pub fn addr(&self) -> SocketAddr {
+        self.listener.local_addr().unwrap()
+    }
+
+    /// Accept the primary's next connection and send `HELLO{durable}`.
+    pub fn hello(&self, durable: u64) -> FakeConn {
+        self.listener.set_nonblocking(false).unwrap();
+        let (stream, _) = self.listener.accept().unwrap();
+        let mut c = FakeConn {
+            rd: FrameReader::new(stream.try_clone().unwrap(), Limits::new(self.max_payload)),
+            stream,
+        };
+        c.send(&Frame::Hello {
+            proto_ver: PROTO_VERSION,
+            replica_id: 9,
+            durable_lsn: Lsn(durable),
+        });
+        c
+    }
+
+    /// How many further connections the primary has opened (non-blocking):
+    /// an independent count of reconnects.
+    pub fn pending_connections(&self) -> usize {
+        self.listener.set_nonblocking(true).unwrap();
+        let mut n = 0;
+        let mut held = Vec::new();
+        while let Ok((s, _)) = self.listener.accept() {
+            held.push(s);
+            n += 1;
+        }
+        self.listener.set_nonblocking(false).unwrap();
+        n
+    }
+}
+
+pub struct FakeConn {
+    stream: TcpStream,
+    rd: FrameReader<TcpStream>,
+}
+
+impl FakeConn {
+    pub fn send(&mut self, f: &Frame<'_>) {
+        let mut b = Vec::new();
+        wire::encode_frame(f, &mut b);
+        let _ = self.stream.write_all(&b);
+    }
+
+    pub fn ack(&mut self, lsn: u64) {
+        self.send(&Frame::Ack {
+            durable_lsn: Lsn(lsn),
+        });
+    }
+
+    /// The next frame, or `Timeout` / `Eof`.
+    pub fn next(&mut self, timeout: Duration) -> Saw {
+        self.stream
+            .set_read_timeout(Some(timeout.max(Duration::from_millis(1))))
+            .unwrap();
+        match self.rd.read_frame() {
+            Ok(Frame::Serving {
+                from_lsn,
+                primary_oldest,
+            }) => Saw::Serving {
+                from: from_lsn.0,
+                oldest: primary_oldest.0,
+            },
+            Ok(Frame::ReseedRequired { primary_oldest }) => Saw::Reseed {
+                oldest: primary_oldest.0,
+            },
+            Ok(Frame::Record { lsn, payload }) => Saw::Record(lsn.0, payload.to_vec()),
+            Ok(Frame::Heartbeat { durable_lsn }) => Saw::Heartbeat(durable_lsn.0),
+            Ok(Frame::Err { code, msg }) => Saw::Err(code, msg.to_owned()),
+            Ok(other) => panic!("fake replica: unexpected {other:?}"),
+            Err(ReplError::Io(e))
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                Saw::Timeout
+            }
+            Err(_) => Saw::Eof,
+        }
+    }
+
+    /// The next frame that is not a heartbeat.
+    pub fn next_data(&mut self, timeout: Duration) -> Saw {
+        let deadline = Instant::now() + timeout;
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match self.next(left) {
+                Saw::Heartbeat(_) if Instant::now() < deadline => {}
+                Saw::Heartbeat(_) => return Saw::Timeout,
+                other => return other,
+            }
+        }
+    }
+
+    /// Everything that arrives within `window` (heartbeats included), stopping
+    /// early at EOF.
+    pub fn drain(&mut self, window: Duration) -> Vec<Saw> {
+        let deadline = Instant::now() + window;
+        let mut out = Vec::new();
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return out;
+            }
+            match self.next(left) {
+                Saw::Timeout => return out,
+                Saw::Eof => {
+                    out.push(Saw::Eof);
+                    return out;
+                }
+                s => out.push(s),
+            }
+        }
+    }
+
+    /// Like [`drain`](Self::drain), keeping only `RECORD` LSNs + payloads.
+    pub fn drain_records(&mut self, window: Duration) -> Vec<(u64, Vec<u8>)> {
+        self.drain(window)
+            .into_iter()
+            .filter_map(|s| match s {
+                Saw::Record(l, p) => Some((l, p)),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+/// The sorted base LSNs of the segment files in `dir` — read from the
+/// directory itself (independent of the `Wal` handle).
+pub fn segment_bases(dir: &Path) -> Vec<u64> {
+    let mut v: Vec<u64> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(|e| {
+            let name = e.unwrap().file_name().into_string().ok()?;
+            name.strip_suffix(".wal")?.parse::<u64>().ok()
+        })
+        .collect();
+    v.sort_unstable();
+    v
+}
+
+/// The path of the segment file with base LSN `base`.
+pub fn segment_path(dir: &Path, base: u64) -> std::path::PathBuf {
+    dir.join(format!("{base:020}.wal"))
+}

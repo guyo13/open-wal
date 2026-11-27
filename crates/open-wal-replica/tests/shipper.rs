@@ -94,6 +94,19 @@ fn assert_no_inband_errors(results: &[Result<(), open_wal_replica::ReplError>]) 
                 e.err_code().is_none(),
                 "replica session failed in-band: {e:?}"
             );
+            assert!(
+                !matches!(
+                    e,
+                    open_wal_replica::ReplError::Remote {
+                        code: ErrCode::Contiguity
+                            | ErrCode::Protocol
+                            | ErrCode::WireCrc
+                            | ErrCode::Poisoned,
+                        ..
+                    }
+                ),
+                "the primary ended the replica's session in-band: {e:?}"
+            );
         }
     }
 }
@@ -142,19 +155,19 @@ fn run_primary(ops: &[Op], release_on_capture: bool) -> Option<String> {
             Op::Pause(ms) => {
                 let until = Instant::now() + Duration::from_millis(u64::from(*ms) + 1);
                 while Instant::now() < until {
-                    sh.poll();
+                    sh.poll(&wal).unwrap();
                     check(&wal, &sh);
                     std::thread::sleep(Duration::from_micros(200));
                 }
             }
         }
-        sh.poll();
+        sh.poll(&wal).unwrap();
         check(&wal, &sh);
     }
     let w = wal.commit().unwrap();
     sh.on_commit(w);
     wait_until(30, "replica to ack the primary's durable watermark", || {
-        sh.poll();
+        sh.poll(&wal).unwrap();
         check(&wal, &sh);
         sh.replica_acked_lsn(0) == Some(w)
     });
@@ -287,7 +300,7 @@ fn replica_ahead_of_primary_is_rejected() {
     let mut sh = Shipper::new(ship_cfg(fake.addr()), &wal).unwrap();
     let s = fake.accept_hello(100, PROTO_VERSION);
     wait_until(10, "join request", || {
-        sh.poll();
+        sh.poll(&wal).unwrap();
         sh.replica_status(0) == Some(ReplicaStatus::Rejected)
     });
     assert_eq!(
@@ -311,22 +324,31 @@ fn protocol_version_mismatch_is_refused() {
     sh.shutdown();
 }
 
-/// §8.3 overflow + §4.2 "the writer never blocks": a replica that accepts and
-/// then stops reading stalls only its own network thread. The writer keeps
-/// appending/capturing/committing with bounded per-call latency, the ring
-/// overflows past the stalled replica (`NeedsCatchUp`, repeatedly — once
-/// mid-stream and again when it reconnects with a resume point the ring no
-/// longer holds), and what *was* shipped is a dense, duplicate-free,
-/// byte-identical prefix.
+/// §8.3 overflow + §4.2 "the writer never blocks" + §9.2 in-session fall-back.
+/// A replica that accepts and then stops reading stalls only its own network
+/// thread. The writer keeps appending / capturing / committing / polling with
+/// bounded per-call latency while the ring overflows past the stalled replica.
+/// When the replica reads again it is served the rest **inside the same
+/// session** — `CatchingUp` from the log in chunks, then `Streaming` from the
+/// ring — and what it receives is the dense, duplicate-free, byte-identical
+/// log.
+///
+/// Geometry (RM3): 1 MiB segments and 64 KiB / 512-record chunks, so a reading
+/// `poll` costs at most one 1 MiB containing-segment prefix scan plus one
+/// chunk (§9.1). Per-poll budget: a poll that opens no reader < 50 ms; a
+/// reading poll < 500 ms (generous for shared CI runners — an unchunked read
+/// of the ~20 MB lag would be far above it).
 #[test]
 fn stalled_replica_overflows_without_blocking_the_writer() {
     // ~25 MB of frames: more than loopback socket buffers can absorb, so the
     // network thread really blocks in write().
     const N: u64 = 200_000;
     const LEN: usize = 100;
+    const QUIET_POLL: Duration = Duration::from_millis(50);
+    const READING_POLL: Duration = Duration::from_millis(500);
     let pdir = tempfile::tempdir().unwrap();
     let big = open_wal::WalConfig {
-        segment_size: 64 * 1024 * 1024,
+        segment_size: 1024 * 1024,
         max_record_size: 256,
     };
     let (mut wal, _) = Wal::open(pdir.path(), big).unwrap();
@@ -338,12 +360,39 @@ fn stalled_replica_overflows_without_blocking_the_writer() {
     cfg.ring_bytes = 1024 * 128;
     cfg.slot_bytes = 128;
     cfg.io_timeout = Duration::from_secs(30);
+    cfg.catchup_chunk_bytes = 64 * 1024;
+    cfg.catchup_chunk_records = 512;
     let mut sh = Shipper::new(cfg, &wal).unwrap();
     let s = fake.accept_hello(0, PROTO_VERSION);
     wait_until(10, "join", || {
-        sh.poll();
+        sh.poll(&wal).unwrap();
         sh.replica_status(0) == Some(ReplicaStatus::Streaming)
     });
+
+    // A poll, timed, and classified by whether it read the log: the writer
+    // thread's own `rchar` (independent of the shipper), where available.
+    let probe = common::io_probe_available();
+    let mut worst_quiet = Duration::ZERO;
+    let mut worst_reading = Duration::ZERO;
+    let mut reading_polls = 0u64;
+    let mut timed_poll = |sh: &mut Shipper, wal: &Wal| {
+        let t = Instant::now();
+        let read = if probe {
+            let ((), io) = common::measure_io(|| sh.poll(wal).unwrap());
+            io.rchar > 0
+        } else {
+            sh.poll(wal).unwrap();
+            // Without the probe, every poll is held to the reading budget.
+            true
+        };
+        let took = t.elapsed();
+        if read {
+            reading_polls += 1;
+            worst_reading = worst_reading.max(took);
+        } else {
+            worst_quiet = worst_quiet.max(took);
+        }
+    };
 
     // The replica now reads nothing; the socket buffers fill and the network
     // thread blocks in write().
@@ -360,10 +409,12 @@ fn stalled_replica_overflows_without_blocking_the_writer() {
             let t = Instant::now();
             sh.on_commit(w);
             worst_commit = worst_commit.max(t.elapsed());
+            timed_poll(&mut sh, &wal);
         }
     }
     let w = wal.commit().unwrap();
     sh.on_commit(w);
+    timed_poll(&mut sh, &wal);
     // Generous bounds (shared CI runners): the point is "never waits on the
     // network", which would show up as ≥ seconds here (io_timeout = 30 s).
     assert!(
@@ -371,10 +422,50 @@ fn stalled_replica_overflows_without_blocking_the_writer() {
         "writer blocked: worst capture {worst_capture:?}, worst on_commit {worst_commit:?}"
     );
 
-    // Unstall: read everything the primary managed to send.
-    let reader = std::thread::spawn(move || read_frames(s, 256, false));
-    wait_until(30, "NeedsCatchUp mid-stream", || sh.catch_up_events(0) >= 1);
-    let seen = reader.join().unwrap();
+    // Unstall: the replica reads everything, on the SAME connection, acking as
+    // it goes (so the session's ack reader stays alive).
+    let reader = std::thread::spawn(move || {
+        let mut rd = FrameReader::new(s.try_clone().unwrap(), Limits::new(256));
+        let mut seen = Vec::new();
+        let mut last = 0u64;
+        while last < N {
+            match rd.read_frame() {
+                Ok(Frame::Serving { from_lsn, .. }) => seen.push(Seen::Serving(from_lsn.0)),
+                Ok(Frame::Record { lsn, payload }) => {
+                    last = lsn.0;
+                    seen.push(Seen::Record(lsn.0, payload.to_vec()));
+                    if last % 1000 == 0 || last == N {
+                        let mut b = Vec::new();
+                        wire::encode_frame(&Frame::Ack { durable_lsn: lsn }, &mut b);
+                        (&s).write_all_checked(&b);
+                    }
+                }
+                Ok(Frame::Heartbeat { .. }) => {}
+                Ok(Frame::Err { code, .. }) => {
+                    seen.push(Seen::Err(code));
+                    break;
+                }
+                Ok(other) => panic!("unexpected {other:?}"),
+                Err(_) => break,
+            }
+        }
+        (seen, s)
+    });
+    // The writer thread keeps polling (the §9.1 cadence) and watches the
+    // session go CatchingUp → Streaming.
+    let mut saw_catching_up = false;
+    wait_until(60, "in-session catch-up and cutover", || {
+        timed_poll(&mut sh, &wal);
+        match sh.replica_status(0) {
+            Some(ReplicaStatus::CatchingUp) => saw_catching_up = true,
+            Some(ReplicaStatus::Streaming) if saw_catching_up => {
+                return sh.replica_acked_lsn(0) == Some(w);
+            }
+            _ => {}
+        }
+        false
+    });
+    let (seen, _s) = reader.join().unwrap();
     assert_eq!(seen.first(), Some(&Seen::Serving(1)));
     let mut next = 1;
     for f in &seen[1..] {
@@ -384,29 +475,34 @@ fn stalled_replica_overflows_without_blocking_the_writer() {
                 assert_eq!(*p, payload(*l, LEN), "byte-identical");
                 next += 1;
             }
-            Seen::Heartbeat => {}
             other => panic!("unexpected {other:?}"),
         }
     }
-    let got = next - 1;
+    assert_eq!(next - 1, N, "the replica converged within its one session");
     eprintln!(
-        "stalled replica: received {got}/{N} records before falling behind; \
-         worst capture {worst_capture:?}, worst on_commit {worst_commit:?}"
+        "stalled replica: worst capture {worst_capture:?}, worst on_commit {worst_commit:?}, \
+         worst non-reading poll {worst_quiet:?}, {reading_polls} reading polls (worst \
+         {worst_reading:?}), {} catch-up episode(s)",
+        sh.catch_up_events(0)
     );
-    assert!(got > 0, "the replica must have streamed before stalling");
-    assert!(got < N, "a stalled replica cannot have received everything");
-
-    // The shipper reconnects at once; the replica resumes from what it got,
-    // which the ring no longer holds ⇒ NeedsCatchUp again (served by RM3).
-    let s2 = fake.accept_hello(got, PROTO_VERSION);
-    wait_until(10, "second NeedsCatchUp", || {
-        sh.poll();
-        sh.catch_up_events(0) >= 2
-    });
-    assert_eq!(sh.replica_status(0), Some(ReplicaStatus::NeedsCatchUp));
-    // Held with heartbeats only: never a record it cannot be served densely.
-    let held = read_frames(s2, 256, true);
-    assert_eq!(held, vec![Seen::Heartbeat]);
+    assert!(
+        worst_quiet < QUIET_POLL,
+        "a poll that opened no reader took {worst_quiet:?}"
+    );
+    assert!(
+        worst_reading < READING_POLL,
+        "a reading poll took {worst_reading:?} (budget {READING_POLL:?})"
+    );
+    assert!(
+        reading_polls >= 2,
+        "the lag must have been served from the log in several chunks"
+    );
+    // In-session: no reconnect. The listener saw exactly the one connection.
+    fake.listener.set_nonblocking(true).unwrap();
+    assert!(
+        fake.listener.accept().is_err(),
+        "the shipper reconnected: overflow must fall back inside the session"
+    );
     sh.shutdown();
 }
 
@@ -430,12 +526,14 @@ fn primary_restart_resumes_from_replica_hello() {
             if i % 7 == 6 {
                 let w = wal.commit().unwrap();
                 sh.on_commit(w);
+                sh.poll(&wal).unwrap();
             }
         }
         let w = wal.commit().unwrap();
         sh.on_commit(w);
+        sh.poll(&wal).unwrap();
         wait_until(30, "replica to catch up", || {
-            sh.poll();
+            sh.poll(&wal).unwrap();
             sh.replica_acked_lsn(0) == Some(w)
         });
         sh.shutdown(); // "crash": no state survives but the WAL itself
@@ -518,12 +616,14 @@ fn acks_during_a_blocked_batch_write_keep_the_session() {
         if l % 128 == 0 {
             let w = wal.commit().unwrap();
             sh.on_commit(w);
+            sh.poll(&wal).unwrap();
         }
     }
     let w = wal.commit().unwrap();
     sh.on_commit(w);
+    sh.poll(&wal).unwrap();
     wait_until(120, "replica to ack everything", || {
-        sh.poll();
+        sh.poll(&wal).unwrap();
         sh.replica_acked_lsn(0) == Some(w)
     });
     sh.shutdown();
@@ -551,7 +651,7 @@ fn acked_drops_when_a_wiped_replica_says_hello() {
     let mut sh = Shipper::new(ship_cfg(fake.addr()), &wal).unwrap();
     let s = fake.accept_hello(0, PROTO_VERSION);
     wait_until(10, "join", || {
-        sh.poll();
+        sh.poll(&wal).unwrap();
         sh.replica_status(0) == Some(ReplicaStatus::Streaming)
     });
     for i in 0..5u8 {
@@ -577,7 +677,7 @@ fn acked_drops_when_a_wiped_replica_says_hello() {
     drop(s);
     let _s2 = fake.accept_hello(0, PROTO_VERSION);
     wait_until(10, "acked to drop to the new replica's durable_lsn", || {
-        sh.poll();
+        sh.poll(&wal).unwrap();
         sh.replica_acked_lsn(0) == Some(Lsn(0))
     });
     assert_eq!(sh.min_replica_acked_lsn(), Some(Lsn(0)));
@@ -603,12 +703,14 @@ fn two_replicas_stream_independently() {
         if l % 17 == 0 {
             let w = wal.commit().unwrap();
             sh.on_commit(w);
+            sh.poll(&wal).unwrap();
         }
     }
     let w = wal.commit().unwrap();
     sh.on_commit(w);
+    sh.poll(&wal).unwrap();
     wait_until(30, "both replicas to ack", || {
-        sh.poll();
+        sh.poll(&wal).unwrap();
         sh.replica_acked_lsn(0) == Some(w) && sh.replica_acked_lsn(1) == Some(w)
     });
     assert_eq!(sh.min_replica_acked_lsn(), Some(w));
