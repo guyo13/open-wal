@@ -399,8 +399,8 @@ underspecified, flag it and propose a fix — do not silently diverge.
     0.26 ms, on_commit 0.06 ms, non-reading poll 1.2 ms, 334 reading polls with worst 12.7 ms,
     one catch-up episode, one connection); `capture_at_or_below_released_writes_nothing`
     inspects the slot (shown failing on a build that proceeds with the write).
-  - **Tests (all green; replica suite 98 = 39 unit + 27 catch-up + 17 receiver + 2 overflow + 11
-    shipper + 2 shim-only):** `tests/catchup.rs` T1–T6, T8a, T9–T13, T15–T17;
+  - **Tests (all green; replica suite at the first push: 96 + 2 shim-only = 39 unit + 27 catch-up
+    + 17 receiver + 2 overflow + 11 shipper; 98 + 2 after the review follow-up's T6b):** `tests/catchup.rs` T1–T6, T8a, T9–T13, T15–T17;
     `src/shipper.rs` tests T14, T18; `src/slot.rs` tests U1; `src/ring.rs` tests T12;
     `tests/poisoned_primary.rs` T8b (K=0: durable 12 / last 22, 6 records exposed above durable;
     K=2: durable 18 / last 22, 4 exposed; exactly `4..=12` served in both; §8.2 reopen then
@@ -552,7 +552,31 @@ underspecified, flag it and propose a fix — do not silently diverge.
         branch and 2 in 25 on unmodified `main` (`a0c47bb`)**. Proposed fix for the designer:
         wait for `Streaming` as well. No `shipper.proptest-regressions` file is committed (it
         would pin the failing case).
-- **Current milestone:** RM3 — implemented, PR open, **awaiting designer review + owner merge**.
+- **RM3 review follow-up (2026-11-27, designer review of #59 at `fb67914`: no correctness defect;
+  four required changes + a `main` merge, all landed on the same branch).**
+  1. **T1 was flaky in CI** (`exactly one overflow … left: 2`): it asserted a shipper counter as
+     an exact value. Now `episodes >= 1`; the in-session oracle stays the proxy's session count
+     (exactly 1). **T1 run 50 times: 50 passed.**
+  2. **A peer could hang `Shipper::shutdown`**: after BelowOldest the primary half-closed and
+     waited for the ack reader, whose read timeout restarts on every frame. The post-FIN drain
+     now has an `io_timeout` deadline, then `shutdown(Both)`; it also ends on shutdown. New test
+     **T6b** (fake replica ACKing every 20 ms after the FIN, two shapes): the next HELLO gets
+     `RESEED_REQUIRED` (measured 407 ms with `io_timeout` 400 ms) and `shutdown()` returns
+     (0.6 ms). Mutations: remove the deadline ⇒ `no new session within 3.4s: the peer's ACKs
+     pinned the old one`; no bounded drain at all (the code as reviewed) ⇒ that and
+     `Shipper::shutdown did not return within 3.4s`.
+  3. **P3 fixed** (edit to the RM2 test authorized in the review): it also waits for `Streaming`.
+     With `ops = [Commit]` pinned: 0 failures in 6 runs (was 6 of 6). No regressions file
+     committed. Finding 16 above is thereby closed.
+  4. **`slot` is no longer public**: `pub` only under `cfg(loom)`, `pub(crate)` otherwise;
+     `Slot::is_idle` is `cfg(any(test, loom))`. L8/L8b still drive the shipped sequences; all six
+     L8/L8b rows and both U1 rows re-run and fail.
+  - Also: the network thread drops its chunk buffer at the cutover (one chunk-sized buffer per
+    replica, as §9.1 states); stale RM2 doc comments in `ring.rs` updated (comments only).
+  - Gates after the follow-up: replica suite 98/98 in three runs of three (+2 shim-only),
+    clippy normal and `--cfg loom`, fmt, MSRV 1.85, loom 12/12, T8b 2/2, root 191/0, root `src/`
+    diff empty.
+- **Current milestone:** RM3 — implemented, PR open, **awaiting designer re-review + owner merge**.
   RM4 (re-seed) is NOT started.
 - **RM2 loom gate:** confirmed by the designer at `b72a2fd`; the nine rows were re-run for RM3
   after the `ring.rs` fast-path change (table above).
