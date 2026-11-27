@@ -538,6 +538,20 @@ underspecified, flag it and propose a fix — do not silently diverge.
         "resume from the log — RM3"): not edited, under the kickoff's ring guardrail.
     14. Debug builds hit `debug_assert!`s first on several ceiling mutations (T5 Wait
         fall-through, T8a, T8b, T12); the `--release` reruns in the table show the wire oracles.
+    15. **T1's "exactly one overflow" needs test-side sequencing, not only ring sizing.** The
+        cutover attaches wherever a chunk happens to end — possibly on the ring's very oldest
+        record, which the next capture evicts (a second, legitimate, in-session fall-back,
+        §9.2). No ring size removes that. T1 therefore lets the network thread act on each
+        poll's answer before the writer appends again (it still appends and commits every
+        iteration up to and including the cutover poll). Before this, 1 run in ~12 saw two
+        episodes (all oracles still held).
+    16. **Pre-existing flake in an RM2 test, NOT fixed (outside the allowed edits):**
+        `p3_replica_is_never_ahead_and_converges` asserts `Streaming` after waiting for
+        `acked == w`; with zero records (`ops = [Commit]`, the shrunk case) `acked == w == 0`
+        holds before the replica has connected. Measured **2 failures in 25 runs on this
+        branch and 2 in 25 on unmodified `main` (`a0c47bb`)**. Proposed fix for the designer:
+        wait for `Streaming` as well. No `shipper.proptest-regressions` file is committed (it
+        would pin the failing case).
 - **Current milestone:** RM3 — implemented, PR open, **awaiting designer review + owner merge**.
   RM4 (re-seed) is NOT started.
 - **RM2 loom gate:** confirmed by the designer at `b72a2fd`; the nine rows were re-run for RM3
