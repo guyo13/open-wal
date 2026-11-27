@@ -80,6 +80,12 @@ cmd_build() {
     log "checking out pinned ref $LAZYFS_REF"
     git -C "$LAZYFS_SRC" fetch --quiet origin "$LAZYFS_REF" 2>/dev/null || git -C "$LAZYFS_SRC" fetch --quiet origin
     git -C "$LAZYFS_SRC" checkout --quiet "$LAZYFS_REF"
+    # CMake >= 4.0 refuses projects that declare cmake_minimum_required < 3.5,
+    # which LazyFS's pinned `toml` dependency does ("Compatibility with CMake <
+    # 3.5 has been removed"). This env var is CMake's documented override; older
+    # CMake versions ignore it. Without it the build dies at configure and the
+    # gate never runs.
+    export CMAKE_POLICY_VERSION_MINIMUM="${CMAKE_POLICY_VERSION_MINIMUM:-3.5}"
     log "building libpcache"
     ( cd "$LAZYFS_SRC/libs/libpcache" && ./build.sh )
     log "building lazyfs"

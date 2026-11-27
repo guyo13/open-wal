@@ -1,11 +1,18 @@
 # Write-Ahead Log (WAL) Component — Design, Implementation & Test Specification
 
-**Status:** **v7.1** — v6.1 plus three additive replication-support changes (Decision 7) and the v7.1 LSN-exhaustion fix; all decisions resolved
+**Status:** **v7.2** — v6.1 plus three additive replication-support changes (Decision 7), the v7.1 LSN-exhaustion fix, and the v7.2 resumable reader position (Decision 8); all decisions resolved
 **Target language:** Rust (stable)
 **Intended audience:** A coding agent implementing the component, plus a human reviewer.
 **Context:** Journal/WAL for an LMAX-style single-writer, event-sourced system with complex incremental business logic. Durability-first (acknowledge only after durable).
 
 ---
+
+## Changelog (v7.1 → v7.2)
+
+- **Resumable reader position (§6, §8.5, new §8.7, §10, §12, §15.2, §15.7, §17 Decision 8).** Additive and **read-only**: `Reader::position() -> Option<ReaderPos>` reports where a reader is as an opaque, `Copy` value that borrows nothing, and `Wal::reader_at(pos)` starts a later reader exactly there **without scanning the segment prefix** (one segment-file open + one record read). New **non-poisoning** `WalError::InvalidPosition`. Motivation: `reader_from(from)` reads and CRC-checks every record of the containing segment below `from`, and a `Reader` borrows `&Wal`, so a consumer that reads in bounded steps on the writer thread (the replica's catch-up) re-paid that prefix scan on **every** step — a writer stall of O(records in the segment) per chunk (measured, hot cache, one 32 MiB segment: 19.6 ms at 4 KiB payloads, 284 ms at 100 B, 1.34 s at 0 B). With a carried `ReaderPos` it is paid once per catch-up session (the first `reader_from`), not once per chunk.
+  - **No change** to `append`, `commit`, roll, `checkpoint`, recovery (`recover_segment` / `classify`), `record::decode`, the sentinel rule, the on-disk format, or any fsync. No invariant D1–D12 is touched. `Reader::next` returns exactly what it did; the only internal change is bookkeeping for `position()` (the reader records whether its final scan outcome was `CleanEnd` and keeps that segment's index and offset).
+  - **Fuzz clock (§14.13) — designer decision:** v7.2 changes no recovery classification and no decoder, so the F1–F4 clocks **do not reset**. The new surface (arbitrary `ReaderPos` values) is covered by §14.2 P10, which is `PROPTEST_CASES`-overridable.
+  - **Tests:** `src/position_tests.rs` `v72_*` (§14.1); `tests/reader_position_property.rs` (§14.2 P9 + P10, the latter under `--features fuzzing`); `tests/reader_at_no_prefix_scan.rs` (the `/proc/thread-self/io` no-prefix-scan proof with its positive control); `tests/zero_alloc_position.rs`; `tests/book_examples_v7_2.rs`. Every mutation row of the v7.2 delta (`docs/wal_design_v7_2_delta.md`) was applied, observed failing its named test, and reverted.
 
 ## Changelog (v7 → v7.1)
 
@@ -324,6 +331,11 @@ impl<O: DurabilityObserver> Wal<O> {
     /// segment scan from that segment's start to `from`, not a whole-log scan.
     pub fn reader_from(&self, from: Lsn) -> Result<Reader<'_>, WalError>;
 
+    /// (v7.2) A reader that starts exactly at `pos`, without scanning the segment
+    /// prefix (§8.7). `InvalidPosition` (non-poisoning) if `pos` is not a record
+    /// boundary of this log; `ContiguityViolation` below `oldest_lsn` (§15.4).
+    pub fn reader_at(&self, pos: ReaderPos) -> Result<Reader<'_>, WalError>;
+
     /// Delete whole segments fully superseded by `up_to` (oldest-first, dir-fsync'd).
     /// MUST preserve D8.
     pub fn checkpoint(&mut self, up_to: Lsn) -> Result<(), WalError>;
@@ -334,6 +346,21 @@ impl<'w> Reader<'w> {
     /// Lending-style next: the borrow is tied to &mut self, so each item is valid only
     /// until the following call. Returns None at end of log.
     pub fn next(&mut self) -> Option<Result<(Lsn, &[u8]), WalError>>;
+
+    /// (v7.2) Where this reader is (§8.7). `None` when it cannot be resumed.
+    /// Pure: no I/O, no allocation.
+    pub fn position(&self) -> Option<ReaderPos>;
+}
+
+/// (v7.2) An opaque, `Copy` position in the log: "the next record this reader would
+/// attempt". It borrows nothing, so it outlives the `Reader` and any `&mut Wal` call.
+/// No public constructor: a position only ever comes from `Reader::position`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReaderPos { /* segment_base: Lsn, offset: u64, next_lsn: Lsn — private */ }
+
+impl ReaderPos {
+    /// The LSN of the record at this position (the next one a resumed reader yields).
+    pub fn next_lsn(&self) -> Lsn;
 }
 ```
 
@@ -464,8 +491,62 @@ Recovery MUST NOT materialize payloads in memory. It retains at most a **sparse 
 
 **(v7 conformance note)** `reader_from(from)` MUST locate the containing segment (greatest `base_lsn ≤ from`, via the sorted per-segment index) and scan **that** segment from its start, skipping to `from`. It MUST NOT open the oldest segment of the log. Memory discipline unchanged. (v6's implementation opened the oldest segment and skipped forward through the whole retained log — correct records, wrong cost; fixed in v7.)
 
+**(v7.2 note)** `reader_at` (§8.7) starts at a recorded position and does not scan the prefix; `reader_from` is unchanged.
+
 ### 8.6 Determinism
 Recovery MUST be a pure function of on-disk bytes — no wall clock, no environment, no filesystem iteration order. `created_unix_nanos` is informational and MUST NOT influence any decision.
+
+### 8.7 Resumable reader position (v7.2, NORMATIVE)
+
+`reader_from(from)` positions by scanning the containing segment from its base (§8.5), and a `Reader` borrows `&Wal`, so it cannot be kept across calls that need `&mut Wal`. A consumer that reads in bounded steps therefore carries a **`ReaderPos`** between steps: `Reader::position()` reports where a reader is, and `Wal::reader_at(pos)` starts a later reader there.
+
+#### `Reader::position`
+- It returns the position of the next record the reader would attempt: the base LSN of the segment it is in, the byte offset in that segment, and the LSN that record must carry.
+- It is pure: no I/O, no allocation.
+- Immediately after `reader_from(from)`, before any `next`, the position is the **start of the containing segment** (offset 64), not `from`, and `position().next_lsn()` is that segment's base LSN. The reader has not skipped yet; the skip happens inside the first `next`, and records below `from` are never yielded.
+- **A position does not carry `from`.** If a reader ends before it reaches `from` (for example `reader_from(Lsn(100))` on a log that ends at 10), its end position has `next_lsn = 11`, and a reader resumed there later yields from 11, not from 100.
+- After `next` yields record `n`, `position().next_lsn() == n + 1`.
+- At a **clean end of log**, `position` is still `Some`: the end position. A clean end means `next` returned `None` because the scan of the **last** segment reported `ScanOutcome::CleanEnd`, i.e. the sentinel, or fewer than 20 bytes left in a segment filled to the brim. A reader resumed there later yields whatever was committed since. The implementation therefore records that the final outcome was `CleanEnd` and keeps that segment's index and offset.
+- It returns `None` when the reader cannot be resumed:
+  - after it yielded LSN `u64::MAX` (nothing can follow, v7.1);
+  - after `next` returned `Some(Err(_))`;
+  - after the stream ended on an invalid record or an LSN-continuity break, i.e. any end other than `CleanEnd` in the last segment.
+
+#### `Wal::reader_at`
+`reader_at(pos)` MUST NOT scan the segment prefix. What it guarantees depends on where `pos` came from:
+
+- **A genuine position:** one returned by `Reader::position()` on this log, with no torn-tail truncation below it since (see "Reopen" below). `reader_at(pos)` MUST succeed, or fail with `ContiguityViolation` exactly when `reader_from(pos.next_lsn())` would. On success it yields **exactly** what `reader_from(pos.next_lsn())` yields.
+- **Any other value** (forged, or from a different log; `ReaderPos` has no public constructor): no panic, bounded I/O, and either an error or a dense run of CRC-valid records starting at `next_lsn`.
+  - Exact equivalence cannot be promised here without a prefix scan. Payloads are opaque, so a payload may itself contain bytes that form a CRC-valid record at an 8-aligned offset, and no local check can tell that from a real record boundary.
+
+Checks, **in this order**:
+
+1. `pos.next_lsn < oldest_lsn` ⇒ `ContiguityViolation`. This is the same fatal gap as `reader_from` (§15.4).
+2. **Segment-base rule.** If `next_lsn` equals the base of a live segment `j`, the reader starts at the beginning of segment `j` (offset 64), whatever `segment_base` and `offset` say. No further check applies.
+   - This is exactly `reader_from(base_j)`, which scans no prefix.
+   - It is what keeps a sealed-segment-end position valid after `checkpoint` deletes that segment: the reader finishes a segment, the position still names it, and its `next_lsn` is the next segment's base.
+3. Structural checks; any failure ⇒ `InvalidPosition`:
+   - `segment_base` is the base of a live segment, at index `i`;
+   - `64 ≤ offset ≤ segment_size`, and `offset` is a multiple of 8;
+   - `segment_base < next_lsn`; and if segment `i + 1` exists, `next_lsn <` its base. (The equal cases were taken by rule 2.)
+4. One read at `offset` (the same bounded `read_record_at` the reader uses):
+   - a valid record with `lsn == next_lsn` ⇒ `Ok`;
+   - a valid record with any other LSN, or an invalid record ⇒ `InvalidPosition`;
+   - `CleanEnd` ⇒ `Ok` only if segment `i` is the active one and `next_lsn > durable_lsn` (a genuine end of log). Otherwise ⇒ `InvalidPosition`. On a non-poisoned handle the file holds exactly the records `≤ durable_lsn`, because staged records are not in the file, so this test is both necessary and sufficient.
+
+Consequences:
+- A position stays valid across `append`, `commit` and roll on the same handle. Sealed segments are immutable (D12), and the active segment only grows.
+  - An end position in the active segment becomes "a record with `lsn == next_lsn`" after the next commit.
+  - It falls under the segment-base rule if the segment is sealed without another record (the empty-prefix roll, §7.3).
+- **Reopen.** A position survives closing and reopening the same directory if its `next_lsn ≤ durable_lsn + 1` as recovered. A position above that pointed into a tail that recovery truncated and zeroed.
+  - Right after the reopen, `reader_at` on such a position reads zeros with `next_lsn > durable_lsn`, so it returns `Ok` and yields nothing.
+  - After later commits it is no longer a genuine position. **The caller MUST discard, at reopen, every position with `next_lsn > durable_lsn + 1`.** `reader_at` cannot detect this later.
+- Every record any reader yields is still CRC-checked and LSN-checked by `Reader::next`, exactly as before.
+- The equivalence is stated for a **non-poisoned** handle. On a poisoned handle the file may hold written-but-unsynced records above `durable_lsn`. `reader_from` already exposes them; `reader_at` adds nothing new. Neither has a contract there.
+
+**Cost.** `reader_at` costs one segment-file open plus one record read. `Reader::next` is unchanged; its zero-allocation guarantee (§14.7) is unchanged. The first `reader_from` of a multi-step read still pays one prefix skip, inside a single `Reader::next` call that cannot be chunked — once per session, not once per step.
+
+*Defence in depth (implementation note):* the rule-3 alignment/bounds checks have no stream-level falsifier — with them removed, rule 4's single read still rejects every misplaced offset, or accepts only a clean end that yields nothing (which is also what `reader_from(next_lsn)` yields there). They are kept regardless: they are cheap, they keep the read inside the segment by construction, and the unit rule table (`v72_reader_at_rejects_forged_positions`) pins the `offset > segment_size` case.
 
 ---
 
@@ -482,7 +563,7 @@ Recovery MUST be a pure function of on-disk bytes — no wall clock, no environm
 ---
 
 ## 10. Error handling (NORMATIVE)
-`WalError` is a non-panicking enum with at least: `Io`, `Corruption { segment, offset, detail }`, `TornMidLog { segment, offset }`, `RecordTooLarge`, `InvalidConfig`, `BadSegmentHeader`, `Locked`, `FsyncFailed`, `ContiguityViolation`, `Poisoned`, and **(v7.1)** `LsnExhausted` (an `append` at `last_lsn == u64::MAX`; non-poisoning — §7.1, §12). The recovery parser MUST return errors, never panic, for all inputs (D11).
+`WalError` is a non-panicking enum with at least: `Io`, `Corruption { segment, offset, detail }`, `TornMidLog { segment, offset }`, `RecordTooLarge`, `InvalidConfig`, `BadSegmentHeader`, `Locked`, `FsyncFailed`, `ContiguityViolation`, `Poisoned`, **(v7.1)** `LsnExhausted` (an `append` at `last_lsn == u64::MAX`; non-poisoning — §7.1, §12), and **(v7.2)** `InvalidPosition` (a `reader_at` position that is not a record boundary of this log; non-poisoning — §8.7, §12). The recovery parser MUST return errors, never panic, for all inputs (D11).
 
 ---
 
@@ -506,6 +587,8 @@ A failed `fdatasync`/`F_FULLFSYNC` is dangerous: on Linux a failed `fsync` may a
 *(The v1 `PropagateError`/"remain usable" option is removed: it was incompatible with a dense-LSN log.)*
 
 **(v7.1) `LsnExhausted` is NOT a poison condition.** It means the log is *full*, not *broken*: no durability was lost and no LSN slot is in doubt. It MUST NOT set the poison flag and MUST NOT touch `last_lsn` or the staging buffer; `commit` of already-appended records, reads, and `checkpoint` keep working, and every further `append` returns `LsnExhausted` again. Poison remains reserved for durability failures.
+
+**(v7.2) `InvalidPosition` is NOT a poison condition** either. It is a read-side argument error from `reader_at` (§8.7) that touches no state: it MUST NOT set the poison flag, and `append`, `commit`, reads and `checkpoint` keep working after it.
 
 ---
 
@@ -547,6 +630,7 @@ Each milestone is independently testable; do not advance until mapped tests (§1
 - **Checkpoint eligibility math:** exhaustive small-case boundary check of `b' − 1 ≤ up_to` (off-by-one), incl. `up_to` exactly at, one below, one above a boundary.
 - **LSN assignment:** monotone, dense, starts at 1 (or at the v7 seed), `Lsn(0)` never assigned.
 - **(v7) Seed + `oldest_lsn()`:** `options().seed(..)` validation (`Lsn(0)` ⇒ `InvalidConfig`; `Lsn(1)`; a large `N`); cold start at `N` ⇒ `oldest_lsn == N`, `durable_lsn == N−1`, first append ⇒ `N`; `options().seed(N).observer(o).open(..)` yields `Wal<O>` whose observer fires with the seeded LSNs; `open`/`open_with` still cold-start at `1` and equal their `options()` forms; `oldest_lsn()` equals `RecoveryReport::oldest_lsn` at open and advances after `checkpoint`. *Implemented: `src/wal.rs` `v7_*` tests.*
+- **(v7.2) Reader position (§8.7)** — `src/position_tests.rs`, every oracle independent of the code under test (the records the test appended; offsets from the test's own §5.3 arithmetic): a position taken after each record of a multi-segment log resumes to the identical remainder; a sealed segment's end position resumes into the next segment; the end-of-log position is `Some`, yields nothing immediately and the new records after a further commit (incl. a commit that rolls without writing to that segment — empty prefix and filled-to-the-brim); `None` after `u64::MAX` was yielded; below `oldest_lsn` after a checkpoint ⇒ exactly `ContiguityViolation`; a sealed-end position survives the checkpoint that deletes its segment (segment-base rule); before any `next` it is the containing segment's start; `None` after `Some(Err(_))` and after an end on an invalid record; a reader that ended below its `from` resumes from its end; reopen after a fabricated torn tail (a position above `durable_lsn + 1` yields nothing); the embedded-frame limit of the forged-position guarantee; the forged-position rule table; `InvalidPosition` leaves the handle usable. `position()` allocates nothing (`tests/zero_alloc_position.rs`).
 
 ### 14.2 Property-based tests (`proptest` / `bolero`)
 For arbitrary `Vec<Vec<u8>>` (sizes incl. 0 and `max_record_size`; `segment_size` small to force rolls **and** commit-time splits):
@@ -562,6 +646,11 @@ For arbitrary `Vec<Vec<u8>>` (sizes incl. 0 and `max_record_size`; `segment_size
 - **(v7) P-reader (D6, §8.5).** `reader_from(from)` for arbitrary `from` yields exactly the records `≥ from` in order, and — instrumented under `cfg(feature = "fuzzing")` (`fuzzing::reader_open_segment`) or the in-crate test hook — opens the containing segment, not `segments[0]`.
 
 *v7 P8/P-reader implemented in `tests/seeded_property.rs` (the containment assertion is active under `--features fuzzing`; the `src/wal.rs` `v7_reader_from_*` unit tests assert it in every build).*
+
+- **(v7.2) P9 Resume equivalence (§8.7).** A seeded random op-script (append / commit / roll-forcing sizes / checkpoint / reopen / crash / fabricated torn tail) on tiny segments. At random points a position is taken from a reader and checked **at capture time** against the test's own model (`next_lsn` is the last yielded LSN + 1, or the containing segment's base before any `next`, or `durable_lsn + 1` at the end of log). Later, after more ops, `reader_at(pos)` is compared with the model's records from `pos.next_lsn()` **and** with `reader_from(pos.next_lsn())`: all three agree, or both readers fail with `ContiguityViolation`. After a reopen the test discards positions as the §8.7 Reopen rule requires. (Comparing only the two readers is not enough: a `position()` that is wrong but self-consistent would pass.)
+- **(v7.2) P10 Arbitrary positions never lie (§8.7).** Under `--features fuzzing` (`fuzzing::reader_pos(..)` is the only constructor), `ReaderPos` values built from arbitrary fields, biased near real ones (offset ± 1 / ± 8 / ± one record, `next_lsn ± 1`, the base swapped for another live base or a non-base). With random-byte payloads (which never contain a CRC-valid record) on a non-poisoned handle, `reader_at` must return an error or yield exactly what `reader_from(next_lsn)` — and the test's model — yields; never a panic.
+
+*v7.2 P9/P10 implemented in `tests/reader_position_property.rs`; both honor `PROPTEST_CASES`.*
 
 Shrinking enabled.
 
@@ -649,6 +738,7 @@ Construct the specific resurrection hazard: write records, induce a torn tail su
 - **Recovery time** vs log size and segment count.
 - **Split-batch overhead:** commit latency when a batch spans a segment boundary vs when it does not (quantify the extra fsync).
 - **Zero-allocation assertion:** an allocation counter (`dhat` / custom allocator) proves steady-state `append`+`commit` (no roll) and `Reader::next` perform **zero** heap allocations after warm-up.
+- **(v7.2) No-prefix-scan proof (Linux)** — `tests/reader_at_no_prefix_scan.rs`. In one multi-MiB segment of small records, the reading thread's `/proc/thread-self/io` `rchar` around `reader_at(pos)` + one `next` must be at most two framed records plus slack (the slack covers the test's own two reads of that file), while `reader_from(next_lsn)` + one `next` in the same test reads at least the prefix (the positive control). The LSN and payload read are asserted against the test's model. Where the file or its `rchar` field is absent (no `CONFIG_TASK_IO_ACCOUNTING`) the test skips with a loud message on stderr — it neither fails nor passes silently. `Reader::position` is also allocation-free (`tests/zero_alloc_position.rs`); `tests/zero_alloc.rs` passes unchanged.
 - **Regression gates:** stored baselines; CI fails if throughput regresses > 10% or p999 > 20% (tune to runner variance; pin CPU governor).
 
 > **M7 status (IMPLEMENTED, with one enforcement caveat tracked honestly).** `benches/wal.rs`
@@ -688,7 +778,7 @@ Multi-hour randomized workload with periodic injected crashes+recoveries and che
 *(**M9 — IMPLEMENTED** as `tests/soak.rs` (`#[ignore]`, env-driven `WAL_SOAK_SECONDS`/`WAL_SOAK_SEED`), driven by `scripts/m9/soak.sh` and run nightly/dispatch in `soak.yml`. It drives a **single long-lived `Wal`** through a weighted randomized loop — append (boundary-biased sizes 0/1/8/`max_record_size`/random), commit (timed into an `hdrhistogram`), `checkpoint(durable)`, and process-crash-recover (drop + reopen) — over a 4 KiB-segment/256 B-record config so rolls/splits/checkpoints fire constantly. After **every** recover it re-checks the §14.3 refinement envelope (D1/D3 durable ≥ committed watermark, D8 oldest ≤ authorized `up_to`+1 and monotone, D2/D6 dense byte-identical replay `oldest..=durable`) against an independent in-memory oracle, so a *correctness* regression under sustained load reds the run too — not just a leak. The four monitors are sampled every 128 ops with bounded-growth gates: **fd** (`/proc/self/fd`, `peak ≤ baseline+32`), **disk** (a deterministic **per-checkpoint floor** — because the soak always checkpoints to exactly `durable_lsn`, every sealed segment is fully superseded, so right after `checkpoint(durable)` exactly the active segment must remain (§9); a checkpoint that reclaims N−1 of N sealed segments reds on the **first** bad cycle, not after 16 accumulate — backstopped by a `peak ≤ 16×segment_size` ceiling for gross runaway between checkpoints), **RSS** (`/proc/self/statm`, `≤ baseline+64 MiB`; recovery materializes no payloads, §8.5), and **commit-latency** (p999 ≤ 2 s ceiling). Deterministic (seeded LCG, no RNG dep) so a failure reproduces from `WAL_SOAK_SEED`. **Honest framing (same stopgap as LazyFS/dm-flakey/bench):** a SHORT run (the per-dispatch default 300 s, and the in-session smoke) proves the driver/monitors/oracle work but is **NOT** the gate — the §14.13 soak gate is a **multi-hour** run with zero regression/violation; a short green run is CONTINGENT, a failure is a real bug. Falsifiability shown (honest form): injecting a per-cycle leak (`deletable_prefix_len` reclaims N−1 of N) reds the **floor** assertion on cycle 1 (`found 2 *.wal files`) — the real leak class, not a sub-working-set threshold; the oracle's refinement checks are the same ones the M6 harness demonstrated falsifiable. No `src/` change — the driver uses only the public API.)*
 
 ### 14.11 CI matrix
-- **Per-PR (fast, blocking).** The always-on `ci.yml` jobs (`push:main` + `pull_request` + dispatch): **`rustfmt + clippy`** (`-D warnings`, all targets); **`build + test`** = §14.1 codec/CRC vectors, §14.2 (reduced proptest) round-trip/property suites, §14.7 **zero-alloc assertion** (enforced) + `cargo bench --no-run` (benches must compile, can't bitrot), and the §14.6 **`!Sync` compile-fail** (`tests/ui.rs` trybuild, stable-only) + **directory-lock / `Send`** runtime tests — all under `cargo test`; **`MSRV (1.85)`** `cargo check --all-targets --locked`; **`Miri (codec subset)`** (§14.6, `record`/`crc`/`lsn`/`config` under `-Zmiri-strict-provenance` — the whole Miri-executable surface, since the file-backed paths use foreign syscalls Miri can't run); **`fuzz smoke (F1/F2/F3/F4)`** (§14.5, short bounded `cargo fuzz run` per target — **BLOCKING: a reproducible crash is a real D1–D11 bug and reds the PR**, distinct from the nightly time-boxed lane and never gating an H1 dispatch); **`differential (§14.9)`** (`cargo test --features fuzzing --test differential` — an independent reference parser vs the production classifier over a 184-case scenario matrix + the committed corpora; **BLOCKING: a classification divergence is a real recovery-classifier bug**, ~6 s, never gates an H1 dispatch); **`§14.4d dir-fsync presence (strace)`** (M8 Tier-1, FS-independent syscall-presence guard). Plus the **paths-filtered** per-PR durability gates that only fire when their sources change: **§14.8 H4 Half A** *(`m8-macos.yml` on `macos-latest` — a macOS-only `F_FULLFSYNC`-routing regression is invisible to Linux PR CI because the `cfg(macos)` path does not compile there; `dtruss` Half B stays owner-run per #19)*, the **§14.4b LazyFS** gate *(`lazyfs.yml`, informational)*, and the **§12 fsync-fault poison** gate *(`m8.yml`)*.
+- **Per-PR (fast, blocking).** The always-on `ci.yml` jobs (`push:main` + `pull_request` + dispatch): **`rustfmt + clippy`** (`-D warnings`, all targets); **`build + test`** = §14.1 codec/CRC vectors, §14.2 (reduced proptest) round-trip/property suites, §14.7 **zero-alloc assertion** (enforced) + `cargo bench --no-run` (benches must compile, can't bitrot), and the §14.6 **`!Sync` compile-fail** (`tests/ui.rs` trybuild, stable-only) + **directory-lock / `Send`** runtime tests — all under `cargo test`; **`MSRV (1.85)`** `cargo check --all-targets --locked`; **`Miri (codec subset)`** (§14.6, `record`/`crc`/`lsn`/`config` under `-Zmiri-strict-provenance` — the whole Miri-executable surface, since the file-backed paths use foreign syscalls Miri can't run); **`fuzz smoke (F1/F2/F3/F4)`** (§14.5, short bounded `cargo fuzz run` per target — **BLOCKING: a reproducible crash is a real D1–D11 bug and reds the PR**, distinct from the nightly time-boxed lane and never gating an H1 dispatch); **`differential (§14.9)`** (`cargo test --features fuzzing --test differential` — an independent reference parser vs the production classifier over a 184-case scenario matrix + the committed corpora; **BLOCKING: a classification divergence is a real recovery-classifier bug**, ~6 s, never gates an H1 dispatch); **`§14.4d dir-fsync presence (strace)`** (M8 Tier-1, FS-independent syscall-presence guard). Plus the **paths-filtered** per-PR durability gates that only fire when their sources change: **§14.8 H4 Half A** *(`m8-macos.yml` on `macos-latest` — a macOS-only `F_FULLFSYNC`-routing regression is invisible to Linux PR CI because the `cfg(macos)` path does not compile there; `dtruss` Half B stays owner-run per #19)*, the **§14.4b LazyFS** gate *(`lazyfs.yml`, blocking since 2026-11-27)*, and the **§12 fsync-fault poison** gate *(`m8.yml`)*.
 - **Nightly (scheduled, staggered off the `:00` rush + `workflow_dispatch`).** **§14.7 benchmarks + gates** *(`bench.yml`, 03:17 UTC; **informational** on hosted runners until a controlled/pinned-governor runner makes the §14.7 thresholds enforceable — same stopgap as the LazyFS gate)*; **§14.5 fuzz (time-boxed F1–F4)** *(`fuzz.yml`, 04:17 UTC; CONTINGENT, NOT the N-CPU-hour §14.13 gate — a crash still reds it)*; **§14.8 H3-physical + §14.4d** *(`m8-dmflakey.yml`, 04:23 UTC + push-to-main; hosted ubuntu VMs reach `dm-flakey`, so these are real gates there — ext4 hard with a source-confirmed block-layer EIO (#16) and a `drop_writes` positive control (#17), xfs/btrfs informational, **best-effort + loud skip** if a runner lacks dm-flakey)*; **§14.10 soak** *(`soak.yml`, 05:17 UTC; a short hosted slice is a CONTINGENT smoke, not the multi-hour gate)*. *(The §14.9 differential runs **per-PR** (`differential (§14.9)` job, ~6 s) rather than nightly. Still to be wired as nightly, not yet automated: full-iteration §14.2/§14.3 — currently the reduced per-PR proptest + the M6 `model_oracle` suite cover these at PR granularity.)*
 - **Pre-release / manual:** §14.8 H1 power-pull on target hardware, §14.10 soak *(M9: `soak.yml`, schedule + manual, **contingent** until a multi-hour run on a dedicated runner — a hosted nightly slice is a smoke, not the gate; same stopgap as the LazyFS/bench informational lanes; each run uploads its §5 soak-evidence artifact)*. *(The nightly §14.8 dm-flakey/macOS gates above also accept `workflow_dispatch`; a manual run posts its §5 evidence to the tracking issue as the human sign-off, while the nightly cron stays artifact-only and surfaces regressions as a red build.)*
 - **OS matrix:** Linux (primary — sole platform for the §14.8 hardware-durability gate), macOS (dev/correctness — exercises `F_FULLFSYNC`; unit/property/fuzz only, not §14.8). Windows is out of scope for v1 (§8.3).
@@ -703,13 +793,14 @@ Multi-hour randomized workload with periodic injected crashes+recoveries and che
 | D3 At-most-tail loss | §14.3, §14.4a, §14.4b, §14.4c, §14.8 H1 |
 | D4 Torn-tail truncation | §14.4b torn-op, §14.4e (i), §14.4f, §14.4g, §14.9 differential (truncation offset) |
 | D5 Mid-log corruption fatal | §14.4e (ii)(iii)(v), sealed-segment cases, `recovery::rec_type_zeroed_interior_is_fatal_tornmidlog` (issue #26), §14.9 differential (interior-corruption classification) |
-| D6 Read-back fidelity | §14.2 P1/P8/P-reader (v7), §14.3 |
+| D6 Read-back fidelity | §14.2 P1/P8/P-reader (v7), §14.3; (v7.2) §14.2 P9/P10 + §14.1 reader-position units (`reader_at` yields exactly the `reader_from` stream) |
 | D7 Idempotent recovery | §14.2 P6/P8 (v7: a different seed on reopen is ignored), §14.3 (no-mutation reopen) |
 | D8 Checkpoint safety | §14.1 math, §14.2 P5, §14.3 (terminal reopen), §14.4c |
 | D9 Crash-anywhere recoverable | §14.4a, §14.4c (incl. split-batch & roll; v7: cold start at a seed) |
 | D10 No buried garbage / resurrection | §14.4g (incl. stale-valid-record case), §14.9 differential (beyond-bound continuation ⇒ torn tail, not resurrected) |
 | D11 Bounded recovery parsing | §14.5 F1/F2/F3/F4, §14.4f, §14.6 Miri, §14.9 differential, bounded-scan counter (structural drift guard) |
 | D12 Sealed-segment immutability | §14.4h sealed-segment-immutability, concurrent-tailer, backup round-trip |
+| §8.7 Resumable reader position (v7.2; read-only — touches no D-invariant) | §14.1 `position_tests::v72_*`, §14.2 P9/P10 (`tests/reader_position_property.rs`), §14.7 no-prefix-scan proof + `position()` zero-alloc |
 
 #### 14.12.1 Reconciliation audit (M9 close-out, 2026-07-02)
 
@@ -777,6 +868,7 @@ The writer's `write(2)` makes bytes visible in the shared page cache **before** 
 - **Segment-roll following:** when a higher-`base_lsn` segment file appears, the current segment is sealed; finish it (to its zero sentinel) and advance. Until a successor appears, the current segment is still active — keep polling.
 - **Growth detection:** `inotify`/`FSEvents` or interval polling. Implementation choice; not normative.
 - **Consume boundary:** the highest record the reader may *act on* is `min(highest contiguously-valid record, published durable watermark)` for divergence-sensitive consumers; `highest contiguously-valid record` for pure backup.
+- **(v7.2) Bounded-step reading:** a consumer that reads in bounded steps on the writer thread (the replica's catch-up) should carry a `ReaderPos` between steps (`Reader::position` → `Wal::reader_at`, §8.7) rather than re-`reader_from` each step, which re-scans the segment prefix every time.
 
 ### 15.3 Durable-watermark publication — `DurabilityObserver` (NORMATIVE; resolved)
 
@@ -832,6 +924,8 @@ For a secondary, prefer a **log-shipping consumer in the writer's process** (a s
 
 > **(v7) Realized by `open-wal-replica`** (async master/slave, static primary, v1; `docs/replica_design_v1.md`). The WAL's responsibility ends at: dense durable records via `reader_from`, the durable watermark (commit's return value / the observer), `oldest_lsn()` for catch-up decisions, and `OpenOptions::seed` so a seeded replica mirrors the primary's LSN space (and may carry an observer to host downstream consumers — replica spec §7.1). Shipping, transport, catch-up, re-seed, checkpoint policy, and promotion are the crate's. Two WAL properties the crate relies on and MUST NOT be weakened: (a) records `≤ durable_lsn` are durable and never change (D1, D12); (b) a replica that only ever appends records `≤` the primary's `durable_lsn`, in order, is always a **dense prefix** of the primary and never needs a destructive operation to reconcile — which is why async master/slave requires no suffix-truncate.
 
+> **(v7.2)** A shipper that serves catch-up in bounded chunks on the writer thread should carry a `ReaderPos` between chunks (§8.7): the prefix skip is then paid once per catch-up session (the first `reader_from`), not once per chunk.
+
 ### 15.8 Tests for this section (added to §14)
 - **§14.4h Concurrent tailer (property + fault).** A reader (thread/process) tails while the writer appends/commits/rolls/checkpoints. Assert the reader: observes a monotonic dense prefix; never surfaces a partial/torn record as valid (treats tail-CRC-failure as retry); follows segment rolls without gap; and **never acts on a record beyond the published watermark** — verified by delaying the writer's `fdatasync` and asserting the watermarked reader does not surface the buffered records until the sync completes.
 - **Watermark-divergence (under LazyFS).** Writer `write`s a batch, the watermark has *not* advanced, inject power-loss + crash; assert a watermarked reader had **not** consumed the lost records (no divergence), while an un-watermarked reader *would* have (demonstrating why the watermark is mandatory for replication). This is the headline replication-safety test.
@@ -868,6 +962,8 @@ Keep the runtime dependency set minimal.
 6. **External-reader support (§15) — RESOLVED for v1.** (a) Watermark publication is a pluggable **`DurabilityObserver`** (§15.3) with two built-ins: `NullObserver` (default, don't ship) and an in-process observer forwarding `durable_lsn` to a caller sink *(v7 correction: only `NullObserver` shipped; the forwarding observer is consumer-implemented — see §15.3)*; static dispatch with `NullObserver` default keeps it zero-cost; future channels (mmap'd cursor, network) are additive impls. (b) Retention floor is **gap-is-fatal** (§15.4): no writer-side gating in v1; readers fatally error when `oldest_available_lsn > next_expected_lsn`; a future min-LSN gating strategy is additive. Sealed-segment immutability (D12) is implemented regardless, so backup works in v1 even though cross-process *replication* readers await a future watermark strategy.
 
 7. **Replication support — RESOLVED (v7).** The WAL gains exactly: an `OpenOptions` builder (`Wal::options().seed(n).observer(o).open(dir, cfg)` — the cold-start seed is a builder option, not a `WalConfig` field, because a new `pub` field is source-breaking for exhaustive literals in the published crate and a one-shot seed is not steady-state config; a builder rather than more `open_*` functions because seed and observer compose — a replica may host downstream consumers), `Wal::oldest_lsn()` (live retention floor), and a `reader_from` that seeks to the containing segment. All truly additive (zero existing-source edits; `open`/`open_with` unchanged); no invariant weakened. **Explicitly NOT added:** (a) a "checkpoint observer" — checkpoint coordination is the integrator's existing `checkpoint(up_to)` policy consulting the crate's `min_replica_acked_lsn()`; (b) writer-side reader gating (§15.4 stays gap-is-fatal); (c) a suffix-truncate (`truncate_after`) — not needed while replicas are always prefixes of the primary; it becomes necessary only with leader election (a replica ahead of a new leader must truncate) or to let a former primary rejoin without re-seeding. Both are deferred; a former primary MUST be re-seeded in v1. (d) a standalone read-only `WalReader` (§15.2 pattern) — deferred to v2; it would move all shipping I/O off the writer thread and enable cross-process readers, and is a drop-in shipper swap for the crate (wire protocol and replica side unchanged).
+
+8. **Resumable reader position — RESOLVED (v7.2).** The WAL gains `Reader::position() -> Option<ReaderPos>`, `Wal::reader_at(pos)` and the non-poisoning `InvalidPosition` (§8.7): an opaque, `Copy`, borrow-free position so a consumer reading in bounded steps does not re-scan a segment prefix per step. Read-only and additive; no D-invariant is touched. *Rejected:* **`Wal::segment_bases()` with segment-aligned chunks** — it exposes the segment layout and still rescans a partial segment; **an owned or `'static` reader** — it would outlive `&mut Wal` calls and need interior synchronization, against §6.2.
 
 ---
 

@@ -75,6 +75,15 @@ pub enum WalError {
     /// work, and every further `append` returns `LsnExhausted` again. The
     /// integrator's recovery path is to rotate to a new log.
     LsnExhausted,
+
+    /// The [`ReaderPos`](crate::ReaderPos) passed to
+    /// [`Wal::reader_at`](crate::Wal::reader_at) does not name a record
+    /// boundary of this log (v7.2, §8.7): it was taken from a different log, or
+    /// it pointed into a tail that a later recovery truncated.
+    ///
+    /// A read-side argument error — **not** a poison condition (§12). No state
+    /// is touched; `append`, `commit`, reads and `checkpoint` keep working.
+    InvalidPosition,
 }
 
 impl fmt::Display for WalError {
@@ -103,6 +112,9 @@ impl fmt::Display for WalError {
             WalError::ContiguityViolation => write!(f, "retained segments are not contiguous"),
             WalError::Poisoned => write!(f, "WAL handle is poisoned by a prior durability failure"),
             WalError::LsnExhausted => write!(f, "LSN space exhausted (last LSN is u64::MAX)"),
+            WalError::InvalidPosition => {
+                write!(f, "reader position does not name a record of this log")
+            }
         }
     }
 }
