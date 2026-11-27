@@ -1707,6 +1707,11 @@ fn t12_the_ceiling_is_the_clamped_released_watermark() {
     p.on_commit(w); // raw w = 32; the ring clamps to 31
     assert_eq!(p.sh().released().0, 31);
     expect_records(&mut p, &mut c, 6, 31);
+    // …and it cuts over at 32 (a ceiling above the clamp would leave the
+    // cursor "ahead" of the ring, waiting).
+    p.poll_until(5, "the cutover", |p| {
+        p.sh().replica_status(0) == Some(ReplicaStatus::Streaming)
+    });
     p.stop();
 }
 
