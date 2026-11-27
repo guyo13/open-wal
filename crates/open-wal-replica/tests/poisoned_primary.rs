@@ -156,7 +156,8 @@ fn t8b(k: u64) {
     // The oracle: nothing above R, however long we keep polling.
     let until = std::time::Instant::now() + Duration::from_millis(300);
     while std::time::Instant::now() < until {
-        sh.poll(&wal).unwrap();
+        // The wire first: a violation is reported as such, whatever a later
+        // poll on the mis-served handle does.
         match c.next(Duration::from_millis(5)) {
             Saw::Timeout | Saw::Heartbeat(_) => {}
             other => panic!(
@@ -164,6 +165,7 @@ fn t8b(k: u64) {
                  (durable {durable}, last {last}), got {other:?}"
             ),
         }
+        sh.poll(&wal).unwrap();
     }
 
     // §8.2 extension (liveness): reopen in-process, release what recovery
