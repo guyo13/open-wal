@@ -5,10 +5,10 @@ name: LazyFS gate
 # heavier than the main `ci.yml` (it builds + mounts a FUSE filesystem), so it
 # lives in its own workflow and only runs when the code it covers changes.
 #
-# Currently INFORMATIONAL: the "Run the gate" step is `continue-on-error`, so a
-# hosted-runner FUSE hiccup cannot block a merge. Once it has proven stable on
-# ubuntu-latest, make it required by removing `continue-on-error` from that step
-# (and adding this job to branch protection).
+# BLOCKING (owner decision, 2026-11-27): a failing gate test fails the job.
+# Until then the "Run the gate" step was `continue-on-error`, so a failing
+# power-loss test still showed a green job. (To make this a *required* check,
+# also add the job to branch protection.)
 
 on:
   push:
@@ -94,15 +94,14 @@ jobs:
       - name: Build LazyFS
         run: scripts/lazyfs-gate.sh build
 
-      - name: Run the gate (informational until proven stable)
+      - name: Run the gate
         id: gate
-        continue-on-error: true
         run: |
           scripts/lazyfs-gate.sh mount
           scripts/lazyfs-gate.sh run
 
       - name: LazyFS log (on gate failure)
-        if: steps.gate.outcome == 'failure'
+        if: failure() && steps.gate.outcome == 'failure'
         run: |
           echo "==== ${LAZYFS_WORK}/lazyfs.log ===="
           cat "${LAZYFS_WORK}/lazyfs.log" 2>/dev/null || echo "(no log)"
