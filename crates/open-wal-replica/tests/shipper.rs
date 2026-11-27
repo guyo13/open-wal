@@ -379,7 +379,7 @@ fn stalled_replica_overflows_without_blocking_the_writer() {
         let t = Instant::now();
         let read = if probe {
             let ((), io) = common::measure_io(|| sh.poll(wal).unwrap());
-            io.rchar > 0
+            io.rchar > 16 // more than probe noise: a reader ran
         } else {
             sh.poll(wal).unwrap();
             // Without the probe, every poll is held to the reading budget.

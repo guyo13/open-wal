@@ -623,15 +623,26 @@ impl Shipper {
         let mut pass = Pass::default();
         let w = &mut self.w;
         // Joins first: `SERVING` latency never includes a log read.
+        // A replica is answered at most once per pass: the chunk request a
+        // network thread posts right after its join was answered waits for the
+        // next `poll`, so the pass that answers a join never reads for it.
+        let mut joined = [0u64; ring::MAX_CONSUMERS / 64 + 1];
         for k in 0..n {
             let id = (start + k) % n;
             let slot = &self.net.replicas[id].slot;
-            if slot.pending_join() {
-                slot.answer(|req, buf| w.decide(id, req, buf, wal, &mut pass));
+            if slot.pending_join()
+                && slot
+                    .answer(|req, buf| w.decide(id, req, buf, wal, &mut pass))
+                    .is_some()
+            {
+                joined[id / 64] |= 1 << (id % 64);
             }
         }
         for k in 0..n {
             let id = (start + k) % n;
+            if joined[id / 64] & (1 << (id % 64)) != 0 {
+                continue;
+            }
             self.net.replicas[id]
                 .slot
                 .answer(|req, buf| w.decide(id, req, buf, wal, &mut pass));
@@ -1344,4 +1355,306 @@ fn ack_reader(
     dead.store(true, Ordering::Release);
     let _ = rd.get_ref().shutdown(Shutdown::Both);
     sender.unpark();
+}
+
+#[cfg(test)]
+mod tests {
+    use open_wal::WalConfig;
+
+    use super::*;
+
+    /// T14. The one sending-side check: it accepts `lsn == next` and returns
+    /// `checked_next`; it rejects ±1 and anything else. (Its wiring — every
+    /// encoded record, from a chunk or from the ring — is a review item.)
+    #[test]
+    fn t14_send_check_accepts_only_the_next_lsn() {
+        assert_eq!(send_check(Lsn(5), Lsn(5)).unwrap(), Lsn(6));
+        assert_eq!(send_check(Lsn(1), Lsn(1)).unwrap(), Lsn(2));
+        for got in [4, 6, 0, 3, 7, 500, u64::MAX] {
+            match send_check(Lsn(5), Lsn(got)) {
+                Err(ReplError::Contiguity { expected, got: g }) => {
+                    assert_eq!((expected, g), (Lsn(5), Lsn(got)));
+                }
+                other => panic!("send_check(5, {got}) must be Contiguity, got {other:?}"),
+            }
+        }
+        // `checked_next`, never the saturating `next`.
+        assert!(matches!(
+            send_check(Lsn(u64::MAX), Lsn(u64::MAX)),
+            Err(ReplError::LsnExhausted { .. })
+        ));
+    }
+
+    #[test]
+    fn chunk_buffer_round_trips() {
+        let mut buf = Vec::new();
+        chunk_push(&mut buf, Lsn(7), b"seven");
+        chunk_push(&mut buf, Lsn(8), b"");
+        let (l, p, rest) = chunk_pop(&buf).unwrap();
+        assert_eq!((l, p), (Lsn(7), &b"seven"[..]));
+        let (l, p, rest) = chunk_pop(rest).unwrap();
+        assert_eq!((l, p), (Lsn(8), &b""[..]));
+        assert!(rest.is_empty());
+        assert!(chunk_pop(&buf[..5]).is_none());
+    }
+
+    // ---- T18: position safety, at the writer (the request is posted by hand:
+    // ---- the network thread never forges or misplaces a position) ----
+
+    const CFG: WalConfig = WalConfig {
+        segment_size: 4096,
+        max_record_size: 256,
+    };
+    /// Framed size of a 64-byte record in a segment file (20 + 64, padded to 8).
+    const F64: u64 = 88;
+
+    /// A primary WAL plus the test's own model of its records. Every record is
+    /// 64 bytes, except `special` (if any), whose payload is given.
+    fn log(n: u64, special: Option<(u64, Vec<u8>)>) -> (tempfile::TempDir, Wal, Vec<Vec<u8>>) {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut wal, _) = Wal::open(dir.path(), CFG).unwrap();
+        let mut model = vec![Vec::new()]; // index = lsn
+        for l in 1..=n {
+            let p = match &special {
+                Some((at, bytes)) if *at == l => bytes.clone(),
+                _ => (0..64).map(|i| (l as u8).wrapping_mul(7) ^ i).collect(),
+            };
+            assert_eq!(wal.append(&p).unwrap(), Lsn(l));
+            model.push(p);
+            if l % 16 == 0 {
+                wal.commit().unwrap();
+            }
+        }
+        wal.commit().unwrap();
+        (dir, wal, model)
+    }
+
+    /// A writer whose ring starts after the whole log (so every cursor in the
+    /// log is "outside the ring"), one replica, chunks of `records`.
+    fn writer(wal: &Wal, records: usize) -> (Writer, Consumer, Slot) {
+        let (producer, mut cs) = ring::ring(
+            RingConfig {
+                slots: 4,
+                slot_bytes: 64,
+                consumers: 1,
+            },
+            wal.last_lsn().checked_next().unwrap(),
+            wal.durable_lsn(),
+        );
+        let w = Writer {
+            producer,
+            chunk_bytes: 1 << 20,
+            chunk_records: records,
+            readers_per_poll: 1,
+            terminal: false,
+            sticky_read_failed: None,
+            position_fallbacks: 0,
+        };
+        (w, cs.pop().unwrap(), Slot::new())
+    }
+
+    /// Post `req` as the network thread would, answer it as `poll` would, and
+    /// return the answer with the chunk's decoded records.
+    fn ask(
+        w: &mut Writer,
+        slot: &Slot,
+        c: &mut Consumer,
+        wal: &Wal,
+        req: Request,
+    ) -> (Answer, Vec<(u64, Vec<u8>)>) {
+        c.detach();
+        slot.post(req);
+        let mut pass = Pass::default();
+        slot.answer(|r, b| w.decide(0, r, b, wal, &mut pass))
+            .expect("the request was pending");
+        let mut buf = Vec::new();
+        let Awaited::Answer(a) = slot.await_answer(c, &mut buf, |_| unreachable!("DONE")) else {
+            panic!("no answer");
+        };
+        let mut recs = Vec::new();
+        let mut rest = &buf[..];
+        while let Some((l, p, tail)) = chunk_pop(rest) {
+            recs.push((l.0, p.to_vec()));
+            rest = tail;
+        }
+        assert!(rest.is_empty());
+        (a, recs)
+    }
+
+    fn want(model: &[Vec<u8>], from: u64, n: u64) -> Vec<(u64, Vec<u8>)> {
+        (from..from + n)
+            .map(|l| (l, model[l as usize].clone()))
+            .collect()
+    }
+
+    /// T18(a) — stale position, live cursor. A genuine position is taken in a
+    /// segment that a later checkpoint deletes, while the request's cursor is
+    /// still `≥ oldest_lsn` (and `≠ pos.next_lsn()`, as after a cutover and a
+    /// ring fall-back). The position must be ignored: the replica is served
+    /// densely from its cursor — not answered BelowOldest (a FIN and a second
+    /// session).
+    #[test]
+    fn t18a_a_stale_position_is_ignored_when_the_cursor_moved() {
+        let (_dir, mut wal, model) = log(300, None);
+        let (mut w, mut c, slot) = writer(&wal, 5);
+        // A genuine position: the first chunk's end, in the first segment.
+        let (a, recs) = ask(
+            &mut w,
+            &slot,
+            &mut c,
+            &wal,
+            Request::Chunk {
+                cursor: Lsn(1),
+                pos: None,
+            },
+        );
+        assert_eq!(recs, want(&model, 1, 5));
+        let Answer::Chunk {
+            next: Lsn(6),
+            end: ChunkEnd::More(Some(pos)),
+        } = a
+        else {
+            panic!("expected Chunk{{6, More(pos)}}, got {a:?}");
+        };
+        assert_eq!(pos.next_lsn(), Lsn(6));
+        // Used as given while it matches the cursor (no fallback).
+        let (a, recs) = ask(
+            &mut w,
+            &slot,
+            &mut c,
+            &wal,
+            Request::Chunk {
+                cursor: Lsn(6),
+                pos: Some(pos),
+            },
+        );
+        assert!(matches!(a, Answer::Chunk { next: Lsn(11), .. }));
+        assert_eq!(recs, want(&model, 6, 5));
+        assert_eq!(w.position_fallbacks, 0);
+
+        // The checkpoint deletes the position's segment.
+        wal.checkpoint(Lsn(150)).unwrap();
+        let oldest = wal.oldest_lsn().0;
+        assert!(
+            oldest > 6,
+            "the position's segment is gone (oldest {oldest})"
+        );
+        let cursor = oldest + 3;
+        let (a, recs) = ask(
+            &mut w,
+            &slot,
+            &mut c,
+            &wal,
+            Request::Chunk {
+                cursor: Lsn(cursor),
+                pos: Some(pos), // stale: next_lsn 6 ≠ cursor
+            },
+        );
+        assert!(
+            matches!(a, Answer::Chunk { next, .. } if next.0 == cursor + 5),
+            "a stale position must not end the session: got {a:?}"
+        );
+        assert_eq!(
+            recs,
+            want(&model, cursor, 5),
+            "served densely from the cursor"
+        );
+    }
+
+    /// T18(b), first case — a forged position that `reader_at` rejects: the
+    /// answer falls back to `reader_from` and serves the genuine records.
+    #[test]
+    fn t18b_a_rejected_forged_position_falls_back_to_reader_from() {
+        let (_dir, wal, model) = log(120, None);
+        let (mut w, mut c, slot) = writer(&wal, 5);
+        // Offset 72 is inside the first record (8-aligned, but no record
+        // starts there).
+        let forged = open_wal::fuzzing::reader_pos(1, 72, 9);
+        assert!(matches!(
+            wal.reader_at(forged).map(|_| ()),
+            Err(WalError::InvalidPosition)
+        ));
+        let (a, recs) = ask(
+            &mut w,
+            &slot,
+            &mut c,
+            &wal,
+            Request::Chunk {
+                cursor: Lsn(9),
+                pos: Some(forged),
+            },
+        );
+        assert!(matches!(a, Answer::Chunk { next: Lsn(14), .. }), "{a:?}");
+        assert_eq!(recs, want(&model, 9, 5));
+        assert!(w.sticky_read_failed.is_none());
+        assert_eq!(w.position_fallbacks, 1, "reachability: the fallback ran");
+    }
+
+    /// T18(b), second case — a forged position pointing at a CRC-valid frame
+    /// **embedded in a payload**. `reader_at` accepts it (it cannot tell), the
+    /// reader yields the fake record and then ends early. The writer must
+    /// discard what that reader produced and retry with `reader_from`: the
+    /// chunk carries exactly the genuine records, and nothing is sticky.
+    #[test]
+    fn t18b_a_fake_record_from_a_forged_position_never_reaches_the_wire() {
+        const CARRIER: u64 = 5; // the record whose payload hides a frame
+        const CLAIMED: u64 = 7; // the LSN the hidden frame claims
+        // The carrier's payload starts at file offset `off + 20` (≡ 4 mod 8):
+        // 4 pad bytes put the hidden frame at an 8-aligned offset.
+        let mut hidden = Vec::new();
+        open_wal::fuzzing::encode_record_into(&mut hidden, CLAIMED, b"FAKE-FAKE-FAKE-!");
+        let mut carrier = vec![0xAA; 4];
+        carrier.extend_from_slice(&hidden);
+        carrier.extend_from_slice(&[0u8; 24]); // then zeros: the fake stream ends
+        let (_dir, wal, model) = log(120, Some((CARRIER, carrier)));
+        let off = 64 + (CARRIER - 1) * F64 + 20 + 4;
+        assert_eq!(off % 8, 0);
+        let forged = open_wal::fuzzing::reader_pos(1, off, CLAIMED);
+
+        // Preconditions: `reader_at` accepts it, yields the FAKE record, then
+        // ends early (below the ceiling: released ≥ cursor + 1).
+        {
+            let mut r = wal.reader_at(forged).expect("reader_at cannot tell");
+            let (l, p) = r.next().unwrap().unwrap();
+            assert_eq!((l, p), (Lsn(CLAIMED), &b"FAKE-FAKE-FAKE-!"[..]));
+            assert_ne!(p, &model[CLAIMED as usize][..]);
+            assert!(r.next().is_none(), "the fake stream ends early");
+        }
+        let (mut w, mut c, slot) = writer(&wal, 5); // ≥ 2 records per chunk
+        assert!(w.producer.released().0 > CLAIMED);
+
+        let (a, recs) = ask(
+            &mut w,
+            &slot,
+            &mut c,
+            &wal,
+            Request::Chunk {
+                cursor: Lsn(CLAIMED),
+                pos: Some(forged),
+            },
+        );
+        assert!(
+            matches!(a, Answer::Chunk { next, .. } if next.0 == CLAIMED + 5),
+            "no ReadFailed from a reader_at reader: got {a:?}"
+        );
+        assert_eq!(
+            recs,
+            want(&model, CLAIMED, 5),
+            "the chunk must carry exactly the log's own records"
+        );
+        assert!(w.sticky_read_failed.is_none(), "nothing may be sticky");
+        assert_eq!(w.position_fallbacks, 1, "reachability: the retry ran");
+        // And the next request reads normally.
+        let (_, recs) = ask(
+            &mut w,
+            &slot,
+            &mut c,
+            &wal,
+            Request::Chunk {
+                cursor: Lsn(CLAIMED + 5),
+                pos: None,
+            },
+        );
+        assert_eq!(recs, want(&model, CLAIMED + 5, 5));
+    }
 }
