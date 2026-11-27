@@ -15,6 +15,12 @@
 //! release-at-commit as a Release/Acquire watermark (the R1 gate), one network
 //! thread per replica, and overflow ⇒ `NeedsCatchUp` without ever blocking the
 //! writer. The ring is model-checked with loom (§15.7, `tests/loom_ring.rs`).
+//! **RM3** adds catch-up / resume (§9): a replica that (re)connects behind the
+//! ring, or that the ring overflows past, is served the missing records from
+//! the primary's log in bounded chunks on the writer thread
+//! ([`Shipper::poll`]`(&wal)`), under the released watermark (R1), and then cut
+//! over to the ring — inside its session. A replica below the primary's
+//! retention floor is answered `RESEED_REQUIRED` (R6).
 
 #![warn(missing_docs)]
 

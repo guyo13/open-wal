@@ -937,6 +937,10 @@ fn session(
     let (oldest, how) = match answer {
         Answer::Serve { oldest, how } => (oldest, how),
         Answer::Reseed { oldest } => {
+            // An honest replica we cannot serve: `acked` still describes the
+            // replica connected NOW (review R4 on #53 — every HELLO that is
+            // not "ahead" replaces a stale watermark).
+            r.acked.store(d.0, Ordering::Release);
             set_status(r, ReplicaStatus::NeedsReseed);
             let _ = send(
                 &stream,
