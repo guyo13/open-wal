@@ -39,6 +39,8 @@ mod lsn;
 mod observer;
 mod options;
 #[cfg(test)]
+mod parent_dir_tests;
+#[cfg(test)]
 mod position_tests;
 mod reader;
 mod record;

@@ -179,6 +179,28 @@ jobs:
       - name: dir-fsync presence (correct issues it per roll; inject does not)
         run: scripts/m8/dirfsync-presence.sh
 
+  parent-dirfsync-presence:
+    # §8.4.1 F2 (PRIMARY): the deterministic, FS-independent regression guard for
+    # the parent-directory fsyncs `open` issues when it creates the WAL directory
+    # or cold-starts in it. Straces three cases (missing nested path / pre-existing
+    # empty directory / reopen) and checks the order and target of every mkdir and
+    # fsync: each created level's parent is fsynced before the next level and
+    # before the first segment exists; every cold start fsyncs dir's parent after
+    # dir; a reopen issues none. Syscall presence, not a power-loss proof (a
+    # behavioural test would very likely be masked by journaling, as §14.4d's
+    # was). Needs only strace + python3; a missing strace FAILS the script.
+    name: §8.4.1 parent dir-fsync presence (strace)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install strace
+        run: sudo apt-get update -y && sudo apt-get install -y strace
+      - name: parent dir-fsync presence (created levels, cold start, none on reopen)
+        run: scripts/m8/parent-dirfsync-presence.sh
+
   book:
     # User-facing documentation (book/). `mdbook build` catches broken SUMMARY
     # entries and malformed chapters; the *code* in the book is verified
