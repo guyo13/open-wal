@@ -115,6 +115,12 @@ The entire value of this component is **correct behavior under crashes and fault
 
 ## Project status (keep this updated)
 
+- **LATEST (2026-11-28, WAL fix): #62 (parent-directory fsync on directory creation / cold start, kickoff F) reviewed at `bfcdacd` — approved, pending one macOS re-run and two spec lines.**
+  - **Gap fixed:** `Wal::open` used `create_dir_all` and never fsynced the parent, so a new WAL directory's own entry was not durable (D1 by POSIX; very likely masked on journaling filesystems).
+  - **Rule:** each level `open` creates has its parent fsynced before the next; every cold start fsyncs `dir`'s parent before `open` returns; reopening an existing log issues none; `PermissionDenied` on opening the parent is tolerated only for a pre-existing `dir`.
+  - **Reviewer-run:** root 202 (205 with `fuzzing`), replica 98, clippy, fmt, both strace scripts; F3 run as uid 65534. Five mutations, the reviewer's own patches in a separate worktree: all fail F2 or F3.
+  - **Open:** the macOS H4 job failed on a crates.io DNS error before any test ran, so macOS is unexercised on this head (one re-run requested). The spec needs the symlink and left-behind-directory limits.
+  - **Owner decisions:** no patch release; the fix ships with 0.3.0. Snapshot transport stays out of v1 scope unless the owner adds it (the removed traits never specified one).
 - **LATEST (2026-11-28, RM4 prep): #61 MERGED (`e659fbb`); spec §10 rewritten and kickoff E drafted. DRAFT, not dispatched: it waits on the owner's yes to the §10 revision.**
   - **§10 revision:** the snapshot traits are removed (the crate never transports a snapshot, so nothing called them). The crate owns two things only:
     - replica: `Receiver::open_seeded(dir, cfg, installed, observer_factory)`. Stateless rule: keep the log iff `durable_lsn ≥ s`, else set the directory aside (rename, never delete) and cold-start at `s + 1`. The same call converges from every crash state of a re-seed.
