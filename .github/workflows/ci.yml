@@ -274,3 +274,23 @@ jobs:
           RUSTFLAGS: --cfg loom
           CARGO_TARGET_DIR: target/loom
         run: cargo test -p open-wal-replica --test loom_ring --release
+
+  replica-reseed-dirops:
+    # RM4 E9 (replica spec §10.1): `Receiver::open_seeded`'s directory
+    # operations are durable and ordered. Straces a set-aside run and a
+    # missing-directory run and checks, from the trace: the WAL's LOCK
+    # descriptor is closed before the rename; the parent directory is fsynced
+    # after the rename and after each mkdir, before the first segment file is
+    # created. Per-PR and BLOCKING; the script exits 77 (red) if strace is
+    # missing — a skip is not a pass.
+    name: replica — §10.1 directory ops (strace, E9)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install strace
+        run: sudo apt-get update -y && sudo apt-get install -y strace
+      - name: E9 directory-operation order
+        run: scripts/replica/reseed-dirops.sh

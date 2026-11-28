@@ -27,9 +27,14 @@
 //! (read models, subscribers) off its *own* [`DurabilityObserver`]: open it with
 //! [`Receiver::open_with`]. The observer fires only after the replica's
 //! `commit() → Ok` — so a consumer fed from it acts only on records durable on
-//! at least two nodes (here, and by R1 on the primary), never on `append`. (Once
-//! WAL v7 lands, a re-seeded replica opens via `Wal::options().seed(..)
-//! .observer(o)`; that is RM4.)
+//! at least two nodes (here, and by R1 on the primary), never on `append`.
+//!
+//! **Re-seed (§10.1).** A replica that was answered `RESEED_REQUIRED`, or that
+//! is new on a primary whose log no longer starts at 1, is restarted from an
+//! application snapshot at LSN `s` with [`Receiver::open_seeded`]: a log that
+//! predates the snapshot is **set aside** (renamed, never deleted) and a new
+//! one is cold-started at `s + 1`. The crate never produces, transports or
+//! installs the snapshot itself.
 //!
 //! The replica's `WalConfig` MUST use the primary's `segment_size` and
 //! `max_record_size` (§7 step 1). The protocol does not carry them; a primary
@@ -37,7 +42,7 @@
 
 use std::io::{self, Write};
 use std::net::{Shutdown, TcpListener, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -128,27 +133,132 @@ impl Receiver<NullObserver> {
     }
 }
 
+/// What [`Receiver::open_seeded`] did to the directory (§10.1).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SeedReport {
+    /// The directory a stale log was moved to (`<dir>.stale.<k>`), if one was
+    /// set aside by this call. The crate never deletes or reopens it: it still
+    /// holds the replica's old durable prefix, and removing it is the
+    /// operator's decision.
+    pub set_aside: Option<PathBuf>,
+}
+
 impl<O: DurabilityObserver> Receiver<O> {
     /// Like [`open`](Receiver::open), with `observer` attached to the replica
     /// WAL (§7.1): it is notified of each durable advance after the replica's
     /// `commit() → Ok`, on the receiver's thread, under the WAL's observer
     /// contract (cheap, non-blocking, no I/O, no panic).
     pub fn open_with(dir: &Path, cfg: ReceiverConfig, observer: O) -> Result<Receiver<O>> {
-        if cfg.batch_records == 0 {
-            return Err(ReplError::Wal(WalError::InvalidConfig));
-        }
+        check_cfg(&cfg)?;
         let (wal, _report) = Wal::open_with(dir, cfg.wal_config, observer)?;
+        Ok(Receiver::from_wal(wal, cfg))
+    }
+
+    /// Open the replica WAL for an application that may have been re-seeded
+    /// from a snapshot (§10.1).
+    ///
+    /// `installed` is the LSN of the most recent re-seed snapshot the
+    /// application has **durably** installed, read from the application's own
+    /// durable state; `None` if it has never been re-seeded. Pass the same
+    /// value on every start.
+    ///
+    /// - `None` ⇒ exactly [`open_with`](Receiver::open_with)`(dir, cfg,
+    ///   observer())`.
+    /// - `Some(s)` ⇒ the WAL is opened with the cold-start seed `s + 1` (which
+    ///   the WAL ignores when `dir` already holds a log). A log with
+    ///   `durable_lsn ≥ s` is kept — every normal restart. A log with
+    ///   `durable_lsn < s` **predates the snapshot**: it is closed, the whole
+    ///   directory is renamed to `<dir>.stale.<k>` (smallest unused `k`; never
+    ///   deleted, never overwritten), and a new log is cold-started at `s + 1`
+    ///   (`oldest_lsn = s + 1`, `durable_lsn = s`). The rule is stateless, so a
+    ///   crash anywhere in it converges when the same call is made again.
+    ///
+    /// `observer` is a factory because the set-aside path opens the WAL twice
+    /// and a `Wal` consumes its observer: it is called exactly once per WAL
+    /// open (once normally, twice when a log is set aside). The crate never
+    /// calls the observer itself, and neither does the WAL at open: a consumer
+    /// that needs a starting watermark reads [`durable_lsn`](Receiver::durable_lsn)
+    /// (after a seeded cold start it is `s`).
+    ///
+    /// # Requirements
+    /// - `dir` MUST be dedicated to the WAL (the set-aside renames the whole
+    ///   directory): keep the application's `installed` record and snapshot
+    ///   files elsewhere. It must not be a mount point or a symbolic link, and
+    ///   its parent must be writable and readable (it is opened for the fsync
+    ///   before anything is renamed). A bare relative `dir` has parent `.`.
+    /// - One process owns the replica directory: the WAL's directory lock
+    ///   does not cover the window between the old log's close and the new
+    ///   log's open.
+    /// - The snapshot (including `s` itself) MUST be durably installed before
+    ///   this call: afterwards the log starts at `s + 1`.
+    /// - This process is the only one creating `<dir>.stale.*`.
+    /// - A former primary (§12.2) is **not** covered: its log may have
+    ///   `durable_lsn ≥ s` and would be kept. Wipe it by hand first.
+    ///
+    /// # Errors
+    /// A WAL open error is returned unchanged and nothing is set aside (a log
+    /// that cannot be recovered has an unknown `durable_lsn`; the operator
+    /// decides). On the set-aside path, [`ReplError::Io`] with nothing
+    /// changed for: a `dir` that is a symbolic link; a parent that cannot be
+    /// opened; a `dir` spelled so that it has no final name or cannot be
+    /// renamed (`.`, `x/..`, `dir/.`, a symlink with a trailing slash); a
+    /// failed rename. If an error (or a crash) follows the rename, the stale
+    /// directory has already been moved and no [`SeedReport`] names it: list
+    /// `<dir>.stale.*`; calling again converges. `s == u64::MAX` is
+    /// [`ReplError::LsnExhausted`].
+    pub fn open_seeded(
+        dir: &Path,
+        cfg: ReceiverConfig,
+        installed: Option<Lsn>,
+        mut observer: impl FnMut() -> O,
+    ) -> Result<(Receiver<O>, SeedReport)> {
+        let Some(s) = installed else {
+            let rx = Receiver::open_with(dir, cfg, observer())?;
+            return Ok((rx, SeedReport::default()));
+        };
+        check_cfg(&cfg)?;
+        let seed = s
+            .checked_next()
+            .ok_or(ReplError::LsnExhausted { last: s })?;
+        // A missing `dir` is created by the WAL itself, each new level's
+        // parent fsynced before anything is put inside it (WAL §8.4.1).
+        let (wal, _report) = Wal::options()
+            .seed(seed)
+            .observer(observer())
+            .open(dir, cfg.wal_config)?;
+        if wal.durable_lsn() >= s {
+            return Ok((Receiver::from_wal(wal, cfg), SeedReport::default()));
+        }
+        // The log predates the snapshot. Drop the handle — and with it the
+        // directory lock — before the rename.
+        drop(wal);
+        let stale = set_aside(dir)?;
+        // `dir` is gone: the WAL creates it again (parent fsynced first) and
+        // cold-starts at the seed.
+        let (wal, _report) = Wal::options()
+            .seed(seed)
+            .observer(observer())
+            .open(dir, cfg.wal_config)?;
+        Ok((
+            Receiver::from_wal(wal, cfg),
+            SeedReport {
+                set_aside: Some(stale),
+            },
+        ))
+    }
+
+    fn from_wal(wal: Wal<O>, cfg: ReceiverConfig) -> Receiver<O> {
         let watermarks = Arc::new(ReplicaWatermarks {
             durable: AtomicU64::new(wal.durable_lsn().0),
             last: AtomicU64::new(wal.last_lsn().0),
         });
-        Ok(Receiver {
+        Receiver {
             wal,
             cfg,
             poisoned: false,
             watermarks,
             out: Vec::with_capacity(64),
-        })
+        }
     }
 
     /// The replica WAL's durable watermark.
@@ -394,6 +504,72 @@ impl<O: DurabilityObserver> Receiver<O> {
             None => Ok(()),
         }
     }
+}
+
+fn check_cfg(cfg: &ReceiverConfig) -> Result<()> {
+    if cfg.batch_records == 0 {
+        return Err(ReplError::Wal(WalError::InvalidConfig));
+    }
+    Ok(())
+}
+
+// ---- §10.1 set-aside ------------------------------------------------------
+// The only filesystem operations this crate performs outside the WAL: one
+// rename, one parent-directory fsync, and existence checks. Nothing here
+// deletes or overwrites anything. (Directory creation is the WAL's, §8.4.1.)
+
+fn invalid_dir(why: &'static str) -> ReplError {
+    ReplError::Io(io::Error::new(io::ErrorKind::InvalidInput, why))
+}
+
+/// Whether anything (a dangling symlink included) exists at `path`.
+fn exists(path: &Path) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(ReplError::Io(e)),
+    }
+}
+
+/// Rename `dir` to `<dir>.stale.<k>` with the smallest unused `k ≥ 0`, and
+/// make the rename durable. Returns the new path. Every failure before the
+/// rename leaves the filesystem untouched.
+fn set_aside(dir: &Path) -> Result<PathBuf> {
+    // A symlinked `dir` would have the *link* renamed and the new log created
+    // wherever the link lives — silently relocating the replica's log.
+    if std::fs::symlink_metadata(dir)?.file_type().is_symlink() {
+        return Err(invalid_dir(
+            "the replica WAL directory is a symbolic link: it cannot be set aside              automatically (set the stale log aside by hand)",
+        ));
+    }
+    let name = dir
+        .file_name()
+        .ok_or_else(|| invalid_dir("the replica WAL directory has no name to set aside"))?;
+    // A bare relative `dir` has parent `.`.
+    let parent = match dir.parent() {
+        Some(p) if p.as_os_str().is_empty() => Path::new("."),
+        Some(p) => p,
+        None => return Err(invalid_dir("the replica WAL directory has no parent")),
+    };
+    // Open the parent BEFORE the rename: if it cannot be opened it cannot be
+    // fsynced, and the rename must then not happen at all.
+    let parent_handle = std::fs::File::open(parent)?;
+    let mut k: u64 = 0;
+    let stale = loop {
+        let mut n = name.to_os_string();
+        n.push(format!(".stale.{k}"));
+        let candidate = parent.join(n);
+        if !exists(&candidate)? {
+            break candidate;
+        }
+        k = k
+            .checked_add(1)
+            .ok_or_else(|| ReplError::Io(io::Error::other("no unused .stale.<k> name")))?;
+    };
+    std::fs::rename(dir, &stale)?;
+    // `sync_all` on a directory handle: `fsync` on Linux, `F_FULLFSYNC` on macOS.
+    parent_handle.sync_all()?;
+    Ok(stale)
 }
 
 /// `last + 1` for sequencing — never saturating (WAL v7.1: `u64::MAX` is the

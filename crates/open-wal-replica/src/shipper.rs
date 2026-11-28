@@ -43,6 +43,18 @@
 //!   payloads are small (§9.1).
 //! - **After an in-process WAL reopen** (§8.2): before the next `append`, call
 //!   `shipper.on_commit(wal.commit()?)`.
+//! - **Checkpoint policy** (§11): bound every `wal.checkpoint(up_to)` by
+//!   [`retention_floor`](Shipper::retention_floor) (as well as by the latest
+//!   durable snapshot LSN). It already accounts for re-seed holds.
+//!
+//! # Re-seed hold (§10.2)
+//! When a replica must be re-seeded from a snapshot at LSN `s`, call
+//! [`begin_reseed`](Shipper::begin_reseed)`(&wal, id, s)` on the writer thread
+//! **before the next `checkpoint`** after `s` is chosen. The hold keeps
+//! `retention_floor()` at or below `s` until that replica's `HELLO{d == s}` is
+//! served (exactly `d == s`), so the checkpoint policy cannot delete `s + 1` while the snapshot
+//! is in flight (which would get the re-seeded replica `RESEED_REQUIRED`
+//! again). Holds are plain writer-thread state and are not persisted (R7).
 
 use std::io::Write;
 use std::net::{Shutdown, SocketAddr, TcpStream};
@@ -496,9 +508,58 @@ impl Writer {
     }
 }
 
+/// §10.2 re-seed state. Plain writer-thread state (it lives in the
+/// [`Shipper`], which the writer thread owns); never shared, never persisted
+/// (R7).
+struct Reseed {
+    /// Per replica: the snapshot LSN of a re-seed in flight (the hold).
+    holds: Box<[Option<Lsn>]>,
+    /// Per replica: its latest join was answered `RESEED_REQUIRED` (set) or
+    /// Serve (cleared).
+    needs_reseed: Box<[bool]>,
+}
+
+impl Reseed {
+    /// Account for one answered request, on the writer thread, **inside**
+    /// `Slot::answer`'s closure — i.e. before the network thread can see the
+    /// answer, and before `poll` returns.
+    ///
+    /// - A join answered `RESEED_REQUIRED` sets `needs_reseed[id]`. It does
+    ///   not clear a hold.
+    /// - A join answered Serve releases, in this order:
+    ///   1. `acked[id] = d` — the one shared write made here. The network
+    ///      thread's own later store of the same `d` is then redundant. (No
+    ///      ack reader runs for this replica now: a session's ack reader is
+    ///      joined before its network thread posts the next join.) Without
+    ///      it, a `checkpoint` right after this `poll` would see the hold gone
+    ///      and `acked` still at a possibly stale-high value;
+    ///   2. `needs_reseed[id] = false` — the replica counts in the floor
+    ///      again, at `d`;
+    ///   3. the hold, only if `d == s`: a re-seeded replica's first HELLO
+    ///      carries exactly `s` (its seeded log has `durable_lsn = s`). A
+    ///      Serve with any other `d` is not the re-seeded replica — `d > s`
+    ///      may be its old incarnation, which must not release the hold.
+    /// - Nothing else (a rejection, a chunk answer, …) changes anything.
+    fn on_answer(&mut self, id: ReplicaId, acked: &AtomicU64, req: &Request, ans: &Answer) {
+        let Request::Join { d } = *req else { return };
+        match ans {
+            Answer::Reseed { .. } => self.needs_reseed[id] = true,
+            Answer::Serve { .. } => {
+                acked.store(d.0, Ordering::Release);
+                self.needs_reseed[id] = false;
+                if self.holds[id] == Some(d) {
+                    self.holds[id] = None;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// The primary's replication shipper (§8, §9).
 pub struct Shipper {
     w: Writer,
+    reseed: Reseed,
     net: Arc<Net>,
     threads: Vec<JoinHandle<()>>,
     /// Where the next `poll` pass starts (round-robin, §9.1).
@@ -567,6 +628,10 @@ impl Shipper {
                 sticky_read_failed: None,
                 position_fallbacks: 0,
             },
+            reseed: Reseed {
+                holds: vec![None; n].into_boxed_slice(),
+                needs_reseed: vec![false; n].into_boxed_slice(),
+            },
             net,
             threads,
             start: 0,
@@ -622,6 +687,7 @@ impl Shipper {
         let start = self.start % n;
         let mut pass = Pass::default();
         let w = &mut self.w;
+        let reseed = &mut self.reseed;
         // Joins first: `SERVING` latency never includes a log read.
         // A replica is answered at most once per pass: the chunk request a
         // network thread posts right after its join was answered waits for the
@@ -629,10 +695,14 @@ impl Shipper {
         let mut joined = [0u64; ring::MAX_CONSUMERS / 64 + 1];
         for k in 0..n {
             let id = (start + k) % n;
-            let slot = &self.net.replicas[id].slot;
-            if slot.pending_join()
-                && slot
-                    .answer(|req, buf| w.decide(id, req, buf, wal, &mut pass))
+            let r = &self.net.replicas[id];
+            if r.slot.pending_join()
+                && r.slot
+                    .answer(|req, buf| {
+                        let ans = w.decide(id, req, buf, wal, &mut pass);
+                        reseed.on_answer(id, &r.acked, req, &ans);
+                        ans
+                    })
                     .is_some()
             {
                 joined[id / 64] |= 1 << (id % 64);
@@ -643,9 +713,12 @@ impl Shipper {
             if joined[id / 64] & (1 << (id % 64)) != 0 {
                 continue;
             }
-            self.net.replicas[id]
-                .slot
-                .answer(|req, buf| w.decide(id, req, buf, wal, &mut pass));
+            let r = &self.net.replicas[id];
+            r.slot.answer(|req, buf| {
+                let ans = w.decide(id, req, buf, wal, &mut pass);
+                reseed.on_answer(id, &r.acked, req, &ans);
+                ans
+            });
         }
         // A replica deferred by the cap is answered first next time.
         self.start = pass
@@ -679,8 +752,10 @@ impl Shipper {
             .count()
     }
 
-    /// The minimum acked LSN over **all** configured replicas — the input to
-    /// the integrator's checkpoint policy (§11). A replica that has not acked
+    /// The minimum acked LSN over **all** configured replicas, whatever their
+    /// state. For the checkpoint policy use
+    /// [`retention_floor`](Shipper::retention_floor) (§11), which also knows
+    /// about re-seeds. A replica that has not acked
     /// anything since this shipper started counts as `Lsn(0)` (most
     /// conservative; the primary persists no replica state, R7).
     #[must_use]
@@ -689,6 +764,100 @@ impl Shipper {
             .replicas
             .iter()
             .map(|r| Lsn(r.acked.load(Ordering::Acquire)))
+            .min()
+    }
+
+    /// Register a re-seed of replica `id` from a snapshot at LSN `s` (§10.2):
+    /// the **re-seed hold**. Writer thread.
+    ///
+    /// Validates against the live WAL, in this order: `id` is configured
+    /// (else [`ReplError::UnknownReplica`]); `s ≤ wal.durable_lsn()` — a
+    /// snapshot must not reflect a record the primary has not durably
+    /// committed (the R1 rule for snapshots); `s + 1 ≥ wal.oldest_lsn()` — a
+    /// replica seeded at `s + 1` must still be servable (else
+    /// [`ReplError::InvalidSnapshotLsn`]). A failure records nothing. On
+    /// success the hold `s` replaces any earlier hold for that replica.
+    ///
+    /// **Call order (MUST):** call this before the next `checkpoint` after `s`
+    /// is chosen, and from then on bound every `checkpoint` by
+    /// [`retention_floor`](Shipper::retention_floor).
+    ///
+    /// The hold is released inside [`poll`](Shipper::poll) when a join from
+    /// `id` with `HELLO.d == s` is answered Serve — and by nothing else: not a
+    /// join with any other `d` (above `s` it may be the replica's old
+    /// incarnation), not a `RESEED_REQUIRED` answer, not a rejection, not a
+    /// session end. A hold whose replica never arrives at `s` (a newer
+    /// snapshot was used) is replaced by the next `begin_reseed` or dropped
+    /// by [`end_reseed`](Shipper::end_reseed). Holds
+    /// are not persisted (R7): after a primary restart, re-register a re-seed
+    /// that is still in flight. A snapshot is bound to the primary that
+    /// validated it: on promotion, discard it and start over (§10, §12.1).
+    pub fn begin_reseed<O: DurabilityObserver>(
+        &mut self,
+        wal: &Wal<O>,
+        id: ReplicaId,
+        s: Lsn,
+    ) -> Result<()> {
+        if id >= self.reseed.holds.len() {
+            return Err(ReplError::UnknownReplica { id });
+        }
+        let (oldest, durable) = (wal.oldest_lsn(), wal.durable_lsn());
+        let invalid = ReplError::InvalidSnapshotLsn { s, oldest, durable };
+        if s > durable {
+            return Err(invalid);
+        }
+        match s.checked_next() {
+            Some(seed) if seed >= oldest => {}
+            _ => return Err(invalid),
+        }
+        self.reseed.holds[id] = Some(s);
+        Ok(())
+    }
+
+    /// Drop replica `id`'s re-seed hold (the re-seed was abandoned). A no-op
+    /// without a hold or for an unknown id. The integrator SHOULD bound how
+    /// long it lets a hold pin the log.
+    pub fn end_reseed(&mut self, id: ReplicaId) {
+        if let Some(h) = self.reseed.holds.get_mut(id) {
+            *h = None;
+        }
+    }
+
+    /// Whether replica `id`'s latest join was answered `RESEED_REQUIRED`
+    /// (and none since was served); `None` for an unknown id. Deterministic:
+    /// it is set and cleared on the writer thread inside
+    /// [`poll`](Shipper::poll), unlike [`ReplicaStatus::NeedsReseed`], which a
+    /// network thread publishes later.
+    #[must_use]
+    pub fn replica_needs_reseed(&self, id: ReplicaId) -> Option<bool> {
+        self.reseed.needs_reseed.get(id).copied()
+    }
+
+    /// The replica term of the integrator's checkpoint policy (§11):
+    /// `up_to = min(latest durable snapshot LSN, retention_floor() − margin)`.
+    ///
+    /// The minimum, over all configured replicas, of:
+    /// - the replica's re-seed hold `s`, if it has one (§10.2) — even while
+    ///   its old incarnation is being served below or above `s`;
+    /// - nothing, if it has no hold and needs a re-seed (it is below
+    ///   `oldest_lsn` already; no retention can help it);
+    /// - otherwise its acked LSN (`Lsn(0)` until its first `HELLO` since this
+    ///   shipper started, R7).
+    ///
+    /// `None` when every replica is excluded. Checkpointing past this value
+    /// gets some replica `RESEED_REQUIRED` (loud, R6); the crate neither calls
+    /// nor gates `checkpoint`.
+    #[must_use]
+    pub fn retention_floor(&self) -> Option<Lsn> {
+        self.net
+            .replicas
+            .iter()
+            .enumerate()
+            .filter_map(|(id, r)| match self.reseed.holds[id] {
+                Some(s) => Some(s),
+                None if self.reseed.needs_reseed[id] => None,
+                None => Some(Lsn(r.acked.load(Ordering::Acquire))),
+            })
             .min()
     }
 
@@ -1677,5 +1846,84 @@ mod tests {
             },
         );
         assert_eq!(recs, want(&model, CLAIMED + 5, 5));
+    }
+
+    /// E6 (kickoff E), writer-level and deterministic: what `poll` does to the
+    /// re-seed state for each answer — in particular the §10.2 handover (the
+    /// writer itself stores `acked = d` when it answers Serve), which the
+    /// integration row can only observe through a race with the network
+    /// thread's own, later store.
+    #[test]
+    fn e6_on_answer_release_rules() {
+        let serve = Answer::Serve {
+            oldest: Lsn(1),
+            how: Serve::Wait,
+        };
+        let join = |d: u64| Request::Join { d: Lsn(d) };
+        let new = || Reseed {
+            holds: vec![Some(Lsn(500)), Some(Lsn(700))].into_boxed_slice(),
+            needs_reseed: vec![true, true].into_boxed_slice(),
+        };
+        let acked = AtomicU64::new(1000); // stale-high: an earlier session
+        let read = |a: &AtomicU64| a.load(Ordering::Acquire);
+
+        // Serve with d == s: acked, needs_reseed and the hold — replica 0 only.
+        let mut r = new();
+        r.on_answer(0, &acked, &join(500), &serve);
+        assert_eq!(read(&acked), 500, "the writer stores acked = d on Serve");
+        assert_eq!(&*r.needs_reseed, &[false, true]);
+        assert_eq!(&*r.holds, &[None, Some(Lsn(700))]);
+
+        // Serve with d < s or d > s (the old incarnation): acked and
+        // needs_reseed, the hold stays.
+        for d in [499, 501, 1000] {
+            let mut r = new();
+            acked.store(1000, Ordering::Release);
+            r.on_answer(0, &acked, &join(d), &serve);
+            assert_eq!(read(&acked), d);
+            assert_eq!(&*r.needs_reseed, &[false, true]);
+            assert_eq!(
+                &*r.holds,
+                &[Some(Lsn(500)), Some(Lsn(700))],
+                "a Serve with d = {d} != s must keep the hold"
+            );
+        }
+
+        // Serve without a hold still stores acked.
+        let mut r = new();
+        r.holds[0] = None;
+        acked.store(1000, Ordering::Release);
+        r.on_answer(0, &acked, &join(3), &serve);
+        assert_eq!(read(&acked), 3);
+
+        // RESEED_REQUIRED: sets needs_reseed; no hold, no acked (the network
+        // thread publishes that one).
+        let mut r = new();
+        r.needs_reseed[0] = false;
+        acked.store(1000, Ordering::Release);
+        r.on_answer(0, &acked, &join(2), &Answer::Reseed { oldest: Lsn(90) });
+        assert_eq!(read(&acked), 1000);
+        assert_eq!(&*r.needs_reseed, &[true, true]);
+        assert_eq!(&*r.holds, &[Some(Lsn(500)), Some(Lsn(700))]);
+
+        // A rejection, an internal failure and any chunk answer change nothing.
+        let chunk = Request::Chunk {
+            cursor: Lsn(600),
+            pos: None,
+        };
+        for (req, ans) in [
+            (join(900), Answer::Reject),
+            (join(900), Answer::Internal),
+            (join(900), Answer::Terminal),
+            (chunk, Answer::Attached { cursor: Lsn(600) }),
+            (chunk, Answer::Wait),
+            (chunk, Answer::BelowOldest),
+        ] {
+            let mut r = new();
+            r.on_answer(0, &acked, &req, &ans);
+            assert_eq!(read(&acked), 1000, "{ans:?}");
+            assert_eq!(&*r.needs_reseed, &[true, true], "{ans:?}");
+            assert_eq!(&*r.holds, &[Some(Lsn(500)), Some(Lsn(700))], "{ans:?}");
+        }
     }
 }

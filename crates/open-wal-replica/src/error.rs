@@ -53,8 +53,25 @@ pub enum ReplError {
     /// A transport (socket) error. Never a durability failure on its own.
     Io(std::io::Error),
 
-    /// Producing or applying a re-seed snapshot failed (§10, RM4).
-    SnapshotFailed,
+    /// `Shipper::begin_reseed` refused a snapshot LSN (§10.2): `s` is above
+    /// the primary's `durable_lsn` (the snapshot reflects a record the primary
+    /// has not durably committed), or `s + 1` is below its `oldest_lsn` (a
+    /// replica seeded at `s + 1` could not be served). Nothing was recorded.
+    InvalidSnapshotLsn {
+        /// The snapshot LSN that was refused.
+        s: Lsn,
+        /// The primary's `oldest_lsn` at the time of the call.
+        oldest: Lsn,
+        /// The primary's `durable_lsn` at the time of the call.
+        durable: Lsn,
+    },
+
+    /// A replica id that is not an index into `ShipperConfig::replicas`
+    /// (§10.2). Nothing was recorded.
+    UnknownReplica {
+        /// The id that was passed.
+        id: usize,
+    },
 
     /// The LSN space is exhausted (WAL v7.1): the next LSN after `last` would
     /// pass `u64::MAX`. Not a durability failure and not poison — the log
@@ -109,7 +126,13 @@ impl fmt::Display for ReplError {
             }
             ReplError::PrimaryPoisoned => write!(f, "primary WAL is poisoned"),
             ReplError::Io(e) => write!(f, "transport I/O error: {e}"),
-            ReplError::SnapshotFailed => write!(f, "snapshot produce/apply failed"),
+            ReplError::InvalidSnapshotLsn { s, oldest, durable } => {
+                write!(
+                    f,
+                    "invalid snapshot lsn {s}: the primary's log is {oldest}..={durable}"
+                )
+            }
+            ReplError::UnknownReplica { id } => write!(f, "unknown replica id {id}"),
             ReplError::LsnExhausted { last } => {
                 write!(f, "LSN space exhausted after lsn {last}")
             }

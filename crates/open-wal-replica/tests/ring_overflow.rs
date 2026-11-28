@@ -7,11 +7,18 @@
 //! the writer thread re-attaches it, then resumes from the ring. The emitted
 //! stream must be exactly `1..=N` — no record lost, none duplicated at any
 //! ring/catch-up cutover — and byte-identical. The producer never waits for the
-//! consumer.
+//! consumer (P4).
+//!
+//! `tiny_ring_marks_needs_catch_up_repeatedly` additionally passes **gates** to
+//! [`run`]: LSNs at which the test itself sequences the two threads so that an
+//! eviction is forced on any schedule (an unpaced producer can finish all its
+//! captures before a late-scheduled consumer drains once, which gives exactly
+//! one eviction). The eviction is still decided and reported by the ring.
 #![cfg(not(loom))]
 
-use std::sync::mpsc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, mpsc};
+use std::time::{Duration, Instant};
 
 use open_wal::Lsn;
 use open_wal_replica::ring::{self, AttachError, ConsumerStatus, RingConfig};
@@ -21,7 +28,38 @@ fn pat(lsn: u64, len: usize) -> Vec<u8> {
     (0..len).map(|i| (lsn as u8) ^ (i as u8)).collect()
 }
 
-fn run(n: u64, slots: usize, commit_every: u64, consumer_delay_every: u64) -> (Vec<u64>, u64) {
+/// How long a gate may wait before it fails the test loudly.
+const GATE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// `gates` (empty: no pacing, the producer never waits) are LSNs at which an
+/// eviction is forced, using only the test's own counters:
+/// 1. before capturing gate `g`, the producer waits (still serving re-attach
+///    requests) until the consumer has emitted `1..g` and is back in the ring;
+/// 2. the consumer, on emitting `g` from the ring, holds until the producer has
+///    captured more than a ring's worth past `g`.
+///
+/// Either the ring evicted `g` before the consumer drained it, or the
+/// consumer's cursor `g + 1` is evicted while it holds: one `NeedsCatchUp` per
+/// gate, whatever the schedule. Needs `commit_every == 1` and gates more than
+/// `slots + 2` apart and below `n − slots − 2`.
+fn run(
+    n: u64,
+    slots: usize,
+    commit_every: u64,
+    consumer_delay_every: u64,
+    gates: &[u64],
+) -> (Vec<u64>, u64) {
+    let gates: Arc<[u64]> = gates.into();
+    let past_gate = slots as u64 + 2;
+    // Test-side sequencing only: what the producer captured, and how much the
+    // consumer has emitted while attached to the ring.
+    let captured = Arc::new(AtomicU64::new(0));
+    let progress = Arc::new(AtomicU64::new(0));
+    let (c_gates, c_captured, c_progress) = (
+        Arc::clone(&gates),
+        Arc::clone(&captured),
+        Arc::clone(&progress),
+    );
     let (mut p, mut cs) = ring::ring(
         RingConfig {
             slots,
@@ -47,6 +85,18 @@ fn run(n: u64, slots: usize, commit_every: u64, consumer_delay_every: u64) -> (V
             let d = c.drain(usize::MAX, |l, payload| {
                 assert_eq!(payload, &pat(l.0, (l.0 % 9) as usize)[..], "byte-identical");
                 emitted.push(l.0);
+                c_progress.store(emitted.len() as u64, Ordering::Release);
+                if c_gates.contains(&l.0) {
+                    let deadline = Instant::now() + GATE_TIMEOUT;
+                    while c_captured.load(Ordering::Acquire) < l.0 + past_gate {
+                        assert!(
+                            Instant::now() < deadline,
+                            "gate {}: the producer never got {past_gate} records ahead",
+                            l.0
+                        );
+                        std::thread::yield_now();
+                    }
+                }
                 if consumer_delay_every > 0 && l.0 % consumer_delay_every == 0 {
                     std::thread::sleep(Duration::from_micros(50));
                 }
@@ -67,6 +117,7 @@ fn run(n: u64, slots: usize, commit_every: u64, consumer_delay_every: u64) -> (V
                         emitted.push(l);
                     }
                     assert_eq!(c.resume(), Some(Lsn(at)), "joins the ring at the cutover");
+                    c_progress.store(emitted.len() as u64, Ordering::Release);
                 }
                 ConsumerStatus::Detached => unreachable!(),
             }
@@ -96,7 +147,22 @@ fn run(n: u64, slots: usize, commit_every: u64, consumer_delay_every: u64) -> (V
         }
     };
     for l in 1..=n {
+        if gates.contains(&l) {
+            // The consumer must be in the ring at cursor `l` before `l` exists.
+            let deadline = Instant::now() + GATE_TIMEOUT;
+            while progress.load(Ordering::Acquire) < l - 1 {
+                serve(&mut p, &mut pending);
+                assert!(
+                    Instant::now() < deadline,
+                    "gate {l}: the consumer never caught up to {} (at {})",
+                    l - 1,
+                    progress.load(Ordering::Acquire)
+                );
+                std::thread::yield_now();
+            }
+        }
         p.capture(Lsn(l), &pat(l, (l % 9) as usize));
+        captured.store(l, Ordering::Release);
         if l % commit_every == 0 || l == n {
             p.release(Lsn(l));
         }
@@ -122,16 +188,17 @@ proptest! {
         commit_every in 1u64..8,
         delay in prop_oneof![Just(0u64), 1u64..40],
     ) {
-        let (emitted, _catch_ups) = run(n, slots, commit_every, delay);
+        let (emitted, _catch_ups) = run(n, slots, commit_every, delay, &[]);
         let want: Vec<u64> = (1..=n).collect();
         prop_assert_eq!(emitted, want);
     }
 }
 
-/// A slow consumer on a 2-slot ring is evicted many times over.
+/// A slow consumer on a 2-slot ring is evicted many times over — at least
+/// once per gate on any schedule (see [`run`]).
 #[test]
 fn tiny_ring_marks_needs_catch_up_repeatedly() {
-    let (emitted, catch_ups) = run(5000, 2, 1, 3);
+    let (emitted, catch_ups) = run(5000, 2, 1, 3, &[1000, 2500, 4000]);
     assert_eq!(emitted, (1..=5000).collect::<Vec<_>>());
     eprintln!("2-slot ring, slow consumer: {catch_ups} NeedsCatchUp events over 5000 records");
     assert!(
