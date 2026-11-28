@@ -134,15 +134,18 @@ the containing-segment prefix scan. Tracker: issue #47.
 - **Re-seed (RM4, §10) — the crate owns two things and no more.** It never produces, transports
   or installs a snapshot (no snapshot trait, stream type or frame).
   - **Replica: `Receiver::open_seeded` is stateless.** Keep the log iff `durable_lsn ≥ s`;
-    otherwise drop the WAL (and its `LOCK`) **first**, then rename the directory to
-    `<dir>.stale.<k>`, fsync the parent, create `dir`, fsync the parent, open with the seed. Both
-    opens carry the seed (that is what makes every crash state converge). **Never delete, never
+    otherwise drop the WAL (and its `LOCK`) **first**, refuse a symlinked `dir`, **open the
+    parent before the rename** (an unopenable parent must fail with nothing moved), rename the
+    directory to `<dir>.stale.<k>`, fsync the parent through that handle, and open with the seed
+    (the WAL creates `dir` and fsyncs its parent itself, WAL §8.4.1 — the crate creates no
+    directory). Both opens carry the seed (that is what makes every crash state converge). **Never delete, never
     overwrite a `.stale.<k>`, never open one, never set aside on an open error, no probe open**
     (the observer factory is called exactly once per WAL open). The crate never calls the
     observer.
   - **Primary: the re-seed loop guard is the hold** (`begin_reseed`, §10.2) plus the integrator
     bounding every checkpoint by `retention_floor()`. The hold is released only when a join with
-    `d ≥ s` is answered Serve, and the writer thread stores `acked[id] = d` **before** it clears
+    **`d == s`** is answered Serve (never `d ≥ s`: the replica's old incarnation can say HELLO
+    above `s` and would re-open the loop), and the writer thread stores `acked[id] = d` **before** it clears
     `needs_reseed` and the hold (no window in which neither protects `s + 1`).
   - **The hold and `needs_reseed` are writer-thread state only** (`Reseed` in `shipper.rs`,
     updated inside `Slot::answer`'s closure). The `acked[id]` store at Serve is the one shared
@@ -184,7 +187,7 @@ the containing-segment prefix scan. Tracker: issue #47.
   replica `id`, call `shipper.begin_reseed(&wal, id, s)` on the writer thread **before the next
   `checkpoint`** (it fails with `InvalidSnapshotLsn` if `s > durable_lsn` or `s + 1 <
   oldest_lsn`; an existing durable snapshot is a valid `s`). The hold releases itself when that
-  replica's `HELLO{d ≥ s}` is served; `end_reseed(id)` abandons it — bound how long a hold may pin
+  replica's `HELLO{d == s}` is served; `end_reseed(id)` abandons it — bound how long a hold may pin
   the log. Holds are not persisted: after a primary restart, re-register a re-seed still in
   flight. On promotion, discard every snapshot not yet installed and served and start over
   against the new primary (§10, §12.1).
@@ -198,8 +201,10 @@ the containing-segment prefix scan. Tracker: issue #47.
   4. On every later start pass the same `installed` value, read back from durable state (`None`
      if never re-seeded). `installed` is the re-seed LSN, never a restore point.
 - **The replica's `dir` MUST be dedicated to the WAL** (the set-aside renames the whole
-  directory): keep the `installed` record and snapshot files elsewhere. Not a mount point; its
-  parent must exist and be writable. The set-aside directory `<dir>.stale.<k>`
+  directory): keep the `installed` record and snapshot files elsewhere. Not a mount point, not a
+  symbolic link; its parent must be writable and readable. One process owns it (the directory
+  lock does not cover the set-aside window). If an error or crash follows the rename, no
+  `SeedReport` names the stale directory: list `<dir>.stale.*`. The set-aside directory `<dir>.stale.<k>`
   (`SeedReport.set_aside`) is never deleted by the crate — removing it is the operator's call. A
   former primary (§12.2) is not covered: wipe it by hand before the install.
 - **A consumer on a seeded replica (§7.1)** reads its starting watermark from
@@ -752,6 +757,54 @@ underspecified, flag it and propose a fix — do not silently diverge.
   `gate 1000: the consumer never caught up to 999 (at 997)`; dropping the eviction's flag store
   ⇒ **passes** (414 events: the consumer still detects the eviction from the slot itself), as it
   did before the edit — recorded, not claimed.
+- **RM4 review round 1 (2026-11-28, designer review of #63 at `4a05ead`: three required code
+  changes, one of them a hole in the spec's own rule; all landed on the same branch. The
+  mutation table above is the first push's; the rows below replace or add to it).**
+  1. **A symlinked `dir` is refused on the set-aside path** (it would have had the link renamed
+     and the new log created beside the link). `Io(InvalidInput)`, nothing changed. Test
+     `e11_a_symlinked_dir_is_never_set_aside`.
+  2. **The hold is released only by a Serve with `d == s`** (was `d ≥ s`: the old incarnation's
+     `HELLO{1000}` after `begin_reseed(500)` released it). Tests: `e6_hold_release` (a `d > s`
+     row; the `d == s` release shown by the floor following A's acks to 230 and then stopping at
+     B's hold, 250), `e6_the_old_incarnation_cannot_release_the_hold` (end to end with the
+     policy and a checkpoint), the unit test.
+  3. **The parent is opened before the rename** and fsynced through that handle. Test
+     `e12_an_unopenable_parent_fails_before_the_rename` (mode-0300 parent; loud skip under
+     root). **Executed here as uid 65534 via `setpriv`: passes; CI runs non-root.**
+  4. **The crate no longer creates directories**: a missing `dir`, and `dir` after the rename,
+     are created by `Wal::open` (WAL §8.4.1). E9's script and assertions are unchanged and pass
+     (the syscalls are still issued, now by the WAL). Its row "no parent fsync after the mkdir"
+     no longer has a mutation site in this crate (that fsync is the WAL's, guarded by #62's own
+     strace gate).
+  5. **Test strength:** E7's "replica started, not yet served" window is now held open (proxy
+     paused) and its assertion runs 3 times, counted; `join_once` / the handover use
+     `answer_request` (polls until the request is taken, so the `PENDING`-before-`net.pending`
+     order cannot make a single poll miss); E4 also covers a plain file, an **empty directory**
+     and a dangling symlink holding `.stale.<k>` names; E5 has a `Locked` row; E3 has state (j),
+     an empty seeded log from a lower `s′` (set aside once); a bare relative `dir` row runs in a
+     child process with its own cwd; `e13_…` pins the spellings that fail with nothing changed
+     (`dir/.`, `x/..`, a symlink with a trailing slash).
+  6. **Spec / kickoff edits made as the review asks:** §10.1 rule 2 (the WAL creates), the
+     set-aside steps, symlink / spellings / `SeedReport` / lock-window bullets, the crash table
+     row and its sentence, procedure step 3's argument order; §10.2 `d == s`, the removed "a
+     stale replica cannot clear one" sentence, the unarrived-hold note, the floor table.
+  - **Mutation rows after the review (the whole table re-run, 30 rows, all fail; unchanged rows
+    keep their messages above):**
+  | # | Mutation | Test | Failure observed |
+  |---|---|---|---|
+  | R1 | no symlink check | `e11_a_symlinked_dir_is_never_set_aside` | `symlinked dir: expected an error, got Ok (set_aside Some(".../wal.stale.0"))` |
+  | R2 | release at `d >= s` (the old rule) | `e6_hold_release` | `a served join with d > s keeps the hold` (left 210, right 200) |
+  | R2 | same | `e6_the_old_incarnation_cannot_release_the_hold` | `the old incarnation (d > s) must not release the hold` (left 1000, right 500) |
+  | R2 | same | `shipper::tests::e6_on_answer_release_rules` | `a Serve with d = 501 != s must keep the hold` |
+  | R3 | parent opened after the rename | `e12_…` (run as uid 65534) | `call 1: the directory was renamed although its parent cannot be fsynced` |
+  | E6 | never clear the hold *(message changed)* | `e6_hold_release` | `Serve with d == s releases A's hold` (left 200, right 230) |
+  | E9 | no parent fsync after the rename *(now `parent_handle.sync_all()`)* | `reseed-dirops.sh` | `FAIL (set_aside): no fsync of the parent directory between the rename and the mkdir` |
+  | E9 | rename before the WAL is dropped | `reseed-dirops.sh` | `FAIL (set_aside): the WAL's LOCK descriptor is still open at the rename (2 opened, 1 closed before it)` |
+  - Earlier findings 3 and 10 are thereby closed (the WAL creates every missing level; §10.1
+    no longer duplicates it), and finding 1 (the argument-order typo) is fixed in the spec.
+  - Gates: replica suite 123/123 ×3 (+2 shim-only, +2 strace targets); E1/E6/E7 25 of 25
+    unpinned and 15 of 15 under `taskset -c 0`; clippy normal and `--cfg loom`; fmt; MSRV 1.85;
+    loom 12/12; T8b; E9 script; root 202/0; root `src tests benches fuzz` diff empty.
 - **Current milestone:** RM4 — implemented, PR open, **awaiting designer review + owner merge**.
   RM5 is NOT started.
 - **RM2 loom gate:** confirmed by the designer at `b72a2fd`; the nine rows were re-run for RM3
