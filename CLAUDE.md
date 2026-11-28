@@ -116,7 +116,6 @@ The entire value of this component is **correct behavior under crashes and fault
 
 ## Project status (keep this updated)
 
-<<<<<<< HEAD
 - **LATEST (2026-11-28): #62 (parent-directory fsync, WAL spec §8.4.1) MERGED to `main` as `e729934` by the owner.** Follow-ups landed at `109f230`: the two limits are in the spec, and macOS passed on that head (CI 17/17). No version bump; it ships with 0.3.0.
 - **LATEST (2026-11-28, RM4): replica RM4 (re-seed) DISPATCHED.** The owner approved the §10 revision and decided snapshot transport is not part of the crate (application-specific). Contract: `docs/replica_design_v1.md` §10–§11 and `docs/kickoff_e_replica_rm4.md` on `claude/epic-hopper-2jb32q` (the agent copies both files). It opens a PR; the designer reviews against the diff and re-derives the mutation rows; the owner merges.
 - **LATEST (2026-11-28, WAL fix): #62 (parent-directory fsync on directory creation / cold start, kickoff F) reviewed at `bfcdacd` — approved, pending one macOS re-run and two spec lines.**
@@ -139,7 +138,6 @@ The entire value of this component is **correct behavior under crashes and fault
     - a snapshot in flight across a promotion must be discarded (§10, §12.1 step 5).
   - **WAL finding, not changed (owner's call):** `Wal::open` creates a missing directory with `create_dir_all` and never fsyncs its parent, so a brand-new WAL directory's own entry is not durable until something else syncs the parent. `open_seeded` covers it for seeded replicas only.
   - **Tests:** E1–E10 with mutation rows, incl. an `strace` check of the rename / mkdir / fsync order (E9).
-=======
 - **LATEST (2026-11-28, kickoff F): `open` now fsyncs the parent when it creates or cold-starts the WAL directory (D1) — on a PR branch (`claude/wal-parent-dir-fsync`), awaiting designer review and owner merge.**
   - **The gap:** `open` used `create_dir_all(dir)` and never fsynced the parent of anything it created, so `dir`'s own entry was not durable; by POSIX a power loss after the first `commit() → Ok` could remove the whole directory. Contract: `docs/kickoff_f_wal_parent_dir_fsync.md`; rule: spec §8.4.1 (new).
   - **`src/` changes (`src/wal.rs` only, plus a `#[cfg(test)] mod` line in `lib.rs`):**
@@ -169,7 +167,6 @@ The entire value of this component is **correct behavior under crashes and fault
     3. If a creating `open` fails at its parent fsync, the directory stays behind. A later `open` then sees it as pre-existing, so under an unopenable parent it succeeds by the tolerated-failure rule. This follows from the rule as written.
     4. The spec changelog entry is titled as a v7.2 durability fix; the spec version was not renumbered.
   - Gates run here: `cargo test` (202) and `--features fuzzing` (205), clippy `-D warnings` (both), fmt, MSRV 1.85 check, `bench --no-run`, `cargo test -p open-wal-replica` (98), fuzz smoke ×4 at the CI run counts (no crash), both strace scripts, `shellcheck`, `actionlint`.
->>>>>>> origin/main
 - **LATEST (2026-11-28): #59 (replica RM3) MERGED to `main` as `c1a12bf` (squash), on the owner's instruction. Two owner decisions written into the replica spec (designer branch; not yet on `main`):**
   - **Archive replicas are a supported use** (new §11.1): a replica that never checkpoints keeps the log while the primary checkpoints, provided the integrator bounds every checkpoint by that replica's acked LSN. A re-seed leaves a hole. Scenario test + negative control added to §15.3, assigned to RM5.
   - **Multi-process harness** (new §15.8): test-only `repl_primary` / `repl_replica` binaries, a seeded driver, a loopback fault proxy, ack ledgers and one end-of-run validator; a bounce matrix (target × fault × phase) with three negative controls. It is an RM7 deliverable, and the RM8 soak is the same harness run for hours (primary + 2 replicas + 1 archive).
