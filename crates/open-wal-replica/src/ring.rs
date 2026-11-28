@@ -200,13 +200,14 @@ pub fn ring(cfg: RingConfig, next: Lsn, released: Lsn) -> (Producer, Vec<Consume
 pub enum AttachError {
     /// The consumer is still attached (it must detach first).
     AlreadyAttached,
-    /// `from` is past `released + 1`: the replica claims records the primary
-    /// has not durably committed (§9 step 2 — a former primary, or a bug).
+    /// `from` is past `released + 1`: nothing at `from` is shippable yet. The
+    /// shipper makes that replica **wait** until `released ≥ from − 1`; it is
+    /// never a rejection (§9: step 2 alone rejects, on `wal.durable_lsn()`).
     Ahead {
         /// The current released watermark.
         released: Lsn,
     },
-    /// `from` is older than the ring retains; serve it from the log (§9, RM3).
+    /// `from` is older than the ring retains; serve it from the log (§9.1).
     Behind {
         /// The oldest LSN the ring can still serve contiguously.
         oldest: Lsn,
@@ -252,7 +253,11 @@ impl Producer {
     ///   is marked `NeedsCatchUp` (the log stays the source of truth).
     pub fn capture(&mut self, lsn: Lsn, payload: &[u8]) {
         let lsn = lsn.0;
-        if lsn != self.next && !self.discontinuity(lsn) {
+        // `lsn > MAX_LSN` is checked here too (§9.2, defence in depth for
+        // direct ring users): a producer-local compare, no atomic. Without it
+        // `capture(next)` with `next` past the tag domain would write a record
+        // whose tag is the tombstone (or overflows the state word).
+        if (lsn != self.next || lsn > MAX_LSN) && !self.discontinuity(lsn) {
             return;
         }
         let i = (lsn % self.n) as usize;
@@ -876,8 +881,88 @@ mod tests {
         }));
         assert!(r.is_err() == cfg!(debug_assertions));
         assert!(p.needs_catch_up(0));
+        // The consumer is `NeedsCatchUp` now, so its drain emits nothing either
+        // way: inspect the slot itself. Record 1 is still there, untouched.
+        let b = p.slot_buf[1];
+        assert_eq!(p.slot_tag[1], 1);
+        assert_eq!(p.shared.bufs[b].state.load(Ordering::Relaxed), pack(1, 0));
+        p.shared.bufs[b].data.with(|d| {
+            let d = unsafe { &*d };
+            assert_eq!(
+                (d.lsn, &d.payload[..]),
+                (1, &pat(1)[..]),
+                "a released record was overwritten"
+            );
+        });
+        assert_eq!(p.next_lsn(), Lsn(2), "the bad capture must not move `next`");
         let (out, _) = drain_all(&mut cs[0]);
         assert!(out.iter().all(|(_, b)| b != b"evil"));
+    }
+
+    /// T12 (§9.2): `capture(next)` with `next == MAX_LSN + 1` (= 2^56 − 1, the
+    /// tombstone tag) takes the cold path: nothing is written, nothing is
+    /// emitted. Only the fast-path bound check sends it there — `lsn == next`.
+    #[test]
+    fn capture_at_the_tombstone_lsn_writes_nothing() {
+        assert_eq!(MAX_LSN + 1, (1 << 56) - 1);
+        let (mut p, mut cs) = ring(cfg(4, 1), Lsn(MAX_LSN), Lsn(MAX_LSN - 1));
+        p.attach(0, Lsn(MAX_LSN)).unwrap();
+        cs[0].resume();
+        p.capture(Lsn(MAX_LSN), b"last");
+        let over = MAX_LSN + 1;
+        let i = (over % 4) as usize;
+        let before = (p.slot_tag.clone(), p.slot_buf.clone());
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            p.capture(Lsn(over), b"over");
+        }));
+        assert!(r.is_err() == cfg!(debug_assertions));
+        assert_eq!(
+            p.next_lsn(),
+            Lsn(over),
+            "`next` must not move past the domain"
+        );
+        assert_eq!((p.slot_tag.clone(), p.slot_buf.clone()), before);
+        p.shared.bufs[p.slot_buf[i]]
+            .data
+            .with(|d| assert_ne!(unsafe { &*d }.payload, b"over", "nothing may be written"));
+        // Release everything a commit could return; only MAX_LSN is emitted.
+        // (The consumer was marked NeedsCatchUp by the bad capture, so re-attach.)
+        p.release(Lsn(u64::MAX));
+        assert_eq!(p.released(), Lsn(MAX_LSN));
+        cs[0].detach();
+        p.attach(0, Lsn(MAX_LSN)).unwrap();
+        cs[0].resume();
+        assert_eq!(drain_all(&mut cs[0]).0, vec![(MAX_LSN, b"last".to_vec())]);
+    }
+
+    /// T12 (§9.2): the same at `2^56`, whose tag would overflow the state word.
+    #[test]
+    fn capture_past_the_tag_width_writes_nothing() {
+        let over = 1u64 << 56;
+        let (mut p, mut cs) = ring(cfg(4, 1), Lsn(MAX_LSN), Lsn(MAX_LSN - 1));
+        p.attach(0, Lsn(MAX_LSN)).unwrap();
+        cs[0].resume();
+        p.capture(Lsn(MAX_LSN), b"last");
+        // Force `next` to 2^56 so that `lsn == next` (the fast path's only
+        // other test) cannot be what stops it.
+        p.next = over;
+        let before = (p.slot_tag.clone(), p.slot_buf.clone());
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            p.capture(Lsn(over), b"over");
+        }));
+        assert!(r.is_err() == cfg!(debug_assertions));
+        assert_eq!(p.next_lsn(), Lsn(over));
+        assert_eq!((p.slot_tag.clone(), p.slot_buf.clone()), before);
+        for b in p.shared.bufs.iter() {
+            b.data
+                .with(|d| assert_ne!(unsafe { &*d }.payload, b"over", "nothing may be written"));
+        }
+        p.next = MAX_LSN + 1;
+        p.release(Lsn(u64::MAX));
+        cs[0].detach();
+        p.attach(0, Lsn(MAX_LSN)).unwrap();
+        cs[0].resume();
+        assert_eq!(drain_all(&mut cs[0]).0, vec![(MAX_LSN, b"last".to_vec())]);
     }
 
     #[test]

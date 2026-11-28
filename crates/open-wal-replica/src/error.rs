@@ -64,6 +64,22 @@ pub enum ReplError {
         last: Lsn,
     },
 
+    /// Catch-up could not read a record the primary durably committed (§9.1):
+    /// the reader ended, failed, or yielded another LSN where `lsn` (which is
+    /// `≤` the released watermark) was expected. The record actually damaged
+    /// may be earlier in the same segment. Returned by `Shipper::poll` for a
+    /// pass that answered a chunk request this way. A data-level failure
+    /// disables catch-up reads until the `Shipper` is recreated.
+    PrimaryLogUnreadable {
+        /// The LSN catch-up expected and did not get.
+        lsn: Lsn,
+    },
+
+    /// The primary's log left the shipper ring's LSN domain
+    /// (`ring::MAX_LSN`, §9.2). The shipper is terminal: every session ends
+    /// with `ERR(Protocol)` and nothing more is served.
+    LsnDomainExhausted,
+
     /// The peer sent an `ERR` frame and is closing the connection.
     Remote {
         /// The peer's error class.
@@ -96,6 +112,18 @@ impl fmt::Display for ReplError {
             ReplError::SnapshotFailed => write!(f, "snapshot produce/apply failed"),
             ReplError::LsnExhausted { last } => {
                 write!(f, "LSN space exhausted after lsn {last}")
+            }
+            ReplError::PrimaryLogUnreadable { lsn } => {
+                write!(
+                    f,
+                    "primary log unreadable: committed lsn {lsn} could not be read"
+                )
+            }
+            ReplError::LsnDomainExhausted => {
+                write!(
+                    f,
+                    "LSN domain exhausted: the log passed the shipper ring's maximum LSN"
+                )
             }
             ReplError::Remote { code, msg } => write!(f, "peer sent ERR({code:?}): {msg}"),
         }
