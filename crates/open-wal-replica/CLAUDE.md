@@ -1,8 +1,9 @@
 # CLAUDE.md — `open-wal-replica` (crates/open-wal-replica)
 
 Operating guide for this crate. Read fully before writing code. The build contract is
-`docs/replica_design_v1.md` (re-read **§4.1–4.2, §5, §8, §9 (incl. §9.1–§9.3), §12.2, §15.5,
-§15.7** before touching the shipper, receiver, catch-up, or promotion). The WAL's own `CLAUDE.md` at the repo
+`docs/replica_design_v1.md` (re-read **§4.1–4.2, §5, §8, §9 (incl. §9.1–§9.3), §10 (incl.
+§10.1–§10.2), §11, §12.2, §15.5, §15.7** before touching the shipper, receiver, catch-up, re-seed,
+or promotion). The WAL's own `CLAUDE.md` at the repo
 root still applies to anything that touches `open-wal`; this file is the replica-specific
 summary of what must never be violated.
 
@@ -129,9 +130,24 @@ the containing-segment prefix scan. Tracker: issue #47.
 - **Catch-up cutover has no gap and no duplicate** — `resume()` must return the answered cursor,
   and every record passes the sending-side check (§9.2).
 - **No checkpoint observer, no writer-side gating, no WAL changes** beyond v7's three. Checkpoint
-  coordination is the integrator's `checkpoint(up_to)` consulting `min_replica_acked_lsn()` (§11).
-- **Re-seed loop guard:** the primary MUST NOT checkpoint past an in-flight re-seed's snapshot
-  LSN (§10 step 5, §11).
+  coordination is the integrator's `checkpoint(up_to)` consulting `retention_floor()` (§11).
+- **Re-seed (RM4, §10) — the crate owns two things and no more.** It never produces, transports
+  or installs a snapshot (no snapshot trait, stream type or frame).
+  - **Replica: `Receiver::open_seeded` is stateless.** Keep the log iff `durable_lsn ≥ s`;
+    otherwise drop the WAL (and its `LOCK`) **first**, then rename the directory to
+    `<dir>.stale.<k>`, fsync the parent, create `dir`, fsync the parent, open with the seed. Both
+    opens carry the seed (that is what makes every crash state converge). **Never delete, never
+    overwrite a `.stale.<k>`, never open one, never set aside on an open error, no probe open**
+    (the observer factory is called exactly once per WAL open). The crate never calls the
+    observer.
+  - **Primary: the re-seed loop guard is the hold** (`begin_reseed`, §10.2) plus the integrator
+    bounding every checkpoint by `retention_floor()`. The hold is released only when a join with
+    `d ≥ s` is answered Serve, and the writer thread stores `acked[id] = d` **before** it clears
+    `needs_reseed` and the hold (no window in which neither protects `s + 1`).
+  - **The hold and `needs_reseed` are writer-thread state only** (`Reseed` in `shipper.rs`,
+    updated inside `Slot::answer`'s closure). The `acked[id]` store at Serve is the one shared
+    write. Not persisted (R7).
+  - `checked_next()` for `s + 1`, as everywhere.
 - **Wire decoder is attacker-facing:** bounded frame lengths, no OOB, no unbounded alloc — fuzz it (RM8).
 
 ---
@@ -158,8 +174,37 @@ the containing-segment prefix scan. Tracker: issue #47.
 - **`poll` returning `Err(PrimaryLogUnreadable{lsn})`** means a committed record could not be read
   (a WAL D5-class emergency for data-level failures); catch-up reads stay disabled until the
   `Shipper` is recreated. **`Err(LsnDomainExhausted)`** means the shipper is terminal.
-- **Checkpoint policy (§11)** is unchanged: `min_replica_acked_lsn()` protects the catch-up range;
-  checkpointing past it gets the replica `RESEED_REQUIRED` (loud, R6).
+- **Checkpoint policy (§11):** `up_to = min(latest durable snapshot LSN, retention_floor() −
+  margin)`. `retention_floor()` is the minimum over replicas of: its re-seed hold if it has one;
+  nothing if it needs a re-seed and has no hold; otherwise its acked LSN (0 until its first HELLO
+  since this `Shipper` started). `None` = no replica constrains. Checkpointing past it gets some
+  replica `RESEED_REQUIRED` (loud, R6). `min_replica_acked_lsn()` is unchanged and knows nothing
+  about re-seeds.
+- **Re-seed, primary side (§10.2) — call order (MUST):** once a snapshot LSN `s` is chosen for
+  replica `id`, call `shipper.begin_reseed(&wal, id, s)` on the writer thread **before the next
+  `checkpoint`** (it fails with `InvalidSnapshotLsn` if `s > durable_lsn` or `s + 1 <
+  oldest_lsn`; an existing durable snapshot is a valid `s`). The hold releases itself when that
+  replica's `HELLO{d ≥ s}` is served; `end_reseed(id)` abandons it — bound how long a hold may pin
+  the log. Holds are not persisted: after a primary restart, re-register a re-seed still in
+  flight. On promotion, discard every snapshot not yet installed and served and start over
+  against the new primary (§10, §12.1).
+- **Re-seed, replica side (§10.1) — in this order:**
+  1. `Receiver::run` returns `Err(ReseedRequired{oldest})` (or the replica is new). Drop the
+     receiver.
+  2. Obtain a snapshot with LSN `s` and install it into application state **durably, including
+     `s` itself**. Only then:
+  3. `Receiver::open_seeded(dir, cfg, Some(s), observer_factory)`, then `run`. The next `HELLO`
+     carries `d = s`; the primary serves from `s + 1`.
+  4. On every later start pass the same `installed` value, read back from durable state (`None`
+     if never re-seeded). `installed` is the re-seed LSN, never a restore point.
+- **The replica's `dir` MUST be dedicated to the WAL** (the set-aside renames the whole
+  directory): keep the `installed` record and snapshot files elsewhere. Not a mount point; its
+  parent must exist and be writable. The set-aside directory `<dir>.stale.<k>`
+  (`SeedReport.set_aside`) is never deleted by the crate — removing it is the operator's call. A
+  former primary (§12.2) is not covered: wipe it by hand before the install.
+- **A consumer on a seeded replica (§7.1)** reads its starting watermark from
+  `Receiver::durable_lsn()` after the open (`s` after a seeded cold start): the observer is not
+  called at open.
 
 ---
 
@@ -180,7 +225,7 @@ Depend on the WAL via `open-wal = { path = "../..", version = "0.2" }`.
 | **RM1** | `Receiver`: own WAL, R3 hard check, group commit, R4 ack | §15.1, §15.2 P1–P2 |
 | **RM2** | `Shipper`: ring capture/release, per-replica net threads, overflow ⇒ `NeedsCatchUp`, R1 as Release/Acquire watermark | §15.2 P3–P4, §15.3 overflow, **§15.7 loom L1–L6 + all 7 mutations — GATE** |
 | **RM3** | catch-up / resume (§9, §9.1–§9.3) *(WAL v7 + v7.2)*: request slot, join decision in `poll(&wal)`, chunked catch-up under the `released` ceiling, cutover, in-session overflow fall-back, LSN domain | §15.3, §15.2 P5, kickoff C T1–T18 + U1, **§15.7 L7/L7b/L8/L8b + all mutation rows** |
-| **RM4** | re-seed traits + `options().seed(..)` cold start + reseed checkpoint guard | §15.3 |
+| **RM4** | re-seed (§10): `Receiver::open_seeded` (stale-log set-aside + `options().seed(..)` cold start) and the primary's re-seed hold (`begin_reseed` / `end_reseed` / `replica_needs_reseed` / `retention_floor`) | §15.3 re-seed, kickoff E E1–E10 + all mutation rows |
 | **RM5** | checkpoint policy helper, promotion runbook, former-primary rejection | §15.3 |
 | **RM6** | model/oracle harness | §15.4 |
 | **RM7** | fault injection: LazyFS replica-never-ahead headline + negative control, split-batch, SIGKILL matrices, wire corruption, partition | §15.5 |
@@ -212,6 +257,10 @@ durability half of R1 is proven by the RM7 LazyFS headline (§15.7.6) — never 
   `/proc/thread-self/io` and print a loud skip without it. **The replica's test builds compile
   `open-wal` with its `fuzzing` feature** (dev-dependency; `fuzzing::reader_pos` for T18(b) and
   loom L8b) — the non-test build of `open-wal`, and so the shipped library, stays without it.
+- **RM4 extra:** `scripts/replica/reseed-dirops.sh` runs E9: it straces the two `#[ignore]`d
+  `e9_target_*` tests of `tests/reseed.rs` and checks the order of `open_seeded`'s directory
+  syscalls (needs `strace` + `python3`; exits 77 — not a pass — without strace). CI: the
+  `replica — §10.1 directory ops (strace, E9)` job in `ci.yml`, per-PR, blocking.
 - Fault injection (RM7) needs the same LazyFS/FUSE Linux environment as the WAL's §14.4. If
   unavailable, say so and leave the gate open — never fake or skip it.
 
@@ -576,8 +625,108 @@ underspecified, flag it and propose a fix — do not silently diverge.
   - Gates after the follow-up: replica suite 98/98 in three runs of three (+2 shim-only),
     clippy normal and `--cfg loom`, fmt, MSRV 1.85, loom 12/12, T8b 2/2, root 191/0, root `src/`
     diff empty.
-- **Current milestone:** RM3 — implemented, PR open, **awaiting designer re-review + owner merge**.
-  RM4 (re-seed) is NOT started.
+- **RM4 — LANDED on a PR branch (2026-11-28; kickoff `docs/kickoff_e_replica_rm4.md`, contract
+  `docs/replica_design_v1.md` §10–§10.2). Awaiting designer review + owner merge.**
+  `open-wal`'s `src/`, `ring.rs`, `slot.rs` and the wire protocol are untouched; no existing test
+  was edited (`tests/common` gained helpers only; `src/shipper.rs`'s test module gained one test).
+  - **`src/receiver.rs`** — `Receiver::open_seeded(dir, cfg, installed, observer: impl FnMut() ->
+    O) -> Result<(Receiver<O>, SeedReport)>` and `SeedReport { set_aside }`. `None` ⇒ exactly
+    `open_with(dir, cfg, observer())`. `Some(s)`: seed `s.checked_next()`; a missing `dir` is
+    created (one level) and its parent fsynced; open with the seed; keep iff `durable_lsn ≥ s`;
+    else drop the WAL, `rename(dir, <dir>.stale.<k>)` (smallest unused `k`), fsync the parent,
+    create `dir`, fsync the parent, open with the seed again. An open error is returned unchanged.
+    Module doc no longer says the seeded open "is RM4".
+  - **`src/shipper.rs`** — `begin_reseed`, `end_reseed`, `replica_needs_reseed`,
+    `retention_floor`. State is `Reseed { holds, needs_reseed }` on `Shipper` (writer thread),
+    updated by `Reseed::on_answer` inside `Slot::answer`'s closure, right after `Writer::decide`
+    returns and before the slot goes `DONE`: Reseed answer ⇒ `needs_reseed = true`; Serve answer ⇒
+    `acked[id] = d`, then `needs_reseed = false`, then the hold if `d ≥ s`.
+  - **`src/error.rs`** — `InvalidSnapshotLsn{s, oldest, durable}`, `UnknownReplica{id}`;
+    `SnapshotFailed` removed.
+  - **Tests (all green; replica suite 116 = 40 unit + 29 catch-up + 17 receiver + 17 re-seed + 2
+    overflow + 11 shipper; + 2 shim-only + 2 strace targets):** `tests/reseed.rs` E1 (+ variants
+    A, B), E2, E3 (11 on-disk states × 2 calls), E4, E5, E6 (validation table, floor table, R7,
+    release, handover), E7 (+ negative control), E8, E9 targets, E10;
+    `shipper::tests::e6_on_answer_release_rules`; `scripts/replica/reseed-dirops.sh` (E9,
+    **executed**: set-aside run 13 relevant syscalls / 2 parent fsyncs, missing-directory run 5 /
+    1). New shared helpers in `tests/common`: `SeededServer` (a real `Receiver` opened with
+    `open_seeded`, running `Receiver::run`, on a shared listener so a re-seeded receiver comes up
+    on the same address; it seeds the shared `DurableTap` with the opened WAL's `durable_lsn()`),
+    `stale_dirs`, `stale_path`.
+  - **Mutation table (each applied in a separate worktree, the named test run and shown failing,
+    reverted; the worktree was checked clean after every row):**
+  | # | Mutation (applied, run, reverted) | Test | Failure observed |
+  |---|---|---|---|
+  | E1 | seed = `s` | `e1_reseed_end_to_end` | `the new log starts at s + 1` (left 240, right 241) |
+  | E1 | seed = `s + 2` | `e1_reseed_end_to_end` | `the new log starts at s + 1` (left 242, right 241) |
+  | E1 | keep the stale log (no set-aside) | `e1_reseed_end_to_end` | `the re-seeded replica never converged: its run ended with Err(ReseedRequired { oldest: Lsn(232) })` |
+  | E1 | delete instead of rename | `e1_reseed_end_to_end` | set-aside assertion: `left: []`, `right: [".../replica.stale.0"]` |
+  | E2 | keep iff `durable > s` (`≤` instead of `<`) | `e2_keep_set_aside_boundary_table` | `d == s: the log's records must survive` (left `[]`) |
+  | E2 | compare against `s + 1` | `e2_keep_set_aside_boundary_table` | `d == s: the log's records must survive` |
+  | E2 | set aside on `None` | `e2_keep_set_aside_boundary_table` | `None: the log's records must survive` |
+  | E2 | a probe open with a throwaway observer | `e2_keep_set_aside_boundary_table` | `d < s: two opens, two observers` (left 3, right 2) |
+  | E3 | the first open is seed-less | `e3_every_crash_state_converges` | `(b) dir absent, .stale.0 present, call 1: .stale.* directories` (left 2, right 1) |
+  | E3 | the re-open after the set-aside is seed-less | `e3_every_crash_state_converges` | `(a) old log intact, call 1: durable_lsn 0 < s` |
+  | E4 | always `.stale.0` | `e4_set_aside_never_clobbers` | `open_seeded: Io(Os { code: 39, kind: DirectoryNotEmpty, .. })` |
+  | E5 | set aside on open error | `e5_an_unrecoverable_log_is_never_set_aside` | `an unrecoverable log was opened (or replaced)` |
+  | E6 | drop the `durable` check | `e6_begin_reseed_validation_table` | `s = 301: expected InvalidSnapshotLsn, got Ok(())` |
+  | E6 | drop the `oldest` check | `e6_begin_reseed_validation_table` | `s = 99: expected InvalidSnapshotLsn, got Ok(())` |
+  | E6 | clear the hold on any join | `e6_hold_release` | `a served join with d < s keeps the hold` (left 150, right 200) |
+  | E6 | clear the hold on session end (in `poll`: a served replica whose status is `Connecting`) | `e6_hold_release` | `a session end keeps the hold` (left 150, right 200) |
+  | E6 | never clear the hold | `e6_hold_release` | `Serve with d >= s releases A's hold (and only A's)` (left 200, right 210) |
+  | E6 | no writer-side `acked` store | `e6_handover_has_no_unprotected_window` | `the writer must store acked = d when it answers Serve` (left 1000, right 500) — **20 of 20 runs here; by construction this row races with the network thread's own store** |
+  | E6 | same | `shipper::tests::e6_on_answer_release_rules` | `the writer stores acked = d on Serve` (left 1000, right 500) — deterministic |
+  | E6 | `needs_reseed` never cleared | `e6_retention_floor_table` | `a served replica counts again, at its HELLO value` (left `None`, right `Some(300)`) |
+  | E6 | a needs-reseed replica is not excluded | `e6_retention_floor_table` | `a replica that needs a re-seed and has no hold is excluded` (left `Some(0)`, right `Some(295)`) |
+  | E6 | *(extra)* release at `d > s` instead of `d ≥ s` | `e6_hold_release` | `d == s released the hold` (left 220, right 230) |
+  | E7 | *(extra)* `retention_floor` ignores holds | `e7_the_hold_prevents_the_reseed_loop` | `the hold must keep s + 1 = 241 (oldest is 265)` |
+  | E9 | no parent fsync after the rename | `reseed-dirops.sh` | `FAIL (set_aside): no fsync of the parent directory between the rename and the mkdir` |
+  | E9 | no parent fsync after the mkdir | `reseed-dirops.sh` | `FAIL (set_aside)` and `FAIL (missing_dir)`: `no fsync of the parent directory between the mkdir and the first segment file` |
+  | E9 | rename before the WAL is dropped | `reseed-dirops.sh` | `FAIL (set_aside): the WAL's LOCK descriptor is still open at the rename (2 opened, 1 closed before it)` |
+  | E10 | `open_seeded` calls `on_durable(s)` itself | `e10_observer_on_a_seeded_replica` | `no observer call at open` (left `[40]`, right `[]`) |
+  E7's own row is its negative control (same code, a policy that ignores holds): the session with
+  `HELLO.d == s` is answered `RESEED_REQUIRED`, after `oldest_lsn > s + 1` was asserted. E8 has no
+  mutation row (kickoff).
+  - **Findings flagged to the designer (implemented as described; none weakens R1–R9):**
+    1. **Spec typo:** §10.1 "Integrator procedure" step 3 writes `open_seeded(dir, cfg, observer,
+       Some(s))`; the signature (and the kickoff) is `(dir, cfg, installed, observer)`. Built to
+       the signature.
+    2. **The re-seed state is not inside `Writer::join`.** The RM3 in-source tests build a
+       `Writer` literal and call `decide` directly, so a new `Writer` field or `decide` parameter
+       would edit existing tests. It lives in `Reseed` on `Shipper` and is updated inside the same
+       `Slot::answer` closure, after `decide` returns and before `DONE` — the same thread, the
+       same point in the handshake, before `poll` returns.
+    3. **A missing `dir` is created one level deep** (`create_dir`, then one parent fsync): a
+       missing *parent* is `ReplError::Io`, unlike `open` / `open_with`, whose `create_dir_all`
+       builds the whole path. A multi-level create would leave ancestors' entries un-fsynced.
+    4. **The handover row cannot be made deterministic from outside** (its mutation "reads 1000
+       or races", as the kickoff says): 20 of 20 runs failed here. Added the writer-level unit
+       test above as the deterministic falsifier.
+    5. **"Clear on session end" has no natural mutation site** — the writer never learns that a
+       session ended. The row's mutation is synthesized in `poll` (status `Connecting` and
+       `acked ≠ 0`).
+    6. **"Exactly one session after the re-seed" is asserted as "exactly one *answered* session
+       with `HELLO.d ≥ s`".** While the receiver is down between `run` returning and
+       `open_seeded`, the shipper's reconnect sits in the shared listener's backlog; if it timed
+       out there (`io_timeout`), the proxy would log a session in which the primary said nothing.
+       Such a session is ignored; any answered one counts.
+    7. **`SeededServer` seeds the tap with the opened WAL's `durable_lsn()`** (equal to `s` after
+       a seeded cold start) rather than the literal `s`, so the same helper serves the unseeded
+       phase of a test.
+    8. **`SeedReport.set_aside` is `None` when a call finishes an interrupted set-aside** (crash
+       state "`dir` absent, `.stale.0` present"): that call moved nothing. The stale directory is
+       then only discoverable by name.
+    9. **A hold's term is `s` even while that replica is being served from `d < s`** (the spec's
+       table). The floor is then above that replica's cursor, so the policy may checkpoint under
+       it and it gets a BelowOldest FIN and `RESEED_REQUIRED` — which is the re-seed already in
+       flight. Stated, not changed.
+    10. **Pre-existing, not touched:** `cargo doc` with `-D warnings` fails on a private
+        intra-doc link in `ring.rs:30` (ring guardrail).
+  - Gates: replica suite 116/116 ×3 (+2 shim-only, +2 strace targets), clippy normal and
+    `--cfg loom`, fmt, MSRV 1.85, loom 12/12, T8b 2/2, E9 script, root 191/0, root
+    `src tests benches fuzz` diff empty.
+- **Current milestone:** RM4 — implemented, PR open, **awaiting designer review + owner merge**.
+  RM5 is NOT started.
 - **RM2 loom gate:** confirmed by the designer at `b72a2fd`; the nine rows were re-run for RM3
   after the `ring.rs` fast-path change (table above).
 - **WAL dependency:** v7 (#52), v7.1 (#54), v7.2 (#56) all on `main`.
