@@ -212,9 +212,10 @@ impl<O: DurabilityObserver> Receiver<O> {
             .ok_or(ReplError::LsnExhausted { last: s })?;
         let parent = parent_of(dir)?;
         if !exists(dir)? {
-            // The WAL's own `create_dir_all` does not fsync the parent: the new
-            // log's directory entry would not be durable while the replica
-            // already acks records in it.
+            // §10.1: the new log's directory entry must be durable before the
+            // replica acks records in it. (Since WAL §8.4.1 `Wal::open` does
+            // the same for a directory it creates itself; doing it here keeps
+            // the §10.1 order independent of that.)
             create_dir_durably(dir, parent)?;
         }
         let (wal, _report) = Wal::options()
