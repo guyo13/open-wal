@@ -115,6 +115,20 @@ The entire value of this component is **correct behavior under crashes and fault
 
 ## Project status (keep this updated)
 
+- **LATEST (2026-11-28, RM4 prep): #61 MERGED (`e659fbb`); spec §10 rewritten and kickoff E drafted. DRAFT, not dispatched: it waits on the owner's yes to the §10 revision.**
+  - **§10 revision:** the snapshot traits are removed (the crate never transports a snapshot, so nothing called them). The crate owns two things only:
+    - replica: `Receiver::open_seeded(dir, cfg, installed, observer_factory)`. Stateless rule: keep the log iff `durable_lsn ≥ s`, else set the directory aside (rename, never delete) and cold-start at `s + 1`. The same call converges from every crash state of a re-seed.
+    - primary: the re-seed hold (`begin_reseed` validates `s ≤ durable` and `s + 1 ≥ oldest`), `needs_reseed`, and `retention_floor()`, which §11's checkpoint formula now uses.
+  - **Critique pass 1** (independent, with experiments on the real WAL): the keep / set-aside rule held in every reachable crash state. 2 blockers and 5 majors, all fixed:
+    - the observer is consumed by the first open ⇒ an observer factory;
+    - the WAL never calls the observer at open, so the proxy oracle would report false R4 violations on a seeded replica ⇒ tests seed the tap;
+    - a window where neither the hold nor `acked` protected `s + 1` ⇒ the writer stores `acked` before clearing the hold;
+    - E7 failed on a correct build and its control was vacuous ⇒ `retention_floor()` with a precise exclusion rule;
+    - a new replica once opened without a seed holds an empty base-1 log, which is set aside;
+    - `dir` was created without a parent fsync;
+    - a snapshot in flight across a promotion must be discarded (§10, §12.1 step 5).
+  - **WAL finding, not changed (owner's call):** `Wal::open` creates a missing directory with `create_dir_all` and never fsyncs its parent, so a brand-new WAL directory's own entry is not durable until something else syncs the parent. `open_seeded` covers it for seeded replicas only.
+  - **Tests:** E1–E10 with mutation rows, incl. an `strace` check of the rename / mkdir / fsync order (E9).
 - **LATEST (2026-11-28): #59 (replica RM3) MERGED to `main` as `c1a12bf` (squash), on the owner's instruction. Two owner decisions written into the replica spec (designer branch; not yet on `main`):**
   - **Archive replicas are a supported use** (new §11.1): a replica that never checkpoints keeps the log while the primary checkpoints, provided the integrator bounds every checkpoint by that replica's acked LSN. A re-seed leaves a hole. Scenario test + negative control added to §15.3, assigned to RM5.
   - **Multi-process harness** (new §15.8): test-only `repl_primary` / `repl_replica` binaries, a seeded driver, a loopback fault proxy, ack ledgers and one end-of-run validator; a bounce matrix (target × fault × phase) with three negative controls. It is an RM7 deliverable, and the RM8 soak is the same harness run for hours (primary + 2 replicas + 1 archive).

@@ -62,8 +62,9 @@ injection is not trustworthy. Normative keywords MUST / MUST NOT / SHOULD / MAY 
 - **Not synchronous replication.** The ack-barrier *surface* is designed (§13) so an
   integrator can gate on replica durability later, but v1 does not gate.
 - **Not sharding / multi-primary.** One primary, N replicas.
-- **Not a snapshot system.** Re-seeding a replica needs an application snapshot; the crate
-  defines the trait, the application implements it (§10).
+- **Not a snapshot system.** Re-seeding a replica needs an application snapshot, which the
+  application produces, moves and installs; the crate only swaps the replica's log and holds
+  the primary's retention (§10).
 - **Not cross-process tailing.** The shipper runs in the primary's process (§15.7 of the WAL
   spec, and forced by `Wal` being `!Sync` — see §4.1).
 
@@ -742,7 +743,13 @@ A replica that is fresh on a primary whose `oldest_lsn > 1`, or that was answere
 **Snapshot LSN `s`** means: the snapshot reflects exactly the records `≤ s`.
 - **`s ≤ primary.durable_lsn` (MUST, the R1 rule for snapshots).** A snapshot that reflects a
   record the primary has not durably committed can outlive that record. `begin_reseed`
-  (§10.2) checks it; the integrator MUST call `begin_reseed` *before* producing the snapshot.
+  (§10.2) checks it against the primary it is called on.
+- **A snapshot is bound to the primary that validated it.** On promotion (§12.1) every
+  in-flight re-seed snapshot MUST be discarded and the re-seed restarted against the new
+  primary: the snapshot may reflect records from the old primary's lost tail, and §9 step 2
+  rejects `HELLO{s}` only until the new primary's `durable_lsn` passes `s`. After that the
+  replica would be served on top of divergent application state, silently (the §12.2 hazard
+  in another form; the operator procedure is the only guard).
 - **`s + 1 ≥ primary.oldest_lsn`** when the replica says HELLO, or the answer is
   `RESEED_REQUIRED` again. The hold (§10.2) is what keeps this true.
 
@@ -753,18 +760,31 @@ impl<O: DurabilityObserver> Receiver<O> {
     /// `installed`: the LSN of the most recent re-seed snapshot the application has
     /// DURABLY installed, read from the application's own durable state; `None` if it
     /// has never been re-seeded.
-    pub fn open_seeded(dir: &Path, cfg: ReceiverConfig, observer: O, installed: Option<Lsn>)
+    pub fn open_seeded(dir: &Path, cfg: ReceiverConfig, installed: Option<Lsn>,
+                       observer: impl FnMut() -> O)
         -> Result<(Receiver<O>, SeedReport)>;
 }
 pub struct SeedReport { pub set_aside: Option<PathBuf> }   // the stale log, if one was moved
 ```
-`open` / `open_with` are unchanged (`installed = None`).
+`open` / `open_with` are unchanged.
+- **Why a factory.** `Wal` takes its observer by value and has no way to give it back, and the
+  set-aside path opens twice. `observer()` is called once per open: once on every normal
+  start, twice only when a stale log is set aside. (No probe open with a throwaway observer:
+  that would run recovery twice on every restart.)
+- **The WAL never calls the observer at open**, seeded or not; its first call is the first
+  commit. A consumer that needs a starting watermark reads `durable_lsn()` after the open
+  (after a seeded cold start it is `s`).
+- **`dir` MUST be dedicated to the WAL.** The set-aside renames the whole directory; the
+  application's own `installed` record and snapshot files live elsewhere.
 
 **The rule (stateless; the same code path serves a re-seed and a crash in the middle of one):**
-1. `installed = None` ⇒ exactly `open_with`.
-2. `installed = Some(s)`: let `seed = s.checked_next()` (`None` ⇒ `LsnExhausted`). Open the WAL
-   with `Wal::options().seed(seed).observer(o).open(dir, cfg.wal_config)`. The WAL ignores the
-   seed when the directory already holds a log.
+1. `installed = None` ⇒ exactly `open_with(dir, cfg, observer())`.
+2. `installed = Some(s)`: let `seed = s.checked_next()` (`None` ⇒ `LsnExhausted`).
+   **If `dir` does not exist, create it and fsync its parent first** (the WAL's own
+   `create_dir_all` does not fsync the parent, so the new log's directory entry would not be
+   durable while the replica already acks records in it). Then open the WAL with
+   `Wal::options().seed(seed).observer(observer()).open(dir, cfg.wal_config)`. The WAL ignores
+   the seed when the directory already holds a log.
    - If the opened log has `durable_lsn ≥ s` ⇒ keep it. This is every normal restart: a log
      seeded at `s + 1` has `durable_lsn = s` from its first instant and never goes below.
    - If the opened log has `durable_lsn < s` ⇒ the log **predates the snapshot** (a re-seed
@@ -782,16 +802,21 @@ pub struct SeedReport { pub set_aside: Option<PathBuf> }   // the stale log, if 
   durable prefix (which an archive replica may want, §11.1); removing it is the operator's
   call. `SeedReport.set_aside` names it.
 - `dir` must not be a mount point and its parent must be writable; a failed rename is
-  `ReplError::Io` and changes nothing.
+  `ReplError::Io` and changes nothing. A bare relative `dir` has parent `.`.
+- The crate assumes this process is the only one creating `<dir>.stale.*` (no
+  `RENAME_NOREPLACE` is available to it; the existence check is not atomic).
 - **Every crash state converges** when `open_seeded(dir, .., Some(s))` is called again:
   | State on disk | Result |
   |---|---|
   | old log intact (rename not durable) | `durable < s` ⇒ set aside, cold start at `s + 1` |
+  | an **empty log at base 1** (a new replica that was once opened without a seed) | `durable = 0 < s` ⇒ set aside (it is a valid log; the crate never deletes), cold start at `s + 1` |
   | `dir` absent (renamed, not yet recreated) | created, cold start at `s + 1` |
   | `dir` empty, or holding only `LOCK` | cold start at `s + 1` |
-  | `dir` with an incomplete first segment | WAL §8.4 discards it ⇒ cold start at `s + 1` |
-  | seeded log complete | kept (`durable ≥ s`) |
-  No state sets a second directory aside, and none loses the snapshot's position.
+  | `dir` with an incomplete first segment (zero-length, any base name; or full-size all-zero) | WAL §8.4 discards it ⇒ cold start at `s + 1` |
+  | seeded log complete, with or without later records or checkpoints | kept (`durable ≥ s`) |
+  No state sets a second directory aside, and none loses the snapshot's position. (Verified
+  by experiment against the WAL at `2705cf0`, seed 501. States `segment::create` cannot
+  produce, such as a 1–63-byte segment file, fail the open and are returned unchanged.)
 
 **Integrator procedure (MUST, in this order):**
 1. `Receiver::run` returns `Err(ReseedRequired{oldest})` (or the replica is new). Drop the
@@ -810,6 +835,9 @@ pub struct SeedReport { pub set_aside: Option<PathBuf> }   // the stale log, if 
   requires.
 - `open_seeded` trusts `installed`. A value from another deployment sets a healthy log aside
   (recoverable: nothing is deleted).
+- **`installed` is the re-seed LSN, never a restore point.** The rule keeps any log with
+  `durable_lsn ≥ s` without looking at `oldest_lsn`, so restoring the application to an older
+  snapshot and passing its LSN does not rebuild the log below the replica's own checkpoints.
 - A replica-hosted consumer (§7.1) that reads below `s + 1` gets the WAL's fatal gap (WAL
   §15.4), as after any checkpoint.
 
@@ -819,28 +847,50 @@ pub struct SeedReport { pub set_aside: Option<PathBuf> }   // the stale log, if 
 impl Shipper {
     pub fn begin_reseed<O>(&mut self, wal: &Wal<O>, id: ReplicaId, s: Lsn) -> Result<()>;
     pub fn end_reseed(&mut self, id: ReplicaId);
-    pub fn min_reseed_hold_lsn(&self) -> Option<Lsn>;      // the §11 third term
+    pub fn replica_needs_reseed(&self, id: ReplicaId) -> Option<bool>;   // None: unknown id
+    pub fn retention_floor(&self) -> Option<Lsn>;                        // the §11 replica term
 }
 ```
-- **`begin_reseed`** validates, against the live WAL, in this order: `id` is configured;
-  `s < ring::MAX_LSN`; `s ≤ wal.durable_lsn()`; `s + 1 ≥ wal.oldest_lsn()`. Any failure is
-  `Err(ReplError::InvalidSnapshotLsn{s, oldest, durable})` and records nothing. On success it
-  records hold `s` for replica `id`, replacing an earlier hold for that replica.
-- **Call order (MUST).** The integrator calls `begin_reseed` on the writer thread *before*
-  producing the snapshot, and applies the §11 formula (which includes
-  `min_reseed_hold_lsn()`) to every `checkpoint` from then on. Both run on the writer
-  thread, so there is no window between the check and the next checkpoint.
-- **Release.** The hold for `id` is cleared, inside `poll`, when a join from replica `id`
-  with `d ≥ s` is answered Serve (§9 step 3); from then on that replica's `acked` (set to
-  `d`, §9.2) protects the range. A join with `d < s`, a `RESEED_REQUIRED` answer, a rejection
-  and a session end do **not** clear it. `end_reseed` clears it explicitly (the re-seed was
-  abandoned); the integrator SHOULD bound how long it lets a hold pin the log.
-- **The hold is plain writer-thread state.** No atomic, no network-thread access.
+- **`begin_reseed`** validates, against the live WAL, in this order: `id` is configured
+  (else `Err(ReplError::UnknownReplica{id})`); `s ≤ wal.durable_lsn()`;
+  `s + 1 ≥ wal.oldest_lsn()` (else `Err(ReplError::InvalidSnapshotLsn{s, oldest, durable})`).
+  A failure records nothing. On success it records hold `s` for replica `id`, replacing an
+  earlier hold for that replica. (`s < ring::MAX_LSN` follows from `s ≤ durable` on any WAL
+  `Shipper::new` accepted.)
+- **Call order (MUST).** `begin_reseed` runs on the writer thread before the next
+  `checkpoint` after `s` is chosen; the `s + 1 ≥ oldest` check is what enforces it. An
+  existing durable snapshot is a valid `s`. From then on every `checkpoint` is bounded by
+  `retention_floor()` (§11).
+- **`needs_reseed[id]`** (writer-thread state) is set when a join from `id` is answered
+  `RESEED_REQUIRED` and cleared when a join from `id` is answered Serve. It is the
+  deterministic form of the `NeedsReseed` status, which a network thread publishes later.
+- **`retention_floor()`** is the minimum, over all configured replicas, of that replica's
+  term:
+  | Replica state | Term |
+  |---|---|
+  | has a hold `s` | `s` |
+  | no hold, `needs_reseed` | none (excluded: no retention can help it; it is below `oldest` already) |
+  | otherwise | its `acked` (0 until its first HELLO since this `Shipper` started, R7) |
+  `None` when every replica is excluded. `min_replica_acked_lsn()` is unchanged.
+- **Release, with no unprotected window.** Inside `poll`, when a join from replica `id` with
+  `d ≥ s` is answered Serve (§9 step 3), the writer thread, in this order: stores
+  `acked[id] = d`; clears `needs_reseed[id]`; clears the hold. The network thread's own later
+  store of the same `d` (§9.2) is then redundant. Without the writer-side store, a `poll`
+  followed by a `checkpoint` in the same loop iteration would see the hold gone and `acked`
+  still at its previous value, which can be stale-high (a replica that acked 1000, lost its
+  disk, and is re-seeded at 500).
+  - A join with `d < s`, a `RESEED_REQUIRED` answer, a rejection and a session end do **not**
+    clear a hold. A stale replica cannot clear one: needing a re-seed means
+    `d + 1 < oldest ≤ s + 1`, so `d < s`.
+  - `end_reseed` clears the hold explicitly (the re-seed was abandoned); the integrator
+    SHOULD bound how long it lets a hold pin the log.
+- **The hold and `needs_reseed` are plain writer-thread state.** The one shared write is the
+  `acked[id]` store above, on the existing atomic.
 - **Not persisted (R7).** A primary restart drops every hold. The integrator re-registers a
   re-seed that is still in flight (`begin_reseed` re-validates it); otherwise that re-seed
   may be answered `RESEED_REQUIRED` once more — loud, never unsafe.
-- The crate does not call `checkpoint` and does not gate it (§11). A policy that ignores
-  `min_reseed_hold_lsn()` gets the loop; the §15.3 negative control shows it.
+- The crate does not call `checkpoint` and does not gate it (§11). A policy that ignores the
+  holds gets the loop; the §15.3 negative control shows it.
 
 ---
 
@@ -850,12 +900,16 @@ The WAL's `checkpoint(up_to)` is called by the **integrator** (WAL §17.3). The 
 `min_replica_acked_lsn()`. The integrator's policy MUST be:
 
 ```
-up_to = min(latest_durable_snapshot_lsn,                 // WAL §9 rule — binding
-            min_replica_acked_lsn − retention_margin,     // keep lagging replicas catch-up-able
-            min_reseed_hold_lsn())                        // §10.2 — in-flight re-seeds
+up_to = min(latest_durable_snapshot_lsn,           // WAL §9 rule — binding
+            retention_floor() − retention_margin)  // §10.2: holds, and acked of every replica
+                                                   // that does not need a re-seed
 ```
+- `retention_floor()` already drops a replica that was answered `RESEED_REQUIRED` and puts
+  it back, at its HELLO value, the moment it is served again. The margin applies to the
+  `acked` terms; a hold is exact and needs none.
 - If a replica is disconnected for longer than the margin allows, the integrator MAY choose
-  to checkpoint past it — that replica will then hit R6 and re-seed. This is a deliberate
+  to checkpoint past it (using `replica_acked_lsn` per replica instead of the floor) — that
+  replica will then hit R6 and re-seed. This is a deliberate
   availability-vs-disk trade the integrator makes; the crate makes it **loud** (R6), never silent.
 - There is **no** "checkpoint observer" and no writer-side gating; WAL §15.4 stays gap-is-fatal.
 
@@ -896,7 +950,9 @@ mode distinguishes it; it is a policy on both sides:
    writer. Start the application as primary on it; start its `Shipper`.
 4. Point the remaining replicas at the new primary; they `HELLO` with their `durable_lsn` and
    catch up (§9) — no truncation needed (R5).
-5. Loss = the old primary's un-shipped tail (records > new primary's `durable_lsn` that the
+5. **Discard every re-seed snapshot produced by the old primary that is not yet installed and
+   served** (§10): restart those re-seeds against the new primary.
+6. Loss = the old primary's un-shipped tail (records > new primary's `durable_lsn` that the
    old primary had committed). The integrator MUST treat those as lost.
 
 ### 12.2 The former primary MUST be re-seeded
@@ -932,7 +988,8 @@ fixed slots — and `max_reconnect_backoff`, `io_timeout`, `send_batch`.)* **`Re
 
 **`ReplError`** (non-panicking): `Wal(WalError)`, `Contiguity{expected, got}`, `WireCrc`,
 `Protocol`, `ReseedRequired{oldest}`, `PrimaryPoisoned`, `Io`,
-`InvalidSnapshotLsn{s, oldest, durable}` (RM4; replaces the never-used `SnapshotFailed`).
+`InvalidSnapshotLsn{s, oldest, durable}`, `UnknownReplica{id}` (RM4; `InvalidSnapshotLsn`
+replaces the never-used `SnapshotFailed`).
 
 **Milestones** (each gated on its §15 tests):
 - **RM0** — crate skeleton, wire codec (frames, CRC, HELLO/SERVING/RECORD/ACK/ERR). *§15.1.*
@@ -999,10 +1056,11 @@ slot accounting (capture/release/free/evict).
     fall-back (§9.2), a session end in this test is itself a failure.
 - **Re-seed end to end (RM4):** replica behind floor ⇒ `RESEED_REQUIRED` ⇒ `begin_reseed(s)` ⇒
   install ⇒ `open_seeded(.., Some(s))` ⇒ `HELLO{s}` ⇒ served from `s + 1` ⇒ converges, with
-  the old log set aside intact. Every §10.1 crash state converges. With the hold in the
-  checkpoint policy the re-seed completes with exactly one `RESEED_REQUIRED` on the wire;
-  **negative control:** the same run with the hold term removed is answered
-  `RESEED_REQUIRED` a second time.
+  the old log set aside intact. Every §10.1 crash state converges. With `retention_floor()`
+  in the checkpoint policy, no session whose `HELLO.d ≥ s` is answered `RESEED_REQUIRED`,
+  even though the primary checkpoints throughout the re-seed and the catch-up after it;
+  **negative control:** the same run with the holds ignored is answered `RESEED_REQUIRED` at
+  `HELLO{s}`.
 - **Promotion:** kill primary; promote highest replica; others catch up without truncation;
   content = dense prefix of old primary's durable log.
 - **Former primary rejoin is REJECTED:** old primary (ahead) sends HELLO ⇒ `ERR(Contiguity)`,
