@@ -150,12 +150,14 @@ print("PASS (%s): %d relevant syscalls; parent fsyncs: %d" % (mode, len(ev), kin
 PY
 }
 
+fail=0
 log "E9: tracing the set-aside run"
 p1="$(trace_target e9_target_set_aside)"
-check set_aside "$p1" "$WORK/trace.e9_target_set_aside" || die "set-aside run: see above"
+check set_aside "$p1" "$WORK/trace.e9_target_set_aside" || fail=1
 
 log "E9: tracing the missing-directory run"
 p2="$(trace_target e9_target_missing_dir)"
-check missing_dir "$p2" "$WORK/trace.e9_target_missing_dir" || die "missing-directory run: see above"
+check missing_dir "$p2" "$WORK/trace.e9_target_missing_dir" || fail=1
 
+[ "$fail" -eq 0 ] || die "E9: the directory operations are not durable / not ordered — see above."
 log "PASS: LOCK closed before the rename; parent fsync after the rename and after each mkdir, before the first segment file."

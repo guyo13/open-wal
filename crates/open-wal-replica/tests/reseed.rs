@@ -1013,12 +1013,12 @@ fn e6_retention_floor_table() {
     drop(a);
     let mut a = fa.hello(300);
     let first = join_once(&mut p, 0, &mut a, |p| {
-        assert_eq!(p.sh().replica_needs_reseed(0), Some(false));
         assert_eq!(
             p.floor(),
             Some(300),
             "a served replica counts again, at its HELLO value"
         );
+        assert_eq!(p.sh().replica_needs_reseed(0), Some(false));
     });
     assert_eq!(first, Saw::Serving { from: 301, oldest });
     assert_eq!(p.sh().replica_needs_reseed(1), Some(true));
