@@ -156,7 +156,10 @@ impl<O: DurabilityObserver> Wal<O> {
             return Err(WalError::InvalidConfig);
         }
 
-        std::fs::create_dir_all(dir)?;
+        // §8.4.1 rule 1: create every missing level top-down, fsyncing each new
+        // level's parent before going on. `dir_existed` drives the one tolerated
+        // failure of the cold-start parent fsync below.
+        let dir_existed = !create_dir_durable(dir)?;
 
         // Exclusive writer lock for the handle's lifetime (§6.2).
         let lock = OpenOptions::new()
@@ -192,7 +195,13 @@ impl<O: DurabilityObserver> Wal<O> {
         Self::discard_incomplete_highest(dir, &mut bases, config)?;
 
         let rec = if bases.is_empty() {
-            Self::cold_start(dir, config.segment_size, seed)?
+            let rec = Self::cold_start(dir, config.segment_size, seed)?;
+            // §8.4.1 rule 2: every cold start fsyncs `dir`'s parent once more,
+            // after the first segment exists and `dir` is fsynced. This covers a
+            // directory an earlier `open` created before crashing short of its
+            // parent fsync. A reopen of an existing log never reaches here (rule 3).
+            fsync_parent_of(dir, dir_existed)?;
+            rec
         } else {
             Self::recover_all(dir, &bases, config)?
         };
@@ -768,8 +777,87 @@ fn containing_segment_idx(bases: &[Lsn], from: Lsn) -> usize {
 /// `fsync` a directory so a newly-created filename within it is durable (§7.4).
 fn fsync_dir(dir: &Path) -> Result<()> {
     let dir_file = File::open(dir)?;
-    rustix::fs::fsync(&dir_file).map_err(io::Error::from)?;
+    fsync_dir_file(&dir_file)
+}
+
+/// The fsync half of [`fsync_dir`], on an already-open directory. Split out so
+/// the cold-start parent fsync (§8.4.1) can tell "the parent cannot be opened"
+/// apart from "the fsync failed" while issuing the very same call.
+fn fsync_dir_file(dir_file: &File) -> Result<()> {
+    rustix::fs::fsync(dir_file).map_err(io::Error::from)?;
     Ok(())
+}
+
+/// The directory that holds `path`'s own entry (§8.4.1 rule 4), or `None` for
+/// the filesystem root, which has no parent. Lexical: the parent of a bare
+/// relative name is `.`; a path with no final name (`.`, `a/..`, the empty
+/// path) is held by `<path>/..`.
+pub(crate) fn parent_dir_of(path: &Path) -> Option<PathBuf> {
+    match path.parent() {
+        Some(p) if path.file_name().is_some() => Some(if p.as_os_str().is_empty() {
+            PathBuf::from(".")
+        } else {
+            p.to_path_buf()
+        }),
+        // `/` (or a bare prefix): nothing above it.
+        None if path.has_root() => None,
+        // `.`, `..`, `a/..`, ``: no final name component to take a parent of.
+        _ => Some(path.join("..")),
+    }
+}
+
+/// §8.4.1 rule 1: the durable replacement for `create_dir_all`. Creates each
+/// missing level of `dir` top-down and fsyncs **that level's parent** before
+/// creating the next, so the new name is durable before anything is put inside
+/// it. Returns `true` iff this call created `dir` itself. Any failure —
+/// including a parent that cannot be opened for the fsync — is an error: no
+/// tolerance applies to a level this call created.
+fn create_dir_durable(dir: &Path) -> Result<bool> {
+    if dir.as_os_str().is_empty() {
+        return Ok(false);
+    }
+    match std::fs::create_dir(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            // A missing ancestor: create it (durably) first, then this level.
+            match dir.parent() {
+                Some(p) if !p.as_os_str().is_empty() => {
+                    create_dir_durable(p)?;
+                }
+                _ => return Err(WalError::Io(e)),
+            }
+            match std::fs::create_dir(dir) {
+                Ok(()) => {}
+                // Lost a race with another creator: not a level this call made.
+                Err(_) if dir.is_dir() => return Ok(false),
+                Err(e) => return Err(WalError::Io(e)),
+            }
+        }
+        // Already there (the steady state): nothing created, nothing to fsync.
+        Err(_) if dir.is_dir() => return Ok(false),
+        Err(e) => return Err(WalError::Io(e)),
+    }
+    if let Some(parent) = parent_dir_of(dir) {
+        fsync_dir(&parent)?;
+    }
+    Ok(true)
+}
+
+/// §8.4.1 rule 2: fsync the parent of `dir` after a cold start. The one
+/// tolerated failure: `dir` already existed when this `open` started
+/// (`dir_existed`) and its parent cannot be **opened** (`PermissionDenied`) — a
+/// pre-provisioned directory under a parent the process cannot read is the
+/// deployment's responsibility. Every other failure is returned.
+fn fsync_parent_of(dir: &Path, dir_existed: bool) -> Result<()> {
+    let Some(parent) = parent_dir_of(dir) else {
+        return Ok(());
+    };
+    let parent_file = match File::open(&parent) {
+        Ok(f) => f,
+        Err(e) if dir_existed && e.kind() == io::ErrorKind::PermissionDenied => return Ok(()),
+        Err(e) => return Err(WalError::Io(e)),
+    };
+    fsync_dir_file(&parent_file)
 }
 
 #[cfg(test)]
