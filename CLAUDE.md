@@ -116,6 +116,16 @@ The entire value of this component is **correct behavior under crashes and fault
 
 ## Project status (keep this updated)
 
+- **LATEST (2026-11-28, RM4 review round 2): #63 (replica RM4, re-seed) APPROVED at `45a5804` — ready for the owner to merge.**
+  - **Required 1–3 verified by execution** (reviewer mutations in a separate worktree):
+    1. Symlinked `dir` refused before any rename: check removed ⇒ `e11` fails.
+    2. Hold released only at `d == s`: `d >= s` ⇒ `e6_hold_release`, the old-incarnation test and the unit test fail. Spec §10.2 corrected in the PR.
+    3. Parent opened before the rename: open-after-rename ⇒ `e12` fails when run as uid 65534 (it cannot fail as root).
+  - **Requested items done:** the crate no longer creates `dir` (the WAL does, §8.4.1); the E9 script is unchanged and passes; E7's dead assertion and the `join_once` race are fixed; more E3/E4/E5 rows; a relative-path row.
+  - **Gates run by the reviewer:** replica 123 passed ×3, root 202, clippy (both cfgs), fmt, loom 12/12, E9; E1/E6/E7 25 of 25; root diff empty.
+  - **Not re-run:** 14 round-1 mutation rows whose code did not change.
+  - **Open before merge:** the PR description still describes the first push; the agent was asked to update it.
+  - **Next:** owner merges #63; then a fenced RM5 kickoff (checkpoint policy helper, promotion, former-primary rejection, the archive scenario).
 - **LATEST (2026-11-28, RM4 review round 1): #63 (replica RM4, re-seed) reviewed at `4a05ead` — needs work: three required code changes, one of them a hole in the designer's spec.**
   - **Verified:** root `src/` diff empty; replica 116 passed ×3, root 202, clippy (both cfgs), fmt, loom 12/12, the E9 strace script; CI 14/14 on the head. 17 reviewer mutations in a separate worktree all fail a named test.
   - **Pre-existing flake fixed in this PR (authorized):** RM2's `tiny_ring_marks_needs_catch_up_repeatedly` assumed the consumer thread ran before the producer finished. Reviewer reproduced it on unmodified `main` (14 failures in 20 under `taskset -c 0`); with the paced version 40/40 pinned and 40/40 unpinned.
