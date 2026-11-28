@@ -766,6 +766,28 @@ up_to = min(latest_durable_snapshot_lsn,                 // WAL §9 rule — bin
   availability-vs-disk trade the integrator makes; the crate makes it **loud** (R6), never silent.
 - There is **no** "checkpoint observer" and no writer-side gating; WAL §15.4 stays gap-is-fatal.
 
+### 11.1 Archive replicas (supported use; owner decision 2026-11-28)
+
+A replica MAY keep the log while the primary checkpoints: its WAL is its own, and nothing the
+primary deletes is propagated (§7 step 6). An **archive replica** is a replica whose
+integrator never checkpoints (or checkpoints on a much longer horizon). No protocol or crate
+mode distinguishes it; it is a policy on both sides:
+
+- **Archive side:** do not call `checkpoint`. The archive then holds a dense, byte-identical
+  run `start..=durable_r` (R5, R9), where `start` is 1 for a replica that joined an empty
+  primary and `seed` for a re-seeded one.
+- **Primary side (integrator, MUST for a gap-free archive):** bound every checkpoint by the
+  archive's acked LSN, with no "disconnected too long" exception for that replica:
+  `up_to ≤ replica_acked_lsn(archive)`. `min_replica_acked_lsn()` already gives this when
+  applied without the §11 MAY above. After a primary restart a replica counts as `Lsn(0)`
+  until its HELLO, so the bound is conservative across restarts (R7).
+- **If the primary checkpoints past the archive anyway**, the archive gets `RESEED_REQUIRED`
+  (R6, loud). A re-seed starts a new log at the snapshot's seed, so the archive then has a
+  **hole** between its old `durable_r` and the seed. The crate cannot repair that; the old
+  directory must be kept by the operator if the prefix still matters.
+- **Limits.** The archive is asynchronous: it lags, and on primary loss it lacks the
+  un-shipped tail like any replica. Disk on the primary grows while the archive is down.
+
 ---
 
 ## 12. Promotion (manual failover) — NORMATIVE procedure
@@ -833,11 +855,13 @@ fixed slots — and `max_reconnect_backoff`, `io_timeout`, `send_batch`.)* **`Re
   `PrimaryLogUnreadable{lsn}`, `LsnDomainExhausted`.
   *§15.3 catch-up, §15.2 P5, §15.7 L7/L7b/L8/L8b.*
 - **RM4** — re-seed traits + `options().seed(..)` cold start; re-seed loop guard. *§15.3 re-seed.*
-- **RM5** — checkpoint policy helper + promotion runbook + former-primary rejection (§12.2).
-  *§15.3 promotion, rejoin-rejected.*
+- **RM5** — checkpoint policy helper (incl. the §11.1 archive bound) + promotion runbook +
+  former-primary rejection (§12.2). *§15.3 promotion, rejoin-rejected, archive replica.*
 - **RM6** — model/oracle test (§15.4).
-- **RM7** — fault injection: the LazyFS divergence headline + crash matrices (§15.5).
-- **RM8** — hardening: fuzz the wire decoder, soak (primary+2 replicas, hours), CI.
+- **RM7** — fault injection: the LazyFS divergence headline + crash matrices (§15.5), built on
+  the §15.8 multi-process harness (the harness itself is an RM7 deliverable).
+- **RM8** — hardening: fuzz the wire decoder; the soak = the §15.8 harness run for hours
+  (primary + 2 replicas + 1 archive replica); CI.
 
 ---
 
@@ -887,6 +911,12 @@ slot accounting (capture/release/free/evict).
 - **Primary restart (R7):** primary crashes and reopens; replicas re-HELLO; shipping resumes
   from each replica's `durable_lsn` with no persisted state on the primary.
 - **Replica poison:** replica `commit()` fails ⇒ `ERR(Poisoned)`; after reopen it resumes.
+- **Archive replica (§11.1, RM5):** the primary rolls many segments and checkpoints repeatedly
+  under the `up_to ≤ replica_acked_lsn(archive)` bound while the archive never checkpoints,
+  including an archive disconnect/reconnect and a primary restart mid-run. Assert, from the
+  archive's own WAL: `oldest_lsn` unchanged, a dense byte-identical run `1..=durable_r` equal
+  to the records the test appended, and no `RESEED_REQUIRED` on the wire (proxy oracle).
+  Negative control: with the bound removed the archive is told `RESEED_REQUIRED`.
 
 ### 15.4 Model / oracle (centerpiece, like WAL §14.3)
 Drive a randomized program — primary `Append/Commit/Checkpoint/Crash`, replica
@@ -917,7 +947,8 @@ crate's model harness pattern; run high-iteration in CI and as an RM8 fuzz targe
 Every R1–R9 has a passing test; §15.5 headline + negative control pass; §15.4 oracle
 high-iteration clean; crash matrices green; **§15.7 loom L1–L6 pass and each falsifiability
 mutation is demonstrated to fail**; wire-decoder fuzz N CPU-hours zero crashes
-(contingent, dedicated runner); soak clean. Nothing self-certified without execution.
+(contingent, dedicated runner); the §15.8 bounce matrix green with its negative controls;
+soak clean. Nothing self-certified without execution.
 
 ### 15.7 loom — model-checking the ring barrier (RM2 gate; NORMATIVE)
 
@@ -1169,6 +1200,58 @@ build and run the ring's ordinary unit tests — the `cfg(loom)` swap must not c
 non-loom code path.
 
 ---
+
+### 15.8 Multi-process harness (RM7 deliverable; the RM8 soak reuses it)
+
+Everything through RM6 runs primary and replicas as threads of one test process. The crash
+matrices (§15.5) and the soak need real processes, so they share one harness instead of two
+sets of plumbing. The shape follows the system tests of replicated logs such as Kafka's
+(verifiable clients, a bounce matrix, scheduled faults, one end-of-run validator), and this
+repo's own H1 power-pull harness (ack ledger written strictly after `commit() → Ok`).
+
+**Parts** (test-only binaries in `crates/open-wal-replica`, never part of the library API):
+- **`repl_primary`** — opens a WAL, runs a `Shipper`, appends a seeded deterministic workload
+  (payload derived from the LSN and the run seed, so any record can be re-derived), and after
+  each `commit() → Ok(w)` appends `w` to an **ack ledger** outside the WAL directory, fsynced.
+  It checkpoints on the §11 policy (with the §11.1 bound for the archive).
+- **`repl_replica`** — opens a WAL, runs a `Receiver`; in archive mode it never checkpoints.
+  It writes its own ledger of ACKs sent, each strictly after its `commit() → Ok`.
+- **Driver** — starts the processes, applies a fault schedule from a seed, stops them, runs
+  the validator. Every run prints its seed; a failure reproduces from it.
+- **Fault proxy** — a loopback TCP forwarder per link, controlled by the driver: pass, drop
+  (partition), delay, throttle, cut mid-frame. No root, `tc` or `iptables` needed, so it runs
+  on hosted CI.
+
+**Faults.** Per target {primary, replica, archive replica}: clean stop (SIGTERM), hard kill
+(SIGKILL), pause (SIGSTOP … SIGCONT, longer than the peer's idle timeout), each followed by a
+restart. Per link: partition and heal, slow link, mid-frame cut. The **bounce matrix** crosses
+target × fault × phase, where phase ∈ {streaming, mid catch-up, mid cutover, mid checkpoint on
+the primary}; phases are reached by configuration (small ring, small chunks, small segments)
+and confirmed from the processes' status output, never assumed (anti-vacuity: a cell whose
+phase was not observed is INCONCLUSIVE, not PASS).
+
+**Validator** (runs on the stopped directories; independent of shipper counters):
+1. Primary recovery succeeds; its `durable_lsn` ≥ the last ledger entry (WAL D1).
+2. Each replica's log is a dense, byte-identical run ending at `durable_r ≤ primary durable`
+   (R1, R5, R9), with payloads re-derived from the seed.
+3. Every ACK in a replica's ledger is ≤ that replica's recovered `durable_lsn` (R4).
+4. The archive replica's `oldest_lsn` is its starting LSN and it was never told
+   `RESEED_REQUIRED` (§11.1).
+5. Liveness, for runs that end with all faults healed and a quiet period: every replica
+   reaches the primary's `durable_lsn`.
+Verdicts are PASS / FAIL / INCONCLUSIVE / HARNESS-ERROR with distinct exit codes, as in M8.
+
+**Negative controls** (each demonstrated to FAIL the validator, then reverted): a shipper
+that releases on capture (rule 2, with a primary SIGKILL between append and commit); a
+receiver that ACKs before `commit()` (rule 3, with a replica SIGKILL); a primary that ignores
+the archive bound (rule 4).
+
+**Where it runs.** Per PR: one short pass over the bounce matrix (blocking). Scheduled: longer
+randomized schedules. The RM8 soak is this harness for hours on a dedicated runner with the
+fd / RSS / disk monitors of WAL §14.10; a short run is never the soak gate.
+
+**Not covered here:** power loss (that is the LazyFS headline, §15.5, and H1), and promotion
+(a scenario test, §15.3; the harness may add it later).
 
 ## 16. Deferred (explicit)
 - **Sync replication** (barrier gating client acks) — surface in §13; v2.
