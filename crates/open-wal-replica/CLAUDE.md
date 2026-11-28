@@ -648,13 +648,15 @@ underspecified, flag it and propose a fix — do not silently diverge.
     A, B), E2, E3 (11 on-disk states × 2 calls), E4, E5, E6 (validation table, floor table, R7,
     release, handover), E7 (+ negative control), E8, E9 targets, E10;
     `shipper::tests::e6_on_answer_release_rules`; `scripts/replica/reseed-dirops.sh` (E9,
-    **executed**: set-aside run 13 relevant syscalls / 2 parent fsyncs, missing-directory run 5 /
-    1). New shared helpers in `tests/common`: `SeededServer` (a real `Receiver` opened with
+    **executed**: on the head merged with #62, set-aside run 16 relevant syscalls / 5 parent
+    fsyncs, missing-directory run 6 / 2; before that merge 13 / 2 and 5 / 1). New shared helpers in `tests/common`: `SeededServer` (a real `Receiver` opened with
     `open_seeded`, running `Receiver::run`, on a shared listener so a re-seeded receiver comes up
     on the same address; it seeds the shared `DurableTap` with the opened WAL's `durable_lsn()`),
     `stale_dirs`, `stale_path`.
   - **Mutation table (each applied in a separate worktree, the named test run and shown failing,
-    reverted; the worktree was checked clean after every row):**
+    reverted; the worktree was checked clean after every row). The whole table was run twice:
+    before and after merging `main` at `e729934` (#62, which changed `Wal::open`'s directory
+    creation). All 27 rows fail on both.**
   | # | Mutation (applied, run, reverted) | Test | Failure observed |
   |---|---|---|---|
   | E1 | seed = `s` | `e1_reseed_end_to_end` | `the new log starts at s + 1` (left 240, right 241) |
@@ -674,7 +676,7 @@ underspecified, flag it and propose a fix — do not silently diverge.
   | E6 | clear the hold on any join | `e6_hold_release` | `a served join with d < s keeps the hold` (left 150, right 200) |
   | E6 | clear the hold on session end (in `poll`: a served replica whose status is `Connecting`) | `e6_hold_release` | `a session end keeps the hold` (left 150, right 200) |
   | E6 | never clear the hold | `e6_hold_release` | `Serve with d >= s releases A's hold (and only A's)` (left 200, right 210) |
-  | E6 | no writer-side `acked` store | `e6_handover_has_no_unprotected_window` | `the writer must store acked = d when it answers Serve` (left 1000, right 500) — **20 of 20 runs here; by construction this row races with the network thread's own store** |
+  | E6 | no writer-side `acked` store | `e6_handover_has_no_unprotected_window` | `the writer must store acked = d when it answers Serve` (left 1000, right 500) — **30 of 30 runs here; by construction this row races with the network thread's own store** |
   | E6 | same | `shipper::tests::e6_on_answer_release_rules` | `the writer stores acked = d on Serve` (left 1000, right 500) — deterministic |
   | E6 | `needs_reseed` never cleared | `e6_retention_floor_table` | `a served replica counts again, at its HELLO value` (left `None`, right `Some(300)`) |
   | E6 | a needs-reseed replica is not excluded | `e6_retention_floor_table` | `a replica that needs a re-seed and has no hold is excluded` (left `Some(0)`, right `Some(295)`) |
@@ -700,7 +702,7 @@ underspecified, flag it and propose a fix — do not silently diverge.
        missing *parent* is `ReplError::Io`, unlike `open` / `open_with`, whose `create_dir_all`
        builds the whole path. A multi-level create would leave ancestors' entries un-fsynced.
     4. **The handover row cannot be made deterministic from outside** (its mutation "reads 1000
-       or races", as the kickoff says): 20 of 20 runs failed here. Added the writer-level unit
+       or races", as the kickoff says): 30 of 30 runs failed here. Added the writer-level unit
        test above as the deterministic falsifier.
     5. **"Clear on session end" has no natural mutation site** — the writer never learns that a
        session ended. The row's mutation is synthesized in `poll` (status `Connecting` and
@@ -720,11 +722,21 @@ underspecified, flag it and propose a fix — do not silently diverge.
        table). The floor is then above that replica's cursor, so the policy may checkpoint under
        it and it gets a BelowOldest FIN and `RESEED_REQUIRED` — which is the re-seed already in
        flight. Stated, not changed.
-    10. **Pre-existing, not touched:** `cargo doc` with `-D warnings` fails on a private
+    10. **#62 (WAL §8.4.1) merged while this was in progress and makes part of §10.1 redundant.**
+        `Wal::open` now creates a missing directory durably itself (parent fsynced before
+        anything is put inside) and fsyncs the parent once more after a cold start. §10.1's
+        stated reason for the explicit create ("the WAL's own `create_dir_all` does not fsync the
+        parent") no longer holds. `open_seeded` still does what §10.1 and the kickoff say (its
+        own `mkdir` + parent fsync, in both the missing-directory and the set-aside path); the
+        WAL's creation step then finds the directory and does nothing. Harmless; the designer may
+        want to simplify §10.1 (the missing-directory branch could be left to the WAL; the
+        post-rename parent fsync must stay). E9's three mutation rows still fail after the merge.
+    11. **Pre-existing, not touched:** `cargo doc` with `-D warnings` fails on a private
         intra-doc link in `ring.rs:30` (ring guardrail).
   - Gates: replica suite 116/116 ×3 (+2 shim-only, +2 strace targets), clippy normal and
-    `--cfg loom`, fmt, MSRV 1.85, loom 12/12, T8b 2/2, E9 script, root 191/0, root
-    `src tests benches fuzz` diff empty.
+    `--cfg loom`, fmt, MSRV 1.85, loom 12/12, T8b 2/2, E9 script, root 202/0 (191 before the
+    #62 merge), `git diff origin/main -- src tests benches fuzz` empty. `main` was merged in
+    (`e729934`), not rebased.
 - **Current milestone:** RM4 — implemented, PR open, **awaiting designer review + owner merge**.
   RM5 is NOT started.
 - **RM2 loom gate:** confirmed by the designer at `b72a2fd`; the nine rows were re-run for RM3
