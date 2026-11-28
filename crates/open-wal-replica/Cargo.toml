@@ -8,7 +8,7 @@ rust-version = "1.85"
 description = "Async primary/replica log shipping for open-wal (static primary, N replicas)."
 license = "BSD-3-Clause"
 repository = "https://github.com/guyo13/open-wal"
-# Not published yet: the crate is pre-RM3 (catch-up needs WAL spec v7). Flip this
+# Not published yet (RM4+ outstanding). Flip this
 # deliberately when the replica contract's §15.6 definition of done is met.
 publish = false
 exclude = ["CLAUDE.md", "tests"]
@@ -35,6 +35,10 @@ loom = "0.7"
 proptest = "1"
 # Temp directories for the primary/replica WALs in tests.
 tempfile = "3"
+# RM3 T18(b) and loom L8b build a `ReaderPos` by hand (`fuzzing::reader_pos`);
+# it has no public constructor. Test builds only: the non-test build of
+# `open-wal` (and so the shipped library) stays without the feature.
+open-wal = { path = "../..", features = ["fuzzing"] }
 
 [lints.rust]
 # `cfg(loom)` is set only via RUSTFLAGS="--cfg loom" for the §15.7 gate.

@@ -1121,6 +1121,46 @@ underspecified or where loom showed it needed sharpening. None weakens R1.
   itself is compiled with `--cfg loom` as a regular dependency of `tests/loom_ring.rs`, where
   dev-dependencies are invisible. The cfg is never set in a normal build.
 
+#### 15.7.8 (cont.) As built (RM3) — refinements of §9.3 and §15.7.4–15.7.5, flagged for review
+None weakens R1–R9. Recorded results: `crates/open-wal-replica/CLAUDE.md`, RM3 status.
+- **A loom scheduling point in `Slot::answer`.** loom switches threads only at its own
+  operations, and its `unpark` is not one (and it joins causality eagerly, as above). So no
+  modelled execution ran the network thread between the `DONE` store and the unpark, and two
+  §15.7.5 rows passed their model: "writer writes the answer after storing `DONE`" (L8) and
+  "`await_answer`'s `DONE` load `Acquire` → `Relaxed`" (L8b). As built, `answer` has a
+  `cfg(loom)`-only `loom::thread::yield_now()` between the store and the unpark (nothing in a
+  normal build). A `Relaxed` load of the state word there is also a branch point, but loom's
+  partial-order reduction does not reorder it against the network thread's load, and the
+  `Relaxed` row still passed with it; with the yield both rows fail. The §15.7.4 claim "the
+  check-before-park interleaving still exposes a race on the answer" holds only with this point.
+- **`await_answer(consumer, buf, idle)`.** `idle` is called before every park. It runs the
+  session-level heartbeat timer (§9.3) while a request is outstanding and reports a dead socket
+  (`Idle::Abandon`), in which case `await_answer` runs `abandon` itself. `await_answer` therefore
+  still has no exit with a request outstanding except shutdown, and a dead session takes a
+  `PENDING` request back instead of waiting for a `poll`.
+- **A `join` hint in the slot.** "Joins first" needs the request kind before the `PENDING → TAKEN`
+  CAS, and reading the request cell before the CAS would be the race the slot forbids. `post`
+  stores an `AtomicBool` hint before `PENDING`; `poll` uses it for ordering only (a stale hint
+  can only delay a join to the pass's second phase).
+- **One answer per replica per pass.** A network thread posts its first chunk request the moment
+  its join is answered; without this rule the same pass could read for it, and "the poll that
+  answers the join reads nothing" would be racy.
+- **L7 parameters.** The late consumer polls `resume()` at most twice and then makes at most two
+  concurrent drain passes; the main thread's finish step does the rest. L7 at preemption bound 4,
+  L7b exhaustive, as specified; both rows of each fail at those bounds.
+- **L8.** The network thread registers its waker, posts `Chunk{1}` and calls `abandon`; the
+  writer calls `answer` once with an `f` that attaches. **L8b.** The writer retries `answer`
+  (with `yield_now`) until the request is there, as successive `poll`s would.
+- **Rows that did not behave as §15.7.5 / the kickoff expected** (details in the crate status):
+  T16's specified shape cannot fail under "return the first error immediately" because joins are
+  answered first (a chunk/chunk shape was added and does); T12's "raw-`w` ceiling" does not make
+  the in-flight variant panic, because a terminal shipper answers Terminal before computing a
+  ceiling (an added clamped-ceiling test falsifies the row).
+- **Unspecified wire behaviour, as built.** ReadFailed ends the session with
+  `ERR(Poisoned, "primary log unreadable at lsn N")`; an internal invariant failure
+  (`AlreadyAttached`, an impossible answer) with `ERR(Protocol)`. BelowOldest half-closes and
+  waits for the replica's EOF so the receiver sees a clean end.
+
 #### 15.7.7 Where it runs
 `RUSTFLAGS="--cfg loom" cargo test -p open-wal-replica --test loom_ring --release` (`--release`
 only for speed; CI uses a separate `CARGO_TARGET_DIR`). Fast at this bound ⇒ **per-PR,

@@ -15,6 +15,12 @@
 //! release-at-commit as a Release/Acquire watermark (the R1 gate), one network
 //! thread per replica, and overflow ⇒ `NeedsCatchUp` without ever blocking the
 //! writer. The ring is model-checked with loom (§15.7, `tests/loom_ring.rs`).
+//! **RM3** adds catch-up / resume (§9): a replica that (re)connects behind the
+//! ring, or that the ring overflows past, is served the missing records from
+//! the primary's log in bounded chunks on the writer thread
+//! ([`Shipper::poll`]`(&wal)`), under the released watermark (R1), and then cut
+//! over to the ring — inside its session. A replica below the primary's
+//! retention floor is answered `RESEED_REQUIRED` (R6).
 
 #![warn(missing_docs)]
 
@@ -25,6 +31,15 @@ pub mod ring;
 // the ring itself is built against loom's primitives and model-checked.
 #[cfg(not(loom))]
 mod shipper;
+// The §9.3 request slot is built under `cfg(loom)` too (models L8 / L8b drive
+// it). Its methods are safe `&self` methods whose soundness depends on which
+// thread calls them, so it is NOT part of the crate's API: it is `pub` only
+// under `cfg(loom)`, where `tests/loom_ring.rs` is its one external user.
+#[cfg(loom)]
+#[doc(hidden)]
+pub mod slot;
+#[cfg(not(loom))]
+pub(crate) mod slot;
 mod sync;
 pub mod wire;
 

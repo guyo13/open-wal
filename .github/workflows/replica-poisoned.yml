@@ -1,0 +1,47 @@
+# open-wal-replica RM3 T8b — the serve ceiling on a POISONED primary (§9.1).
+#
+# Runs crates/open-wal-replica/tests/poisoned_primary.rs under the LD_PRELOAD
+# EIO shim (tests/fault/eio_preload.c, shared with the WAL's §14.8 H3 gate):
+# the primary's commit fails on a chosen fdatasync, the handle is poisoned, and
+# the segment file holds CRC-valid records above anything a `commit() -> Ok`
+# covered. `Shipper::poll` on that handle must serve nothing above the released
+# watermark (K=0: reader's end / last_lsn; K=2 split batch: wal.durable_lsn()).
+#
+# Paths-filtered (it needs a C compiler and a preload, so it is not part of the
+# plain `cargo test`): it runs when the replica crate, the shim, or the script
+# change. BLOCKING when it runs. Anti-vacuous: the tests and the script both
+# fail if the shim injected nothing.
+name: replica — poisoned primary (T8b)
+
+on:
+  pull_request:
+    paths:
+      - "crates/open-wal-replica/**"
+      - "tests/fault/eio_preload.c"
+      - "scripts/replica/poisoned-primary.sh"
+      - ".github/workflows/replica-poisoned.yml"
+      - "src/**"
+  push:
+    branches: [main]
+    paths:
+      - "crates/open-wal-replica/**"
+      - "tests/fault/eio_preload.c"
+      - "scripts/replica/poisoned-primary.sh"
+      - ".github/workflows/replica-poisoned.yml"
+      - "src/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  poisoned-primary:
+    name: replica — T8b under the EIO shim
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: T8b (LD_PRELOAD EIO shim)
+        run: scripts/replica/poisoned-primary.sh run
