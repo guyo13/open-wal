@@ -509,6 +509,11 @@ Fsyncing `dir` (§7.4 step 5) makes a segment's name durable inside `dir`; it do
 
 **Invariant:** `open` never returns `Ok` from a cold start unless the parent of `dir`, and the parent of every level it created, has been fsynced (subject to the one tolerated failure).
 
+**Limits (follow from the rule; accepted as built):**
+
+- **A symlinked `dir`.** The parent is lexical (rule 4), so when `dir` is a symlink to a directory the fsynced parent is the directory holding the **symlink**, not the parent of the symlink's target. The durability of the target directory's own entry is the deployment's responsibility.
+- **A directory left behind by a failed creating `open`.** If `open` creates `dir` and then fails at the parent fsync, it returns the error but does not remove `dir`. A later `open` finds `dir` already there and treats it as pre-existing: it cold-starts and applies rule 2, so under a parent that cannot be opened (`PermissionDenied`) that later `open` **succeeds** by the tolerated-failure rule, with the entry's durability left to the deployment.
+
 ### 8.5 Memory discipline during recovery
 Recovery MUST NOT materialize payloads in memory. It retains at most a **sparse index**: per segment, `(base_lsn, path, max_lsn)`, and optionally a coarse `(lsn → offset)` map for seeking. `reader_from(from)` locates the containing segment and scans within it from the start, skipping to `from`. Memory is `O(num_segments)`, not `O(num_records)` and never `O(total_bytes)`.
 

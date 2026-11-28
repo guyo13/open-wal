@@ -138,6 +138,7 @@ The entire value of this component is **correct behavior under crashes and fault
     | `PermissionDenied` tolerated in the walk and for any cold start | F3 | `open succeeded for a directory it created whose parent could not be fsynced` |
   - **F3 needs a non-root process.** This sandbox runs as root, where F3 prints a loud "NOT EXERCISED" and proves nothing; F3 and its two mutation rows were run here as uid 65534 via `setpriv`. Whether CI executed F3 is stated in the PR after observing the job log.
   - **Not claimed:** a behavioural power-loss test. On ext4/xfs/btrfs it would very likely be masked, as §14.4d's was; none was built. **Fuzz clock:** unchanged (designer decision).
+  - **Designer review (2026-11-28): approved at `bfcdacd`; accepted as built.** Items 1 and 3 below are now stated as limits in spec §8.4.1 at the reviewer's request. The macOS `H4 Half A` job on `bfcdacd` died on a runner DNS failure before compiling, so macOS was not exercised on that head.
   - **Flagged to the designer (implemented as the kickoff specifies):**
     1. The parent is lexical. If `dir` is a symlink to a directory, the fsynced parent is the one holding the symlink, not the one holding the real directory.
     2. The kickoff's tolerated failure is "opening its parent fails". The implementation tolerates exactly that; a failing `fsync` on an opened parent is always returned.
