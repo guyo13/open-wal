@@ -954,3 +954,122 @@ pub fn segment_bases(dir: &Path) -> Vec<u64> {
 pub fn segment_path(dir: &Path, base: u64) -> std::path::PathBuf {
     dir.join(format!("{base:020}.wal"))
 }
+
+// ===========================================================================
+// RM4 shared infrastructure (kickoff E): a real `Receiver` opened with
+// `Receiver::open_seeded` and driven by `Receiver::run`.
+// ===========================================================================
+
+use open_wal_replica::SeedReport;
+
+/// What a [`SeededServer`]'s thread returns: the receiver and what `run`
+/// ended with.
+pub type RunOutcome = (Receiver<DurableTap>, Result<(), ReplError>);
+
+/// A real `Receiver`, opened with `Receiver::open_seeded`, running
+/// **`Receiver::run`** on its own thread — so it stops by itself on a fatal
+/// error (`ReseedRequired`, a poisoned WAL), exactly as an integrator's replica
+/// does. (`ReplicaServer` loops `serve_connection` and never stops.)
+///
+/// The listener is shared (`Arc`) so that a re-seeded receiver can be started
+/// on the **same address**: the proxy's upstream and the shipper's replica
+/// address are fixed for a whole test.
+///
+/// The [`DurableTap`] is the caller's and is shared across restarts. The WAL
+/// does not call its observer at open, and a receiver answers heartbeats with
+/// its recovered `durable_lsn` (after a seeded cold start: `s`), so the tap is
+/// seeded here — with the opened WAL's own `durable_lsn()` — before the thread
+/// (and with it any proxied session) starts.
+pub struct SeededServer {
+    pub addr: SocketAddr,
+    pub tap: DurableTap,
+    /// What `open_seeded` reported.
+    pub report: SeedReport,
+    /// How many times `open_seeded` called the observer factory.
+    pub observer_calls: usize,
+    pub watermarks: Arc<open_wal_replica::ReplicaWatermarks>,
+    listener: Arc<TcpListener>,
+    handle: JoinHandle<RunOutcome>,
+}
+
+impl SeededServer {
+    pub fn start_on(
+        listener: Arc<TcpListener>,
+        dir: &Path,
+        cfg: ReceiverConfig,
+        installed: Option<Lsn>,
+        tap: DurableTap,
+    ) -> Result<SeededServer, ReplError> {
+        let mut observer_calls = 0;
+        let (mut rx, report) = Receiver::open_seeded(dir, cfg, installed, || {
+            observer_calls += 1;
+            tap.clone()
+        })?;
+        tap.0.fetch_max(rx.wal().durable_lsn().0, Ordering::AcqRel);
+        let addr = listener.local_addr().unwrap();
+        let watermarks = rx.watermarks();
+        let l = Arc::clone(&listener);
+        let handle = std::thread::spawn(move || {
+            let res = rx.run(&l);
+            (rx, res)
+        });
+        Ok(SeededServer {
+            addr,
+            tap,
+            report,
+            observer_calls,
+            watermarks,
+            listener,
+            handle,
+        })
+    }
+
+    /// `run` has returned.
+    pub fn finished(&self) -> bool {
+        self.handle.is_finished()
+    }
+
+    /// Wait for `run` to return by itself (e.g. on `ReseedRequired`).
+    pub fn join(self) -> RunOutcome {
+        self.handle.join().expect("receiver thread")
+    }
+
+    /// Make `run` return: its next `accept` fails with `WouldBlock` (the
+    /// result is then `Err(Io)`, unless `run` had already ended). The current
+    /// connection must already be closed by the primary.
+    pub fn stop(self) -> RunOutcome {
+        self.listener.set_nonblocking(true).unwrap();
+        // Wake an `accept` that is already blocked.
+        drop(TcpStream::connect(self.addr));
+        let out = self.handle.join().expect("receiver thread");
+        self.listener.set_nonblocking(false).unwrap();
+        out
+    }
+}
+
+/// The `<dir>.stale.<k>` directories next to `dir`, sorted by name.
+pub fn stale_dirs(dir: &Path) -> Vec<std::path::PathBuf> {
+    let prefix = format!("{}.stale.", dir.file_name().unwrap().to_str().unwrap());
+    let parent = match dir.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let mut v: Vec<_> = std::fs::read_dir(parent)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(&prefix))
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+/// `<dir>.stale.<k>`.
+pub fn stale_path(dir: &Path, k: u32) -> std::path::PathBuf {
+    let mut n = dir.file_name().unwrap().to_os_string();
+    n.push(format!(".stale.{k}"));
+    dir.with_file_name(n)
+}

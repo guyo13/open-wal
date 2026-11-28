@@ -21,6 +21,14 @@
 //! ([`Shipper::poll`]`(&wal)`), under the released watermark (R1), and then cut
 //! over to the ring — inside its session. A replica below the primary's
 //! retention floor is answered `RESEED_REQUIRED` (R6).
+//! **RM4** adds re-seed (§10). The application snapshot itself — its content,
+//! transport and installation — is the integrator's; the crate owns exactly
+//! two things: on the replica, [`Receiver::open_seeded`] sets a log that
+//! predates the snapshot aside (renamed, never deleted) and cold-starts a new
+//! one at `s + 1`, crash-safely; on the primary, the **re-seed hold**
+//! ([`Shipper::begin_reseed`] / [`Shipper::end_reseed`]) validates a snapshot
+//! LSN and feeds [`Shipper::retention_floor`], the replica term of the
+//! integrator's checkpoint policy (§11), so a re-seed in flight cannot loop.
 
 #![warn(missing_docs)]
 
@@ -44,6 +52,6 @@ mod sync;
 pub mod wire;
 
 pub use error::{ReplError, Result};
-pub use receiver::{Receiver, ReceiverConfig, ReplicaWatermarks};
+pub use receiver::{Receiver, ReceiverConfig, ReplicaWatermarks, SeedReport};
 #[cfg(not(loom))]
 pub use shipper::{ReplicaId, ReplicaStatus, Shipper, ShipperConfig};
