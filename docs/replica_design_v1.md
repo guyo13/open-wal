@@ -1419,7 +1419,8 @@ fd / RSS / disk monitors of WAL §14.10; a short run is never the soak gate.
 - **Off-thread / cross-process shipper via a read-only `WalReader`** (WAL §15.2 pattern) —
   moves capture/catch-up I/O off the writer thread; drop-in shipper swap (wire + receiver
   unchanged); v2.
-- **Snapshot transport standardization** — v1 leaves it to the integrator.
+- **Snapshot transport** — not part of the crate (owner decision 2026-11-28: it is
+  application-specific). The integrator produces, moves and installs snapshots (§10).
 - **Resumable WAL reader position: DONE** (WAL v7.2, `Reader::position` / `Wal::reader_at`,
   merged 2026-11-27). §9.1 uses it.
 - **Chunked first skip** (WAL API; owner decision; not planned). The first chunk of a

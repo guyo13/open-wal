@@ -1,8 +1,8 @@
 # Kickoff E — `open-wal-replica` RM4: re-seed (§10)
 
-> **Status: DRAFT (2026-11-28).** Not dispatched. It waits on the owner's decision on the §10
-> revision (the snapshot traits are replaced by `Receiver::open_seeded` and the primary's
-> re-seed hold).
+> **Status: READY (2026-11-28).** The owner approved the §10 revision: the snapshot traits are
+> replaced by `Receiver::open_seeded` and the primary's re-seed hold, and snapshot transport
+> is **not** part of the crate (it is application-specific).
 >
 > **Critique pass 1** (independent, against the code at `2705cf0`, with experiments on the
 > real WAL) confirmed the stateless keep / set-aside rule in every reachable crash state, and

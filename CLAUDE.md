@@ -115,6 +115,7 @@ The entire value of this component is **correct behavior under crashes and fault
 
 ## Project status (keep this updated)
 
+- **LATEST (2026-11-28, RM4): replica RM4 (re-seed) DISPATCHED.** The owner approved the §10 revision and decided snapshot transport is not part of the crate (application-specific). Contract: `docs/replica_design_v1.md` §10–§11 and `docs/kickoff_e_replica_rm4.md` on `claude/epic-hopper-2jb32q` (the agent copies both files). It opens a PR; the designer reviews against the diff and re-derives the mutation rows; the owner merges.
 - **LATEST (2026-11-28, WAL fix): #62 (parent-directory fsync on directory creation / cold start, kickoff F) reviewed at `bfcdacd` — approved, pending one macOS re-run and two spec lines.**
   - **Gap fixed:** `Wal::open` used `create_dir_all` and never fsynced the parent, so a new WAL directory's own entry was not durable (D1 by POSIX; very likely masked on journaling filesystems).
   - **Rule:** each level `open` creates has its parent fsynced before the next; every cold start fsyncs `dir`'s parent before `open` returns; reopening an existing log issues none; `PermissionDenied` on opening the parent is tolerated only for a pre-existing `dir`.
