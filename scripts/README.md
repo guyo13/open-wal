@@ -148,6 +148,7 @@ fakes green — the owner-run gates print loud "NOT EXERCISED"/OPEN banners.
 | `m8/storage-check.sh` | **H2** vacuous-pass guard (deny-by-default FS/cache classification + empirical loss probe) | static part **yes** |
 | `m8/fsync-fault.sh` | **H3 §12 poison state machine** (LD_PRELOAD EIO shim) | **yes — green** |
 | `m8/dm-flakey.sh` | **H3 physical** + **§14.4d** dir-fsync negative control | **nightly CI** (hosted ubuntu VMs reach dm-flakey; `m8-dmflakey.yml`); the build sandbox lacked it |
+| `m8/parent-dirfsync-presence.sh` | **§8.4.1** parent-directory fsync at `open` (strace: created levels, cold start, none on reopen) | **yes — per-PR** (`ci.yml`); needs `strace` + `python3` |
 | `m8/power-pull.sh` | **H1** power-pull (≥50 cycles, zero acked loss) | no (needs a cuttable target) |
 | `m8/evidence.sh` | shared **§5 evidence-ledger** JSON emitter (reused by the gates above) | n/a (helper) |
 

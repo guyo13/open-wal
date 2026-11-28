@@ -60,6 +60,7 @@ The entire value of this component is **correct behavior under crashes and fault
 - **fsync discipline:**
   - Record data in a pre-allocated segment → `fdatasync` (`File::sync_data`) suffices.
   - Segment **creation** → `fdatasync` the file **and `fsync` the directory** (the dir-fsync is the classic gotcha; §14.4d exists to catch its omission).
+  - **WAL directory creation / cold start (§8.4.1)** → `open` never uses `create_dir_all`: each level it creates has its **parent** fsynced before the next, and every cold start fsyncs `dir`'s parent after `dir`. A reopen issues none. Only a *pre-existing* `dir` with an unopenable parent (`PermissionDenied`) is tolerated. Guard: `scripts/m8/parent-dirfsync-presence.sh`.
   - **macOS:** `fdatasync`/`fsync` do NOT flush the drive cache — you MUST use `fcntl(F_FULLFSYNC)` everywhere durability is required.
 - **Torn-tail invalidation (§8.2.1):** normative path is `pwrite` zeros over `[X, segment_size)` then **`fdatasync`** (pure data write — no alignment issue, `fdatasync` is correct). Must extend to **EOF**, not a bounded window. `PUNCH_HOLE` is optional only, and **only with a full `fsync`** + per-filesystem validation via §14.4g.
 - **A failed `fdatasync`/`fsync` POISONS the handle.** Never retry-forever, never advance `durable_lsn` past a failed segment, never offer a "remain usable" path (§12).
@@ -115,6 +116,8 @@ The entire value of this component is **correct behavior under crashes and fault
 
 ## Project status (keep this updated)
 
+<<<<<<< HEAD
+- **LATEST (2026-11-28): #62 (parent-directory fsync, WAL spec §8.4.1) MERGED to `main` as `e729934` by the owner.** Follow-ups landed at `109f230`: the two limits are in the spec, and macOS passed on that head (CI 17/17). No version bump; it ships with 0.3.0.
 - **LATEST (2026-11-28, RM4): replica RM4 (re-seed) DISPATCHED.** The owner approved the §10 revision and decided snapshot transport is not part of the crate (application-specific). Contract: `docs/replica_design_v1.md` §10–§11 and `docs/kickoff_e_replica_rm4.md` on `claude/epic-hopper-2jb32q` (the agent copies both files). It opens a PR; the designer reviews against the diff and re-derives the mutation rows; the owner merges.
 - **LATEST (2026-11-28, WAL fix): #62 (parent-directory fsync on directory creation / cold start, kickoff F) reviewed at `bfcdacd` — approved, pending one macOS re-run and two spec lines.**
   - **Gap fixed:** `Wal::open` used `create_dir_all` and never fsynced the parent, so a new WAL directory's own entry was not durable (D1 by POSIX; very likely masked on journaling filesystems).
@@ -136,6 +139,37 @@ The entire value of this component is **correct behavior under crashes and fault
     - a snapshot in flight across a promotion must be discarded (§10, §12.1 step 5).
   - **WAL finding, not changed (owner's call):** `Wal::open` creates a missing directory with `create_dir_all` and never fsyncs its parent, so a brand-new WAL directory's own entry is not durable until something else syncs the parent. `open_seeded` covers it for seeded replicas only.
   - **Tests:** E1–E10 with mutation rows, incl. an `strace` check of the rename / mkdir / fsync order (E9).
+=======
+- **LATEST (2026-11-28, kickoff F): `open` now fsyncs the parent when it creates or cold-starts the WAL directory (D1) — on a PR branch (`claude/wal-parent-dir-fsync`), awaiting designer review and owner merge.**
+  - **The gap:** `open` used `create_dir_all(dir)` and never fsynced the parent of anything it created, so `dir`'s own entry was not durable; by POSIX a power loss after the first `commit() → Ok` could remove the whole directory. Contract: `docs/kickoff_f_wal_parent_dir_fsync.md`; rule: spec §8.4.1 (new).
+  - **`src/` changes (`src/wal.rs` only, plus a `#[cfg(test)] mod` line in `lib.rs`):**
+    1. `create_dir_durable` replaces `create_dir_all`: each missing level is `mkdir`ed top-down and its parent fsynced before the next.
+    2. `fsync_parent_of` runs after every cold start (after the first segment exists and `dir` is fsynced). It skips only when `dir` pre-existed and its parent cannot be opened (`PermissionDenied`).
+    3. `parent_dir_of` (lexical parent; bare relative name ⇒ `.`; root ⇒ none; a path with no final name such as `.` ⇒ `<path>/..`).
+    4. `fsync_dir` is split into open + `fsync_dir_file` so the cold-start fsync issues the same call. Its behaviour for roll, checkpoint and discard is unchanged.
+  - **No change** to `append`/`commit`/`roll`/`checkpoint`/recovery/`record::decode`/reader/sentinel/on-disk format. A reopen issues the same syscalls as before. No version bump, no new dependency, `crates/open-wal-replica` untouched.
+  - **Zero edits to existing tests, benches, bins, fuzz targets** (`git diff origin/main -- tests benches src/bin fuzz crates` shows only the new `tests/parent_dir_fsync.rs`). The existing suite was run green on the unmodified tree first.
+  - **New tests:** `tests/parent_dir_fsync.rs` (F1 ×4 incl. a bare relative name in a child process with its own cwd; F3 ×2), `scripts/m8/parent-dirfsync-presence.sh` (F2; per-PR job `§8.4.1 parent dir-fsync presence (strace)`), `src/parent_dir_tests.rs` (4 path-rule units).
+  - **Mutation table (each applied, observed, reverted):**
+    | Mutation | Failed | Message |
+    |---|---|---|
+    | plain `create_dir_all` (no parent fsync for created levels) | F2 nested | `mkdir <root>/a is not followed by fsync of its PARENT <root> before the next mkdir (between them: [])` |
+    | no cold-start parent fsync | F2 pre-existing-empty (and nested) | `expected exactly 1 fsync of dir's parent … (the cold-start parent fsync), got 0` |
+    | walk fsyncs the new level instead of its parent | F2 nested (path check) | `… not followed by fsync of its PARENT <root> … (between them: ['fsync <root>/a'])` |
+    | cold start fsyncs `dir` instead of its parent | F2 pre-existing-empty (and nested) | `expected exactly 1 fsync of dir's parent …, got 0` |
+    | parent fsync also on reopen | F2 reopen | `reopening an existing log issued 1 fsync(s) of dir's parent …; the steady-state open must issue ZERO` |
+    | `PermissionDenied` tolerated in the creation walk only | F3 | `open went on to cold-start a directory it created without fsyncing its parent` |
+    | `PermissionDenied` tolerated in the walk and for any cold start | F3 | `open succeeded for a directory it created whose parent could not be fsynced` |
+  - **F3 needs a non-root process.** This sandbox runs as root, where F3 prints a loud "NOT EXERCISED" and proves nothing; F3 and its two mutation rows were run here as uid 65534 via `setpriv`. Whether CI executed F3 is stated in the PR after observing the job log.
+  - **Not claimed:** a behavioural power-loss test. On ext4/xfs/btrfs it would very likely be masked, as §14.4d's was; none was built. **Fuzz clock:** unchanged (designer decision).
+  - **Designer review (2026-11-28): approved at `bfcdacd`; accepted as built.** Items 1 and 3 below are now stated as limits in spec §8.4.1 at the reviewer's request. The macOS `H4 Half A` job on `bfcdacd` died on a runner DNS failure before compiling, so macOS was not exercised on that head.
+  - **Flagged to the designer (implemented as the kickoff specifies):**
+    1. The parent is lexical. If `dir` is a symlink to a directory, the fsynced parent is the one holding the symlink, not the one holding the real directory.
+    2. The kickoff's tolerated failure is "opening its parent fails". The implementation tolerates exactly that; a failing `fsync` on an opened parent is always returned.
+    3. If a creating `open` fails at its parent fsync, the directory stays behind. A later `open` then sees it as pre-existing, so under an unopenable parent it succeeds by the tolerated-failure rule. This follows from the rule as written.
+    4. The spec changelog entry is titled as a v7.2 durability fix; the spec version was not renumbered.
+  - Gates run here: `cargo test` (202) and `--features fuzzing` (205), clippy `-D warnings` (both), fmt, MSRV 1.85 check, `bench --no-run`, `cargo test -p open-wal-replica` (98), fuzz smoke ×4 at the CI run counts (no crash), both strace scripts, `shellcheck`, `actionlint`.
+>>>>>>> origin/main
 - **LATEST (2026-11-28): #59 (replica RM3) MERGED to `main` as `c1a12bf` (squash), on the owner's instruction. Two owner decisions written into the replica spec (designer branch; not yet on `main`):**
   - **Archive replicas are a supported use** (new §11.1): a replica that never checkpoints keeps the log while the primary checkpoints, provided the integrator bounds every checkpoint by that replica's acked LSN. A re-seed leaves a hole. Scenario test + negative control added to §15.3, assigned to RM5.
   - **Multi-process harness** (new §15.8): test-only `repl_primary` / `repl_replica` binaries, a seeded driver, a loopback fault proxy, ack ledgers and one end-of-run validator; a bounce matrix (target × fault × phase) with three negative controls. It is an RM7 deliverable, and the RM8 soak is the same harness run for hours (primary + 2 replicas + 1 archive).
