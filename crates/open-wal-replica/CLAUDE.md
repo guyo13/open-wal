@@ -737,6 +737,21 @@ underspecified, flag it and propose a fix — do not silently diverge.
     `--cfg loom`, fmt, MSRV 1.85, loom 12/12, T8b 2/2, E9 script, root 202/0 (191 before the
     #62 merge), `git diff origin/main -- src tests benches fuzz` empty. `main` was merged in
     (`e729934`), not rebased.
+- **RM4 CI follow-up (2026-11-28, #63; edit authorized by the designer, limited to
+  `tests/ring_overflow.rs`).** The first CI run was red on the RM2 test
+  `tiny_ring_marks_needs_catch_up_repeatedly` (`expected repeated NeedsCatchUp, got 1`): its
+  producer was unpaced, so a consumer thread scheduled after the producer's 5,000 captures is
+  evicted exactly once. Pre-existing: under `taskset -c 0` it failed 20 of 30 runs on this branch
+  and 19 of 30 on unmodified `main` (`e729934`). Fix: `run` takes `gates` (P4 passes `&[]`, so it
+  is unchanged); at each gate LSN the producer waits until the consumer is back in the ring at
+  that cursor, and the consumer, on emitting the gate record, holds until the producer is more
+  than a ring's worth ahead — one eviction per gate on any schedule, still decided and reported
+  by the ring. Waits are bounded (30 s) and fail loudly. Assertions kept (`emitted == 1..=5000`,
+  `catch_ups >= 2`). After: 50 of 50 under `taskset -c 0` (25–30 events), 50 of 50 unpinned.
+  Mutations on `ring.rs` (worktree, reverted): `attach` does not clear the catch-up flag ⇒ FAIL
+  `gate 1000: the consumer never caught up to 999 (at 997)`; dropping the eviction's flag store
+  ⇒ **passes** (414 events: the consumer still detects the eviction from the slot itself), as it
+  did before the edit — recorded, not claimed.
 - **Current milestone:** RM4 — implemented, PR open, **awaiting designer review + owner merge**.
   RM5 is NOT started.
 - **RM2 loom gate:** confirmed by the designer at `b72a2fd`; the nine rows were re-run for RM3
