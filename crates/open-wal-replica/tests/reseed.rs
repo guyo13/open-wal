@@ -48,6 +48,8 @@ fn rx_cfg() -> ReceiverConfig {
     let mut c = ReceiverConfig::new(SMALL);
     c.batch_records = 8;
     c.batch_interval = Duration::from_millis(1);
+    // Room for E7's held window (the receiver waits for SERVING this long).
+    c.idle_timeout = Some(Duration::from_secs(30));
     c
 }
 
@@ -188,6 +190,21 @@ impl Prim {
         wait_until(10, "a pending request", || self.sh().request_pending(id));
     }
 
+    /// Wait until replica `id` has posted a request, then poll until a poll
+    /// has taken it. The slot goes `PENDING` one statement before the network
+    /// thread raises the flag `poll` looks at, so a single `poll` right after
+    /// `await_request` can return without answering; this loops instead. The
+    /// caller may assert writer-thread state right after it returns: the last
+    /// thing that happened is the poll that answered.
+    fn answer_request(&mut self, id: usize) {
+        self.await_request(id);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while self.sh().request_pending(id) {
+            self.poll();
+            assert!(Instant::now() < deadline, "the request was never answered");
+        }
+    }
+
     /// Keep polling until `f` holds.
     fn poll_until(&mut self, secs: u64, what: &str, mut f: impl FnMut(&Prim) -> bool) {
         let deadline = Instant::now() + Duration::from_secs(secs);
@@ -292,6 +309,22 @@ type OldLog = (Lsn, Vec<(Lsn, Vec<u8>)>);
 /// and (unless `Missing`) the replica's `Receiver::run` has returned
 /// `ReseedRequired{oldest}` with the primary's `oldest_lsn`.
 fn needs_reseed(start: Start) -> (Prim, Site, Option<OldLog>) {
+    needs_reseed_with(start, ship_cfg)
+}
+
+/// E7 holds the re-seeded replica's session open with nothing flowing for a
+/// while; give that window room (the shipper drops a replica that is silent
+/// for `io_timeout`).
+fn e7_ship_cfg(addrs: Vec<SocketAddr>) -> ShipperConfig {
+    let mut c = ship_cfg(addrs);
+    c.io_timeout = Duration::from_secs(30);
+    c
+}
+
+fn needs_reseed_with(
+    start: Start,
+    ship_cfg: fn(Vec<SocketAddr>) -> ShipperConfig,
+) -> (Prim, Site, Option<OldLog>) {
     let mut p = Prim::open(SMALL);
     let site = Site::new();
     let mut old = None;
@@ -589,6 +622,49 @@ fn e2_keep_set_aside_boundary_table() {
     }
 }
 
+const REL_CHILD_ENV: &str = "OPEN_WAL_REPLICA_RESEED_REL_CHILD";
+
+/// Child half of the bare-relative-`dir` row: a no-op unless re-executed by
+/// [`e2_bare_relative_dir_is_set_aside_beside_itself`] with the env var set
+/// and the current directory pointed at a scratch directory.
+#[test]
+fn e2_bare_relative_child() {
+    let Ok(name) = std::env::var(REL_CHILD_ENV) else {
+        return;
+    };
+    let dir = Path::new(&name);
+    assert!(dir.is_relative() && dir.parent() == Some(Path::new("")));
+    build_log(dir, 5);
+    let (rx, set_aside, calls) = open_counted(dir, Some(20)).unwrap();
+    assert_eq!(set_aside, Some(PathBuf::from(format!("./{name}.stale.0"))));
+    assert_eq!(
+        (rx.wal().oldest_lsn(), rx.durable_lsn(), calls),
+        (Lsn(21), Lsn(20), 2)
+    );
+}
+
+/// A bare relative `dir` has parent `.`: the stale log lands beside it, in the
+/// process's current directory.
+#[test]
+fn e2_bare_relative_dir_is_set_aside_beside_itself() {
+    let tmp = tempfile::tempdir().unwrap();
+    let exe = std::env::current_exe().expect("current test binary");
+    let out = std::process::Command::new(exe)
+        .args(["--exact", "e2_bare_relative_child", "--test-threads=1"])
+        .env(REL_CHILD_ENV, "wal")
+        .current_dir(tmp.path())
+        .output()
+        .expect("spawn child");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        out.status.success() && stdout.contains("1 passed"),
+        "child failed:\n{stdout}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(read_dir(&tmp.path().join("wal.stale.0"), SMALL).0, Lsn(5));
+    assert_eq!(segment_bases(&tmp.path().join("wal")), vec![21]);
+}
+
 // ---------------------------------------------------------------------------
 // E3 — every §10.1 crash state converges
 // ---------------------------------------------------------------------------
@@ -696,6 +772,16 @@ fn e3_every_crash_state_converges() {
                 None
             }),
         ),
+        (
+            // Legitimately set aside (durable = s' < s) — once; repeating the
+            // call with the same s never sets a second directory aside.
+            "(j) leftover empty seeded log from an earlier, lower s'",
+            1,
+            Box::new(move |dir| {
+                drop(build_seeded(dir, s - 8, 0));
+                None
+            }),
+        ),
     ];
     for (name, want_stale, build) in states {
         let root = tempfile::tempdir().unwrap();
@@ -741,13 +827,22 @@ fn e4_set_aside_never_clobbers() {
     let root = tempfile::tempdir().unwrap();
     let dir = root.path().join("wal");
     let old = build_log(&dir, 10);
+    // Every kind of thing that can already hold a `.stale.<k>` name: two
+    // directories with content, a plain file, an EMPTY directory (the one
+    // `rename` would silently replace) and a dangling symlink.
     for k in 0..2 {
         let taken = stale_path(&dir, k);
         std::fs::create_dir(&taken).unwrap();
         std::fs::write(taken.join("marker"), format!("marker {k}")).unwrap();
     }
+    std::fs::write(stale_path(&dir, 2), b"a plain file").unwrap();
+    std::fs::create_dir(stale_path(&dir, 3)).unwrap();
+    let ino = |p: &Path| std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(p).unwrap());
+    let empty_dir_ino = ino(&stale_path(&dir, 3));
+    std::os::unix::fs::symlink(root.path().join("nowhere"), stale_path(&dir, 4)).unwrap();
+
     let (rx, set_aside, _) = open_counted(&dir, Some(20)).expect("open_seeded");
-    assert_eq!(set_aside, Some(stale_path(&dir, 2)), "smallest unused k");
+    assert_eq!(set_aside, Some(stale_path(&dir, 5)), "smallest unused k");
     assert_eq!(rx.wal().oldest_lsn(), Lsn(21));
     for k in 0..2 {
         let marker = std::fs::read_to_string(stale_path(&dir, k).join("marker"));
@@ -757,8 +852,185 @@ fn e4_set_aside_never_clobbers() {
             ".stale.{k} was clobbered"
         );
     }
-    assert_eq!(read_dir(&stale_path(&dir, 2), SMALL), (Lsn(10), old));
-    assert_eq!(stale_dirs(&dir).len(), 3);
+    assert_eq!(
+        std::fs::read(stale_path(&dir, 2)).ok().as_deref(),
+        Some(&b"a plain file"[..]),
+        ".stale.2 (a plain file) was clobbered"
+    );
+    assert_eq!(
+        (
+            ino(&stale_path(&dir, 3)),
+            std::fs::read_dir(stale_path(&dir, 3)).unwrap().count()
+        ),
+        (empty_dir_ino, 0),
+        ".stale.3 (an empty directory) was replaced"
+    );
+    let link = std::fs::symlink_metadata(stale_path(&dir, 4)).unwrap();
+    assert!(
+        link.file_type().is_symlink() && !stale_path(&dir, 4).exists(),
+        ".stale.4 (a dangling symlink) was clobbered"
+    );
+    assert_eq!(read_dir(&stale_path(&dir, 5), SMALL), (Lsn(10), old));
+    assert_eq!(stale_dirs(&dir).len(), 6);
+}
+
+// ---------------------------------------------------------------------------
+// Review #63: set-aside refusals that must change nothing
+// ---------------------------------------------------------------------------
+
+/// `(name, kind, segment bytes)` of one directory entry.
+type Entry = (String, String, Vec<(u64, Vec<u8>)>);
+
+/// Every entry directly under `root` with its type, plus the segment bytes of
+/// each real directory: "nothing changed" is this being equal before and after.
+fn snapshot(root: &Path) -> Vec<Entry> {
+    let mut v: Vec<_> = std::fs::read_dir(root)
+        .unwrap()
+        .map(|e| {
+            let e = e.unwrap();
+            let ty = e.file_type().unwrap();
+            let kind = if ty.is_symlink() {
+                format!("symlink -> {:?}", std::fs::read_link(e.path()).unwrap())
+            } else if ty.is_dir() {
+                "dir".to_string()
+            } else {
+                "file".to_string()
+            };
+            let segs = if ty.is_dir() {
+                segment_bytes(&e.path())
+            } else {
+                Vec::new()
+            };
+            (e.file_name().into_string().unwrap(), kind, segs)
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+fn expect_io(
+    res: Result<(Receiver, Option<PathBuf>, usize), ReplError>,
+    what: &str,
+) -> std::io::Error {
+    match res {
+        Err(ReplError::Io(e)) => e,
+        Err(e) => panic!("{what}: expected ReplError::Io, got {e:?}"),
+        Ok((_, set_aside, _)) => {
+            panic!("{what}: expected an error, got Ok (set_aside {set_aside:?})")
+        }
+    }
+}
+
+/// Required 1: a symlinked `dir` must not have the link renamed and the new
+/// log created beside the link (silently relocating the replica's log).
+#[test]
+fn e11_a_symlinked_dir_is_never_set_aside() {
+    let root = tempfile::tempdir().unwrap();
+    let real = root.path().join("volume");
+    std::fs::create_dir(&real).unwrap();
+    let target = real.join("wal");
+    let old = build_log(&target, 10);
+    let link = root.path().join("wal");
+    std::os::unix::fs::symlink(&target, &link).unwrap();
+    let before = (snapshot(root.path()), snapshot(&real));
+
+    let e = expect_io(open_counted(&link, Some(20)), "symlinked dir");
+    assert!(
+        e.to_string().contains("symbolic link"),
+        "the error must say why: {e}"
+    );
+    assert_eq!(
+        (snapshot(root.path()), snapshot(&real)),
+        before,
+        "nothing may change"
+    );
+    assert_eq!(stale_dirs(&link), Vec::<PathBuf>::new());
+    assert_eq!(stale_dirs(&target), Vec::<PathBuf>::new());
+    assert_eq!(
+        read_dir(&link, SMALL),
+        (Lsn(10), old),
+        "the log is still behind the link"
+    );
+
+    // The keep path and the missing-directory path are unaffected.
+    let (rx, set_aside, calls) = open_counted(&link, Some(10)).expect("kept through a symlink");
+    assert_eq!((rx.durable_lsn(), set_aside, calls), (Lsn(10), None, 1));
+}
+
+/// Required 3: a parent that cannot be opened cannot be fsynced, so the
+/// rename must not happen. Needs a non-root process (root opens anything):
+/// under root it prints a loud skip and proves nothing.
+#[test]
+fn e12_an_unopenable_parent_fails_before_the_rename() {
+    use std::os::unix::fs::PermissionsExt;
+    struct Restore<'a>(&'a Path);
+    impl Drop for Restore<'_> {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    let root = tempfile::tempdir().unwrap();
+    let parent = root.path().join("parent");
+    std::fs::create_dir(&parent).unwrap();
+    let dir = parent.join("wal");
+    let old = build_log(&dir, 10);
+    let _restore = Restore(&parent);
+    // Writable and searchable, not readable: entries can be renamed and
+    // created, the directory itself cannot be opened.
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o300)).unwrap();
+    if std::fs::File::open(&parent).is_ok() {
+        eprintln!(
+            "\n*** E12 NOT EXERCISED: this process can open a mode-0300 directory \
+             (running as root / CAP_DAC_OVERRIDE). \"Open the parent before the rename\" \
+             is UNVERIFIED by this run — re-run as a non-root user. ***\n"
+        );
+        return;
+    }
+    for call in 1..=2 {
+        let e = expect_io(open_counted(&dir, Some(20)), "unopenable parent");
+        assert_eq!(
+            e.kind(),
+            std::io::ErrorKind::PermissionDenied,
+            "call {call}: {e:?}"
+        );
+        // `dir` is still the old log, in place (it is reachable: 0o300 has x).
+        assert!(
+            segment_path(&dir, 1).is_file(),
+            "call {call}: the directory was renamed although its parent cannot be fsynced"
+        );
+    }
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        stale_dirs(&dir),
+        Vec::<PathBuf>::new(),
+        "nothing was set aside"
+    );
+    assert_eq!(read_dir(&dir, SMALL), (Lsn(10), old));
+}
+
+/// Path spellings that cannot be set aside fail with nothing changed: the
+/// directory's own `.`, a path ending in `..`, and a symlink with a trailing
+/// slash (which the symlink check cannot see).
+#[test]
+fn e13_unrenamable_spellings_fail_with_nothing_changed() {
+    let root = tempfile::tempdir().unwrap();
+    let real = root.path().join("wal");
+    let old = build_log(&real, 10);
+    std::fs::create_dir(real.join("sub")).unwrap();
+    std::os::unix::fs::symlink(&real, root.path().join("link")).unwrap();
+    let before = snapshot(root.path());
+    let spellings = [
+        real.join("."),
+        real.join("sub").join(".."),
+        PathBuf::from(format!("{}/", root.path().join("link").display())),
+    ];
+    for dir in &spellings {
+        // Each spelling does name the old log (so the set-aside path is taken).
+        assert_eq!(read_dir(dir, SMALL).0, Lsn(10), "{dir:?}");
+        let _ = expect_io(open_counted(dir, Some(20)), &format!("{dir:?}"));
+        assert_eq!(snapshot(root.path()), before, "{dir:?}: nothing may change");
+    }
+    assert_eq!(read_dir(&real, SMALL), (Lsn(10), old));
 }
 
 // ---------------------------------------------------------------------------
@@ -813,6 +1085,25 @@ fn e5_an_unrecoverable_log_is_never_set_aside() {
     );
 }
 
+/// A log that cannot be opened because another handle holds it is not set
+/// aside either: the open error comes back unchanged.
+#[test]
+fn e5_a_locked_log_is_never_set_aside() {
+    let root = tempfile::tempdir().unwrap();
+    let dir = root.path().join("wal");
+    build_log(&dir, 10);
+    let (holder, _) = Wal::open(&dir, SMALL).unwrap();
+    let before = segment_bytes(&dir);
+    match open_counted(&dir, Some(500)) {
+        Err(ReplError::Wal(WalError::Locked)) => {}
+        Err(e) => panic!("expected WalError::Locked, got {e:?}"),
+        Ok(_) => panic!("a locked log was opened (or replaced)"),
+    }
+    assert_eq!(stale_dirs(&dir), Vec::<PathBuf>::new());
+    assert!(segment_bytes(&dir) == before);
+    assert_eq!(holder.durable_lsn(), Lsn(10));
+}
+
 // ---------------------------------------------------------------------------
 // E6 — begin_reseed validation, the hold lifecycle, retention_floor
 // ---------------------------------------------------------------------------
@@ -835,16 +1126,15 @@ fn e6_primary(n: u64, fakes: &[&Fake]) -> Prim {
     p
 }
 
-/// Answer replica `id`'s pending join with exactly ONE poll (the caller may
-/// assert right after it returns), then return the replica's first frame.
+/// Answer replica `id`'s pending join, let the caller assert right after the
+/// poll that answered it, then return the replica's first frame.
 fn join_once(
     p: &mut Prim,
     id: usize,
     c: &mut FakeConn,
     right_after_poll: impl FnOnce(&Prim),
 ) -> Saw {
-    p.await_request(id);
-    p.poll();
+    p.answer_request(id);
     right_after_poll(p);
     c.next_data(Duration::from_secs(5))
 }
@@ -1110,32 +1400,37 @@ fn e6_hold_release() {
     );
     drop(a);
 
-    // A join with d >= s answered Serve clears that replica's hold, and no
-    // other: the floor is min(acked A = 210, hold B = 250).
+    // A join with d > s that is served does not: it may be the replica's old
+    // incarnation. Its term stays the hold, 200 — not its acked, 210.
     let mut a = fa.hello(210);
     let first = join_once(&mut p, 0, &mut a, |p| {
         assert_eq!(p.sh().replica_needs_reseed(0), Some(false));
+        assert_eq!(p.acked(0), 210);
         assert_eq!(
             p.floor(),
-            Some(210),
-            "Serve with d >= s releases A's hold (and only A's)"
+            Some(200),
+            "a served join with d > s keeps the hold"
         );
     });
     assert_eq!(first, Saw::Serving { from: 211, oldest });
-
-    // The boundary d == s releases too: afterwards the floor follows A's acks.
     hang_up(&p, 0, a);
-    p.begin_reseed(0, 220).unwrap();
-    assert_eq!(p.floor(), Some(220));
-    let mut a = fa.hello(220);
+
+    // Only a join with d == s answered Serve releases it — that replica's
+    // hold and no other. Shown by the floor following A's acks afterwards:
+    // 230 (A's acked; a kept hold would say 200), then 250 (B's hold, still
+    // there; had it been cleared too, B's term would be its acked, 0).
+    let mut a = fa.hello(200);
     assert_eq!(
         join_once(&mut p, 0, &mut a, |_| {}),
-        Saw::Serving { from: 221, oldest }
+        Saw::Serving { from: 201, oldest }
     );
-    read_through(&mut p, &mut a, 240);
+    read_through(&mut p, &mut a, 270);
     a.ack(230);
     wait_until(10, "A's ack", || p.acked(0) == 230);
-    assert_eq!(p.floor(), Some(230), "d == s released the hold");
+    assert_eq!(p.floor(), Some(230), "Serve with d == s releases A's hold");
+    a.ack(260);
+    wait_until(10, "A's ack", || p.acked(0) == 260);
+    assert_eq!(p.floor(), Some(250), "B's hold is untouched");
 
     // B's hold is still there, and end_reseed drops it.
     p.end_reseed(1);
@@ -1172,8 +1467,7 @@ fn e6_handover_has_no_unprotected_window() {
     p.begin_reseed(0, 500).unwrap();
     assert_eq!(p.floor(), Some(500));
     let mut c = fake.hello(500);
-    p.await_request(0);
-    p.poll();
+    p.answer_request(0);
     // Immediately after the poll, with no wait: the hold is gone and `acked`
     // already says 500 — a checkpoint in this loop iteration is bounded by it.
     let (acked, floor) = (p.acked(0), p.floor());
@@ -1191,12 +1485,74 @@ fn e6_handover_has_no_unprotected_window() {
     );
 }
 
+/// Review #63 required 2. The replica's OLD incarnation (it acked 1000) says
+/// HELLO after `begin_reseed(500)`. Being served must not release the hold:
+/// otherwise the floor jumps to 1000, the policy checkpoints past 501, and the
+/// re-seeded `HELLO{500}` is answered `RESEED_REQUIRED` — the loop the hold
+/// exists to prevent.
+#[test]
+fn e6_the_old_incarnation_cannot_release_the_hold() {
+    let fake = Fake::new(SMALL.max_record_size);
+    let mut p = Prim::open(SMALL);
+    p.fill(1000, TINY, 50);
+    p.start(ship_cfg(vec![fake.addr()]));
+    let policy = |p: &mut Prim| {
+        let durable = p.wal.durable_lsn();
+        let up_to = p.sh().retention_floor().map_or(durable, |f| f.min(durable));
+        p.wal.checkpoint(up_to).unwrap();
+    };
+
+    p.begin_reseed(0, 500).unwrap();
+    // The old process is still around and reconnects.
+    let mut old = fake.hello(1000);
+    let first = join_once(&mut p, 0, &mut old, |p| {
+        assert_eq!(p.acked(0), 1000);
+        assert_eq!(
+            p.floor(),
+            Some(500),
+            "the old incarnation (d > s) must not release the hold"
+        );
+    });
+    assert_eq!(
+        first,
+        Saw::Serving {
+            from: 1001,
+            oldest: 1
+        }
+    );
+    // A checkpoint in the same loop iteration is bounded by the hold.
+    policy(&mut p);
+    assert!(
+        p.oldest() <= 501,
+        "s + 1 must be retained (oldest {})",
+        p.oldest()
+    );
+    hang_up(&p, 0, old);
+
+    // The re-seeded replica arrives at exactly s and is served.
+    let mut new = fake.hello(500);
+    let first = join_once(&mut p, 0, &mut new, |p| {
+        assert_eq!(p.floor(), Some(500), "released: the floor is acked = s");
+    });
+    let oldest = p.oldest();
+    assert_eq!(
+        first,
+        Saw::Serving { from: 501, oldest },
+        "the re-seeded HELLO{{s}} must be served, not told to re-seed again"
+    );
+    // The hold is gone: the floor now follows this replica's acks.
+    read_through(&mut p, &mut new, 600);
+    new.ack(600);
+    wait_until(10, "the ack of 600", || p.acked(0) == 600);
+    assert_eq!(p.floor(), Some(600));
+}
+
 // ---------------------------------------------------------------------------
 // E7 — the hold prevents the loop (end to end), with its negative control
 // ---------------------------------------------------------------------------
 
 fn e7_run(use_holds: bool) {
-    let (mut p, site, _old) = needs_reseed(Start::Prefix);
+    let (mut p, site, _old) = needs_reseed_with(Start::Prefix, e7_ship_cfg);
     let s = p.durable();
     p.begin_reseed(0, s).unwrap();
 
@@ -1256,20 +1612,33 @@ fn e7_run(use_holds: bool) {
         return;
     }
 
+    // The re-seeded replica starts, but nothing the primary sends reaches it
+    // yet (the proxy holds primary→replica bytes): it has said HELLO{s} and
+    // cannot have acked anything above s. The primary answers the join, which
+    // releases the hold — from here on `acked = s` alone protects s + 1.
+    site.proxy.pause();
     let srv = site.start(Some(s));
-    // Five more segments while the re-seeded replica catches up.
-    let proxy = &site.proxy;
-    p.roll(5, &mut |p| {
-        policy(p);
-        // Read AFTER the policy ran: if nothing was answered yet, the replica
-        // cannot have acked anything above s, so the policy was bound by s.
-        if answered_at_or_after(proxy, s).is_empty() {
-            assert!(
-                p.oldest() <= s + 1,
-                "s + 1 must be retained until the replica is served"
-            );
-        }
+    p.poll_until(20, "the re-seeded join to be answered", |p| {
+        p.acked(0) == s && p.sh().replica_needs_reseed(0) == Some(false)
     });
+    let mut checked = 0;
+    p.roll(3, &mut |p| {
+        policy(p);
+        assert!(
+            p.oldest() <= s + 1,
+            "s + 1 must be retained while the replica has not been served (oldest {})",
+            p.oldest()
+        );
+        checked += 1;
+    });
+    assert_eq!(checked, 3, "the not-yet-served window was checked");
+    assert!(
+        answered_at_or_after(&site.proxy, s).is_empty(),
+        "nothing may have reached the replica during the held window"
+    );
+    site.proxy.resume();
+    // Five more segments while the re-seeded replica catches up.
+    p.roll(5, &mut policy.clone());
     let end = p.durable();
     let (srv, ()) = converge(&mut p, srv, end);
     // The policy is live, not inert: once the replica caught up it reclaims.

@@ -780,11 +780,14 @@ pub struct SeedReport { pub set_aside: Option<PathBuf> }   // the stale log, if 
 **The rule (stateless; the same code path serves a re-seed and a crash in the middle of one):**
 1. `installed = None` ⇒ exactly `open_with(dir, cfg, observer())`.
 2. `installed = Some(s)`: let `seed = s.checked_next()` (`None` ⇒ `LsnExhausted`).
-   **If `dir` does not exist, create it and fsync its parent first** (the WAL's own
-   `create_dir_all` does not fsync the parent, so the new log's directory entry would not be
-   durable while the replica already acks records in it). Then open the WAL with
+   Open the WAL with
    `Wal::options().seed(seed).observer(observer()).open(dir, cfg.wal_config)`. The WAL ignores
-   the seed when the directory already holds a log.
+   the seed when the directory already holds a log. **A missing `dir` is created by the WAL
+   itself** (WAL §8.4.1, since #62): each missing level is created and its parent fsynced
+   before anything is put inside, and the parent is fsynced once more after the cold start,
+   so the new log's directory entry is durable before the replica acks records in it. The
+   crate does not create directories. (A missing grandparent therefore behaves the same with
+   `Some(s)` as with `None`.)
    - If the opened log has `durable_lsn ≥ s` ⇒ keep it. This is every normal restart: a log
      seeded at `s + 1` has `durable_lsn = s` from its first instant and never goes below.
    - If the opened log has `durable_lsn < s` ⇒ the log **predates the snapshot** (a re-seed
@@ -795,14 +798,27 @@ pub struct SeedReport { pub set_aside: Option<PathBuf> }   // the stale log, if 
      set aside automatically (its `durable_lsn` is unknown; the operator decides).
 
 **Set-aside (never delete).**
-- `rename(dir, <dir>.stale.<k>)` with the smallest unused `k ≥ 0`, then fsync the parent
-  directory; then create `dir`, fsync the parent again, and open. The WAL handle (and its
-  directory lock) MUST be dropped before the rename.
+- **Open the parent directory first.** If it cannot be opened it cannot be fsynced: return
+  the error with nothing changed. Then `rename(dir, <dir>.stale.<k>)` with the smallest
+  unused `k ≥ 0` and fsync the parent through that handle; then open the WAL again, which
+  creates `dir` (fsyncing the parent, WAL §8.4.1) and cold-starts at the seed. The WAL
+  handle (and its directory lock) MUST be dropped before the rename.
 - The crate never deletes or reopens a set-aside directory. It still holds the replica's old
   durable prefix (which an archive replica may want, §11.1); removing it is the operator's
   call. `SeedReport.set_aside` names it.
-- `dir` must not be a mount point and its parent must be writable; a failed rename is
-  `ReplError::Io` and changes nothing. A bare relative `dir` has parent `.`.
+- `dir` must not be a mount point and its parent must be writable and readable; a failed
+  rename is `ReplError::Io` and changes nothing. A bare relative `dir` has parent `.`.
+- **`dir` must not be a symbolic link.** A rename would move the link and the new log would
+  be created beside it, silently relocating the replica's log. On the set-aside path a
+  symlinked `dir` is `ReplError::Io` with nothing changed (the operator sets the stale log
+  aside by hand). The keep path and the missing-directory path are unaffected.
+- **Spellings that fail on the set-aside path with nothing changed:** `.`, `x/..` (no final
+  name), `dir/.` and a symlink with a trailing slash (the rename itself is refused).
+- **`SeedReport.set_aside` is not returned when an error or a crash follows the rename.**
+  The stale directory has been moved; the operator finds it by listing `<dir>.stale.*`.
+  Calling again converges (and reports `None`: that call moved nothing).
+- **The directory lock does not cover the set-aside window** (between the old log's close
+  and the new log's open). One process must own the replica directory.
 - The crate assumes this process is the only one creating `<dir>.stale.*` (no
   `RENAME_NOREPLACE` is available to it; the existence check is not atomic).
 - **Every crash state converges** when `open_seeded(dir, .., Some(s))` is called again:
@@ -814,7 +830,9 @@ pub struct SeedReport { pub set_aside: Option<PathBuf> }   // the stale log, if 
   | `dir` empty, or holding only `LOCK` | cold start at `s + 1` |
   | `dir` with an incomplete first segment (zero-length, any base name; or full-size all-zero) | WAL §8.4 discards it ⇒ cold start at `s + 1` |
   | seeded log complete, with or without later records or checkpoints | kept (`durable ≥ s`) |
-  No state sets a second directory aside, and none loses the snapshot's position. (Verified
+  | an empty seeded log left from an earlier, lower `s′` | `durable = s′ < s` ⇒ set aside, cold start at `s + 1` |
+  Repeating the call with the same `s` never sets a second directory aside, and no state
+  loses the snapshot's position. (Verified
   by experiment against the WAL at `2705cf0`, seed 501. States `segment::create` cannot
   produce, such as a 1–63-byte segment file, fail the open and are returned unchanged.)
 
@@ -825,7 +843,7 @@ pub struct SeedReport { pub set_aside: Option<PathBuf> }   // the stale log, if 
    install it into application state **durably, including `s` itself**, before step 3. If the
    process dies after step 3 with the install not durable, the application is behind a log
    that starts at `s + 1` and cannot be rebuilt.
-3. `Receiver::open_seeded(dir, cfg, observer, Some(s))`, then `run`. The next `HELLO` carries
+3. `Receiver::open_seeded(dir, cfg, Some(s), observer)`, then `run`. The next `HELLO` carries
    `durable_lsn = s`; the primary serves from `s + 1` (§9).
 4. On every later start, pass the same `installed` value read back from durable state.
 
@@ -868,20 +886,25 @@ impl Shipper {
   term:
   | Replica state | Term |
   |---|---|
-  | has a hold `s` | `s` |
+  | has a hold `s` | `s` — even while its old incarnation is being served below or above `s` (that session may be cut by a checkpoint; the re-seed is coming) |
   | no hold, `needs_reseed` | none (excluded: no retention can help it; it is below `oldest` already) |
   | otherwise | its `acked` (0 until its first HELLO since this `Shipper` started, R7) |
   `None` when every replica is excluded. `min_replica_acked_lsn()` is unchanged.
 - **Release, with no unprotected window.** Inside `poll`, when a join from replica `id` with
-  `d ≥ s` is answered Serve (§9 step 3), the writer thread, in this order: stores
+  `d == s` is answered Serve (§9 step 3), the writer thread, in this order: stores
   `acked[id] = d`; clears `needs_reseed[id]`; clears the hold. The network thread's own later
   store of the same `d` (§9.2) is then redundant. Without the writer-side store, a `poll`
   followed by a `checkpoint` in the same loop iteration would see the hold gone and `acked`
   still at its previous value, which can be stale-high (a replica that acked 1000, lost its
   disk, and is re-seeded at 500).
-  - A join with `d < s`, a `RESEED_REQUIRED` answer, a rejection and a session end do **not**
-    clear a hold. A stale replica cannot clear one: needing a re-seed means
-    `d + 1 < oldest ≤ s + 1`, so `d < s`.
+  - **Only `d == s` releases.** A re-seeded replica's first HELLO carries exactly `s` (its
+    seeded log has `durable_lsn = s`). A join with `d < s` or `d > s`, a `RESEED_REQUIRED`
+    answer, a rejection and a session end do **not** clear a hold. In particular the
+    replica's **old incarnation** can still say HELLO with `d > s` (it acked 1000, the
+    re-seed is at 500): releasing on it would raise the floor to 1000 and let a checkpoint
+    delete `s + 1` before the re-seeded replica arrives.
+  - A hold whose replica never arrives at `s` (a newer snapshot was used instead) is
+    replaced by the next `begin_reseed` for that replica or cleared by `end_reseed`.
   - `end_reseed` clears the hold explicitly (the re-seed was abandoned); the integrator
     SHOULD bound how long it lets a hold pin the log.
 - **The hold and `needs_reseed` are plain writer-thread state.** The one shared write is the

@@ -51,8 +51,8 @@
 //! When a replica must be re-seeded from a snapshot at LSN `s`, call
 //! [`begin_reseed`](Shipper::begin_reseed)`(&wal, id, s)` on the writer thread
 //! **before the next `checkpoint`** after `s` is chosen. The hold keeps
-//! `retention_floor()` at or below `s` until that replica's `HELLO{d ≥ s}` is
-//! served, so the checkpoint policy cannot delete `s + 1` while the snapshot
+//! `retention_floor()` at or below `s` until that replica's `HELLO{d == s}` is
+//! served (exactly `d == s`), so the checkpoint policy cannot delete `s + 1` while the snapshot
 //! is in flight (which would get the re-seeded replica `RESEED_REQUIRED`
 //! again). Holds are plain writer-thread state and are not persisted (R7).
 
@@ -525,8 +525,7 @@ impl Reseed {
     /// answer, and before `poll` returns.
     ///
     /// - A join answered `RESEED_REQUIRED` sets `needs_reseed[id]`. It does
-    ///   not clear a hold (needing a re-seed means `d + 1 < oldest ≤ s + 1`,
-    ///   so `d < s`).
+    ///   not clear a hold.
     /// - A join answered Serve releases, in this order:
     ///   1. `acked[id] = d` — the one shared write made here. The network
     ///      thread's own later store of the same `d` is then redundant. (No
@@ -536,7 +535,10 @@ impl Reseed {
     ///      and `acked` still at a possibly stale-high value;
     ///   2. `needs_reseed[id] = false` — the replica counts in the floor
     ///      again, at `d`;
-    ///   3. the hold, only if `d ≥ s`.
+    ///   3. the hold, only if `d == s`: a re-seeded replica's first HELLO
+    ///      carries exactly `s` (its seeded log has `durable_lsn = s`). A
+    ///      Serve with any other `d` is not the re-seeded replica — `d > s`
+    ///      may be its old incarnation, which must not release the hold.
     /// - Nothing else (a rejection, a chunk answer, …) changes anything.
     fn on_answer(&mut self, id: ReplicaId, acked: &AtomicU64, req: &Request, ans: &Answer) {
         let Request::Join { d } = *req else { return };
@@ -545,7 +547,7 @@ impl Reseed {
             Answer::Serve { .. } => {
                 acked.store(d.0, Ordering::Release);
                 self.needs_reseed[id] = false;
-                if self.holds[id].is_some_and(|s| d >= s) {
+                if self.holds[id] == Some(d) {
                     self.holds[id] = None;
                 }
             }
@@ -781,9 +783,12 @@ impl Shipper {
     /// [`retention_floor`](Shipper::retention_floor).
     ///
     /// The hold is released inside [`poll`](Shipper::poll) when a join from
-    /// `id` with `HELLO.d ≥ s` is answered Serve — and by nothing else: not a
-    /// join with `d < s`, not a `RESEED_REQUIRED` answer, not a rejection, not
-    /// a session end. [`end_reseed`](Shipper::end_reseed) abandons it. Holds
+    /// `id` with `HELLO.d == s` is answered Serve — and by nothing else: not a
+    /// join with any other `d` (above `s` it may be the replica's old
+    /// incarnation), not a `RESEED_REQUIRED` answer, not a rejection, not a
+    /// session end. A hold whose replica never arrives at `s` (a newer
+    /// snapshot was used) is replaced by the next `begin_reseed` or dropped
+    /// by [`end_reseed`](Shipper::end_reseed). Holds
     /// are not persisted (R7): after a primary restart, re-register a re-seed
     /// that is still in flight. A snapshot is bound to the primary that
     /// validated it: on promotion, discard it and start over (§10, §12.1).
@@ -832,7 +837,8 @@ impl Shipper {
     /// `up_to = min(latest durable snapshot LSN, retention_floor() − margin)`.
     ///
     /// The minimum, over all configured replicas, of:
-    /// - the replica's re-seed hold `s`, if it has one (§10.2);
+    /// - the replica's re-seed hold `s`, if it has one (§10.2) — even while
+    ///   its old incarnation is being served below or above `s`;
     /// - nothing, if it has no hold and needs a re-seed (it is below
     ///   `oldest_lsn` already; no retention can help it);
     /// - otherwise its acked LSN (`Lsn(0)` until its first `HELLO` since this
@@ -1861,20 +1867,27 @@ mod tests {
         let acked = AtomicU64::new(1000); // stale-high: an earlier session
         let read = |a: &AtomicU64| a.load(Ordering::Acquire);
 
-        // Serve with d ≥ s: acked, needs_reseed and the hold — replica 0 only.
+        // Serve with d == s: acked, needs_reseed and the hold — replica 0 only.
         let mut r = new();
         r.on_answer(0, &acked, &join(500), &serve);
         assert_eq!(read(&acked), 500, "the writer stores acked = d on Serve");
         assert_eq!(&*r.needs_reseed, &[false, true]);
         assert_eq!(&*r.holds, &[None, Some(Lsn(700))]);
 
-        // Serve with d < s: acked and needs_reseed, the hold stays.
-        let mut r = new();
-        acked.store(1000, Ordering::Release);
-        r.on_answer(0, &acked, &join(499), &serve);
-        assert_eq!(read(&acked), 499);
-        assert_eq!(&*r.needs_reseed, &[false, true]);
-        assert_eq!(&*r.holds, &[Some(Lsn(500)), Some(Lsn(700))]);
+        // Serve with d < s or d > s (the old incarnation): acked and
+        // needs_reseed, the hold stays.
+        for d in [499, 501, 1000] {
+            let mut r = new();
+            acked.store(1000, Ordering::Release);
+            r.on_answer(0, &acked, &join(d), &serve);
+            assert_eq!(read(&acked), d);
+            assert_eq!(&*r.needs_reseed, &[false, true]);
+            assert_eq!(
+                &*r.holds,
+                &[Some(Lsn(500)), Some(Lsn(700))],
+                "a Serve with d = {d} != s must keep the hold"
+            );
+        }
 
         // Serve without a hold still stores acked.
         let mut r = new();

@@ -63,7 +63,7 @@ Everything you need from the WAL is on `main`. **Do not touch `open-wal`'s `src/
    - `needs_reseed[id]`: set when a join from `id` is answered `RESEED_REQUIRED`, cleared
      when one is answered Serve.
    - `retention_floor()`: the per-replica terms of the §10.2 table, minimum over replicas.
-   - Release: when a join from `id` with `d ≥ s` is answered Serve, the writer thread stores
+   - Release: when a join from `id` with `d == s` (review of #63: was `d ≥ s`) is answered Serve, the writer thread stores
      `acked[id] = d`, then clears `needs_reseed[id]`, then clears the hold, all before `poll`
      returns. (A Serve answer always stores `acked[id] = d` on the writer thread, hold or
      not; the network thread's later store stays.)
@@ -168,7 +168,8 @@ the `DurableTap` observer). New file `tests/reseed.rs` unless stated.
     it.
   - Release, with a fake replica: a join with `d < s` that is served does not clear the
     hold; a `RESEED_REQUIRED` answer does not; a rejected join does not; a session end does
-    not; a join with `d ≥ s` answered Serve clears that replica's hold and no other.
+    not; a join with `d > s` that is served does not (review of #63); a join with `d == s`
+    answered Serve clears that replica's hold and no other.
   - **Handover, no sleep:** give a replica a stale-high `acked` (it acked 1000 in an earlier
     session), `begin_reseed(s = 500)` on a WAL whose `oldest ≤ 501`, let the fake replica say
     `HELLO{500}`, wait for `request_pending`, call `poll` once. Immediately after `poll`

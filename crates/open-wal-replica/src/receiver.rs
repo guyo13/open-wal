@@ -183,8 +183,12 @@ impl<O: DurabilityObserver> Receiver<O> {
     /// # Requirements
     /// - `dir` MUST be dedicated to the WAL (the set-aside renames the whole
     ///   directory): keep the application's `installed` record and snapshot
-    ///   files elsewhere. It must not be a mount point; its parent must exist
-    ///   and be writable. A bare relative `dir` has parent `.`.
+    ///   files elsewhere. It must not be a mount point or a symbolic link, and
+    ///   its parent must be writable and readable (it is opened for the fsync
+    ///   before anything is renamed). A bare relative `dir` has parent `.`.
+    /// - One process owns the replica directory: the WAL's directory lock
+    ///   does not cover the window between the old log's close and the new
+    ///   log's open.
     /// - The snapshot (including `s` itself) MUST be durably installed before
     ///   this call: afterwards the log starts at `s + 1`.
     /// - This process is the only one creating `<dir>.stale.*`.
@@ -194,8 +198,14 @@ impl<O: DurabilityObserver> Receiver<O> {
     /// # Errors
     /// A WAL open error is returned unchanged and nothing is set aside (a log
     /// that cannot be recovered has an unknown `durable_lsn`; the operator
-    /// decides). A failed rename / directory creation / directory fsync is
-    /// [`ReplError::Io`]. `s == u64::MAX` is [`ReplError::LsnExhausted`].
+    /// decides). On the set-aside path, [`ReplError::Io`] with nothing
+    /// changed for: a `dir` that is a symbolic link; a parent that cannot be
+    /// opened; a `dir` spelled so that it has no final name or cannot be
+    /// renamed (`.`, `x/..`, `dir/.`, a symlink with a trailing slash); a
+    /// failed rename. If an error (or a crash) follows the rename, the stale
+    /// directory has already been moved and no [`SeedReport`] names it: list
+    /// `<dir>.stale.*`; calling again converges. `s == u64::MAX` is
+    /// [`ReplError::LsnExhausted`].
     pub fn open_seeded(
         dir: &Path,
         cfg: ReceiverConfig,
@@ -210,14 +220,8 @@ impl<O: DurabilityObserver> Receiver<O> {
         let seed = s
             .checked_next()
             .ok_or(ReplError::LsnExhausted { last: s })?;
-        let parent = parent_of(dir)?;
-        if !exists(dir)? {
-            // §10.1: the new log's directory entry must be durable before the
-            // replica acks records in it. (Since WAL §8.4.1 `Wal::open` does
-            // the same for a directory it creates itself; doing it here keeps
-            // the §10.1 order independent of that.)
-            create_dir_durably(dir, parent)?;
-        }
+        // A missing `dir` is created by the WAL itself, each new level's
+        // parent fsynced before anything is put inside it (WAL §8.4.1).
         let (wal, _report) = Wal::options()
             .seed(seed)
             .observer(observer())
@@ -228,8 +232,9 @@ impl<O: DurabilityObserver> Receiver<O> {
         // The log predates the snapshot. Drop the handle — and with it the
         // directory lock — before the rename.
         drop(wal);
-        let stale = set_aside(dir, parent)?;
-        create_dir_durably(dir, parent)?;
+        let stale = set_aside(dir)?;
+        // `dir` is gone: the WAL creates it again (parent fsynced first) and
+        // cold-starts at the seed.
         let (wal, _report) = Wal::options()
             .seed(seed)
             .observer(observer())
@@ -508,21 +513,13 @@ fn check_cfg(cfg: &ReceiverConfig) -> Result<()> {
     Ok(())
 }
 
-// ---- §10.1 directory operations -------------------------------------------
+// ---- §10.1 set-aside ------------------------------------------------------
 // The only filesystem operations this crate performs outside the WAL: one
-// rename, directory creation, parent-directory fsyncs, and existence checks.
-// Nothing here deletes or overwrites anything.
+// rename, one parent-directory fsync, and existence checks. Nothing here
+// deletes or overwrites anything. (Directory creation is the WAL's, §8.4.1.)
 
-/// `dir`'s parent directory; a bare relative `dir` has parent `.`.
-fn parent_of(dir: &Path) -> Result<&Path> {
-    match dir.parent() {
-        Some(p) if p.as_os_str().is_empty() => Ok(Path::new(".")),
-        Some(p) => Ok(p),
-        None => Err(ReplError::Io(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "the replica WAL directory has no parent directory",
-        ))),
-    }
+fn invalid_dir(why: &'static str) -> ReplError {
+    ReplError::Io(io::Error::new(io::ErrorKind::InvalidInput, why))
 }
 
 /// Whether anything (a dangling symlink included) exists at `path`.
@@ -534,27 +531,29 @@ fn exists(path: &Path) -> Result<bool> {
     }
 }
 
-fn fsync_dir(dir: &Path) -> Result<()> {
-    // `sync_all` on a directory handle: `fsync` on Linux, `F_FULLFSYNC` on macOS.
-    std::fs::File::open(dir)?.sync_all()?;
-    Ok(())
-}
-
-/// Create `dir` (one level) and make its directory entry durable.
-fn create_dir_durably(dir: &Path, parent: &Path) -> Result<()> {
-    std::fs::create_dir(dir)?;
-    fsync_dir(parent)
-}
-
 /// Rename `dir` to `<dir>.stale.<k>` with the smallest unused `k ≥ 0`, and
-/// make the rename durable. Returns the new path.
-fn set_aside(dir: &Path, parent: &Path) -> Result<PathBuf> {
-    let name = dir.file_name().ok_or_else(|| {
-        ReplError::Io(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "the replica WAL directory has no name to set aside",
-        ))
-    })?;
+/// make the rename durable. Returns the new path. Every failure before the
+/// rename leaves the filesystem untouched.
+fn set_aside(dir: &Path) -> Result<PathBuf> {
+    // A symlinked `dir` would have the *link* renamed and the new log created
+    // wherever the link lives — silently relocating the replica's log.
+    if std::fs::symlink_metadata(dir)?.file_type().is_symlink() {
+        return Err(invalid_dir(
+            "the replica WAL directory is a symbolic link: it cannot be set aside              automatically (set the stale log aside by hand)",
+        ));
+    }
+    let name = dir
+        .file_name()
+        .ok_or_else(|| invalid_dir("the replica WAL directory has no name to set aside"))?;
+    // A bare relative `dir` has parent `.`.
+    let parent = match dir.parent() {
+        Some(p) if p.as_os_str().is_empty() => Path::new("."),
+        Some(p) => p,
+        None => return Err(invalid_dir("the replica WAL directory has no parent")),
+    };
+    // Open the parent BEFORE the rename: if it cannot be opened it cannot be
+    // fsynced, and the rename must then not happen at all.
+    let parent_handle = std::fs::File::open(parent)?;
     let mut k: u64 = 0;
     let stale = loop {
         let mut n = name.to_os_string();
@@ -568,7 +567,8 @@ fn set_aside(dir: &Path, parent: &Path) -> Result<PathBuf> {
             .ok_or_else(|| ReplError::Io(io::Error::other("no unused .stale.<k> name")))?;
     };
     std::fs::rename(dir, &stale)?;
-    fsync_dir(parent)?;
+    // `sync_all` on a directory handle: `fsync` on Linux, `F_FULLFSYNC` on macOS.
+    parent_handle.sync_all()?;
     Ok(stale)
 }
 
