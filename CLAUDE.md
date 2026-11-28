@@ -116,6 +116,16 @@ The entire value of this component is **correct behavior under crashes and fault
 
 ## Project status (keep this updated)
 
+- **LATEST (2026-11-28, RM4 review round 1): #63 (replica RM4, re-seed) reviewed at `4a05ead` — needs work: three required code changes, one of them a hole in the designer's spec.**
+  - **Verified:** root `src/` diff empty; replica 116 passed ×3, root 202, clippy (both cfgs), fmt, loom 12/12, the E9 strace script; CI 14/14 on the head. 17 reviewer mutations in a separate worktree all fail a named test.
+  - **Pre-existing flake fixed in this PR (authorized):** RM2's `tiny_ring_marks_needs_catch_up_repeatedly` assumed the consumer thread ran before the producer finished. Reviewer reproduced it on unmodified `main` (14 failures in 20 under `taskset -c 0`); with the paced version 40/40 pinned and 40/40 unpinned.
+  - **Independent review** (clean copy, own experiments): no blocker; keep / set-aside rule and the `acked` thread order confirmed.
+  - **Required 1–3:**
+    1. A symlinked `dir` is renamed as a symlink and the new log lands in the link's parent, silently (reproduced twice) ⇒ refuse on the set-aside path.
+    2. **Spec error (§10.2):** a Serve with `d ≥ s` from the replica's old incarnation clears the hold and the re-seed loops ⇒ release only on `d == s`.
+    3. The parent is opened for fsync after the rename, so an unreadable parent fails with the directory already moved and nothing synced ⇒ open the parent handle first.
+  - **Requested:** let the WAL create the directory (redundant since #62); a dead assertion in E7's second loop; a `join_once` scheduling race; more E3/E4/E5 rows; a relative-path row; doc limits.
+  - The agent (`session_0179ehu7nZgqeGBUncyTfQGw`) has the follow-up.
 - **LATEST (2026-11-28): #62 (parent-directory fsync, WAL spec §8.4.1) MERGED to `main` as `e729934` by the owner.** Follow-ups landed at `109f230`: the two limits are in the spec, and macOS passed on that head (CI 17/17). No version bump; it ships with 0.3.0.
 - **LATEST (2026-11-28, RM4): replica RM4 (re-seed) DISPATCHED.** The owner approved the §10 revision and decided snapshot transport is not part of the crate (application-specific). Contract: `docs/replica_design_v1.md` §10–§11 and `docs/kickoff_e_replica_rm4.md` on `claude/epic-hopper-2jb32q` (the agent copies both files). It opens a PR; the designer reviews against the diff and re-derives the mutation rows; the owner merges.
 - **LATEST (2026-11-28, WAL fix): #62 (parent-directory fsync on directory creation / cold start, kickoff F) reviewed at `bfcdacd` — approved, pending one macOS re-run and two spec lines.**
