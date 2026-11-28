@@ -115,6 +115,10 @@ The entire value of this component is **correct behavior under crashes and fault
 
 ## Project status (keep this updated)
 
+- **LATEST (2026-11-28): #59 (replica RM3) MERGED to `main` as `c1a12bf` (squash), on the owner's instruction. Two owner decisions written into the replica spec (designer branch; not yet on `main`):**
+  - **Archive replicas are a supported use** (new §11.1): a replica that never checkpoints keeps the log while the primary checkpoints, provided the integrator bounds every checkpoint by that replica's acked LSN. A re-seed leaves a hole. Scenario test + negative control added to §15.3, assigned to RM5.
+  - **Multi-process harness** (new §15.8): test-only `repl_primary` / `repl_replica` binaries, a seeded driver, a loopback fault proxy, ack ledgers and one end-of-run validator; a bounce matrix (target × fault × phase) with three negative controls. It is an RM7 deliverable, and the RM8 soak is the same harness run for hours (primary + 2 replicas + 1 archive).
+  - **Next:** a fenced RM4 (re-seed) kickoff.
 - **LATEST (2026-11-27, RM3 review round 2): #59 (replica RM3) APPROVED at `fded6b5` — ready for the owner to merge.**
   - **Required 1–4 verified by execution** (mutations in the separate worktree):
     1. T1 asserts `episodes >= 1`: 60 of 60 runs passed.
